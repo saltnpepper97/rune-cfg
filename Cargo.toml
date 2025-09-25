@@ -1,0 +1,21 @@
+[package]
+name = "rune_cfg"
+version = "0.1.0"
+edition = "2024"
+authors = ["Dustin Pilgrim <dustin.pilgrim1997@gmail.com>"]
+description = "A modern, simple, and safe config language inspired by Markdown."
+license = "MIT"
+repository = "https://github.com/saltnpepper97/rune_cfg"
+homepage = "https://github.com/saltnpepper97/rune_cfg"
+documentation = "https://docs.rs/rune_cfg"
+keywords = ["config", "rune", "parser", "serde", "dsl"]
+categories = ["config", "parsing"]
+readme = "README.md"
+rust-version = "1.89" 
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[dependencies]
+serde = { version = "1.0.170", features = ["derive"] }
+serde_json = "1.0.145"

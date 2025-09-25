@@ -1,0 +1,39 @@
+# This is a comment
+
+# This is the same as `import` keyword
+gather "defaults.rune" as defaults
+
+# This is a metadata tag for showing things like
+# a description as such:
+@description "Simple app using RUNE config"
+
+# Global variable definition
+name "RuneApp"
+
+# Read from system env variables
+# $env = query environment variables
+# $runtime = query RUNE runtime info
+# $sys = qery direct system information
+path = $env.PATH
+
+app:
+  name name # use of global variable here
+  version "1.0.0"
+  debug true
+
+  server:
+    host = defaults.server.host # use of optional `=` and of imported variable to get to it we use dot notation to `crawl through nested objects`
+    port 8080
+    timeout "30s"
+  end
+
+  # Arrays can be inline like this
+  # plugins [ "auth", "logger" ]
+
+  # or separated like this
+  plugins [
+    "auth",
+    "logger"
+  ]
+end
+
