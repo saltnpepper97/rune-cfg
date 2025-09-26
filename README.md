@@ -1,98 +1,188 @@
-# Rune
+<p align="center">
+  <img src="./assets/rune.png" width="350" />
+</p>
 
-**Rune** – *Readable Unified Notation for Everyone* – is a modern, simple, and memory-safe configuration language for Rust projects. Inspired by Markdown and classic DSL simplicity, Rune makes writing, reading, and parsing config files a breeze, while supporting advanced features like references, imports, and environment variable expansion.
+<h1 align="center">RUNE</h1>
 
-> ⚠️ **Work In Progress:** Some features like `$sys` (query system parameters) and `$runtime` (query Rune runtime info) are planned and coming soon as well as simple `if` statements.
+<p align="center">
+  <em>Readable Unified Notation for Everyone</em>
+</p>
 
----
-
-## Why Rune?
-
-Rune isn’t just another config format — it’s designed to combine **readability, safety, and power**:
-
-- **Readable & Minimal** – inspired by Markdown, so configs are easy to read for humans.
-- **Safe & Reliable** – written in Rust, memory-safe, and zero external dependencies.
-- **Flexible** – supports imports, variable references, arrays, nested objects, and environment expansion.
-- **Future-ready** – planned `$sys` and `$runtime` namespaces plus conditional logic make it more than a static config.
-- **Interoperable** – built-in Serde integration lets you export configs to JSON effortlessly.
-
-
-## Planned Features
-
-- **$sys namespace** – access system parameters.
-- **$runtime namespace** – query runtime information from Rune itself.
-- **Conditional logic** – simple `if` statements.
+<p align="center">
+  A modern, simple, and memory-safe configuration language for Rust projects
+</p>
 
 ---
 
-## Getting Started
+## Overview
 
-Add `rune_cfg` to your `Cargo.toml`:
+RUNE is a configuration language designed to combine **readability, safety, and power**. Inspired by Markdown's simplicity, RUNE makes writing and reading config files intuitive while supporting advanced features like variable references, imports, and environment variable expansion.
+
+**Key Features:**
+- **Human-readable syntax** - Clean and minimal, inspired by Markdown
+- **Memory-safe** - Written in Rust with zero external dependencies  
+- **Flexible data types** - Strings, numbers, booleans, arrays, and nested objects
+- **Variable references** - Reference global variables and imported values
+- **Environment integration** - Access environment variables with `$env.VARIABLE`
+- **Import system** - Modular configs with `gather "file.rune" as alias`
+- **Serde integration** - Export to JSON seamlessly
+
+## Installation
+
+Add `rune-cfg` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rune_cfg = "0.1.0"
+rune-cfg = "0.1.0"
 ```
 
+## Quick Example
 
-## Example `.rune` File
-
+**config.rune:**
 ```rune
-@description "Simple app using Rune config"
-name "RuneApp"
+@description "Web server configuration"
 
-app:
-  name name
-  version "1.0.0"
-  debug true
+# Global variables
+app_name "MyWebServer"
+default_port 8080
 
-  server:
-    host defaults.server.host
-    port 8080
+# Main configuration block
+server:
+  name app_name
+  port default_port
+  host $env.HOST
+  
+  database:
+    url $env.DATABASE_URL
     timeout "30s"
   end
-
-  plugins [
+  
+  features [
     "auth"
-    "logger"
+    "logging"
+    "metrics"
   ]
 end
 ```
 
-## Parsing & Exporting to JSON
-```
+**Rust code:**
+```rust
 use rune_cfg::export_rune_file;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let json_output = export_rune_file("examples/example.rune")?;
-    println!("{}", json_output);
+    let json = export_rune_file("config.rune")?;
+    println!("{}", json);
     Ok(())
 }
 ```
 
-### Sample json_output
-
-```
+**Output:**
+```json
 {
   "globals": {
-    "name": "RuneApp"
+    "app_name": "MyWebServer",
+    "default_port": 8080
   },
   "items": {
-    "app": {
-      "name": "name",
-      "version": "1.0.0",
-      "debug": true,
-      "server": {
-        "host": "defaults.server.host",
-        "port": 8080,
+    "server": {
+      "name": "MyWebServer",
+      "port": 8080,
+      "host": "localhost",
+      "database": {
+        "url": "postgresql://...",
         "timeout": "30s"
       },
-      "plugins": ["auth", "logger"]
+      "features": ["auth", "logging", "metrics"]
     }
   },
   "metadata": {
-    "description": "Simple app using Rune config"
+    "description": "Web server configuration"
   }
 }
 ```
 
+## Syntax Highlights
+
+### Basic Types
+```rune
+# Strings (single or double quotes)
+name "RUNE Config"
+path '/usr/local/bin'
+
+# Numbers
+port 8080
+timeout 30.5
+
+# Booleans
+debug true
+production false
+
+# Arrays
+servers ["web1", "web2", "web3"]
+ports [8080, 8081, 8082]
+```
+
+### Variable References
+```rune
+# Global variable
+app_name "MyApp"
+
+# Use in other places
+server:
+  name app_name  # References the global variable
+end
+```
+
+### Environment Variables
+```rune
+# Access environment variables
+database_url $env.DATABASE_URL
+home_dir $env.HOME
+```
+
+### Imports
+```rune
+# Import another RUNE file
+gather "database.rune" as db
+gather "logging.rune" as log
+
+# Use imported values
+server:
+  db_host db.host
+  log_level log.level
+end
+```
+
+### Raw Strings (for Regex)
+```rune
+# Raw strings preserve exact content
+email_pattern r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+path_matcher r".*\.exe$"
+```
+
+### Comments and Metadata
+```rune
+# This is a comment
+
+@description "Application configuration"
+@version "1.0.0"
+@author "Your Name"
+
+# Your config here...
+```
+
+## Coming Soon
+
+The following features are planned for future releases:
+
+- **`$sys` namespace** - Access system information (OS, architecture, etc.)
+- **`$runtime` namespace** - Query RUNE runtime information  
+- **Conditional logic** - Simple `if` statements for dynamic configs
+
+## Status
+
+RUNE is currently in active development. The core features are stable and ready for use, but some advanced features are still being implemented.
+
+## License
+
+[MIT License](LICENSE)
