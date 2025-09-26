@@ -6,11 +6,11 @@ authors = ["Dustin Pilgrim <dustin.pilgrim1997@gmail.com>"]
 description = "A modern, simple, and safe config language inspired by Markdown."
 license = "MIT"
 repository = "https://github.com/saltnpepper97/rune-cfg"
-documentation = "https://docs.rs/rune_cfg"
+documentation = "https://docs.rs/rune-cfg"
 keywords = ["config", "rune", "parser", "serde", "dsl"]
 categories = ["config", "parsing"]
 readme = "README.md"
-rust-version = "1.89" 
+rust-version = "1.89"
 
 [dev-dependencies]
 tempfile = "3.23.0"
