@@ -23,6 +23,11 @@ pub fn export_document_to_json(doc: &Document) -> Result<String, RuneError> {
             crate::ast::Value::Interpolated(parts) => {
                 json!(parts.iter().map(value_to_json).collect::<Vec<_>>())
             }
+            crate::ast::Value::Regex(r) => {
+                // Export regex as a tagged JSON string
+                json!({ "regex": r })
+            }
+            crate::ast::Value::Null => serde_json::Value::Null, 
         }
     }
 
@@ -72,7 +77,7 @@ mod tests {
         let example_input = fs::read_to_string("examples/example.rune")
             .expect("Failed to read example.rune");
         let mut parser = Parser::new(&example_input).expect("Failed to create parser for example");
-        let mut doc = parser.parse_document().expect("Failed to parse example.rune");
+        let doc = parser.parse_document().expect("Failed to parse example.rune");
 
         // Inject the defaults import
         parser.inject_import("defaults".to_string(), defaults_doc);
@@ -87,4 +92,23 @@ mod tests {
         assert!(deserialized.get("items").is_some());
         assert!(deserialized.get("metadata").is_some());
     }
+}
+
+#[test]
+fn test_export_regex() {
+    use crate::ast::Value;
+
+    let doc = Document {
+        items: vec![("pattern".to_string(), Value::Regex("^foo.*bar$".into()))],
+        metadata: vec![],
+        globals: vec![],
+    };
+
+    let json_output = export_document_to_json(&doc).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json_output).unwrap();
+
+    assert_eq!(
+        v["items"]["pattern"]["regex"],
+        "^foo.*bar$"
+    );
 }

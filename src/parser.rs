@@ -184,7 +184,7 @@ impl<'a> Parser<'a> {
                 // read namespace
                 let mut ns = String::new();
                 while let Some(&ch) = chars.peek() {
-                    if ch.is_alphanumeric() || ch == '_' {
+                    if ch.is_alphanumeric() || ch == '_' || ch == '-' {
                         ns.push(ch);
                         chars.next();
                     } else { break; }
@@ -207,7 +207,7 @@ impl<'a> Parser<'a> {
                         chars.next(); // consume dot
                         let mut seg = String::new();
                         while let Some(&ch2) = chars.peek() {
-                            if ch2.is_alphanumeric() || ch2 == '_' {
+                            if ch2.is_alphanumeric() || ch2 == '_' || ch2 == '-' {
                                 seg.push(ch2);
                                 chars.next();
                             } else { break; }
@@ -304,6 +304,11 @@ impl<'a> Parser<'a> {
                     Ok(Value::Bool(b))
                 } else { unreachable!() }
             }
+            Some(Token::Regex(_)) => {
+                if let Token::Regex(r) = self.bump()? {
+                    Ok(Value::Regex(r))
+                } else { unreachable!() }
+            }
             Some(Token::Dollar) => {
                 self.bump()?; // consume $
 
@@ -394,6 +399,10 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Ok(Value::Array(arr))
+            }
+            Some(Token::Null) => {
+                self.bump()?; // consume Null
+                Ok(Value::Null) // assuming you have Value::Null variant
             }
             _ => {
                 let token = self.bump()?;
@@ -729,3 +738,17 @@ end
         panic!("Expected 'nested' to be an Object");
     }
 }
+
+#[test]
+fn test_parse_regex_literal() {
+    let input = r#"
+pattern r"^foo.*bar$"
+"#;
+
+    let mut parser = Parser::new(input).expect("Failed to create parser");
+    let doc = parser.parse_document().expect("Failed to parse doc");
+
+    let val = &doc.globals[0].1;
+    assert_eq!(val, &Value::Regex("^foo.*bar$".into()));
+}
+

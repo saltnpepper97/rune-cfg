@@ -5,8 +5,10 @@ use crate::RuneError;
 pub enum Token {
     Ident(String),
     String(String),
+    Regex(String),
     Number(f64),
     Bool(bool),
+    Null,
 
     Colon, Equals, LBracket, RBracket, End,
     Dollar, Dot, At, Gather, As,
@@ -93,30 +95,58 @@ impl<'a> Lexer<'a> {
             Some('.') => { self.bump(); Ok(Token::Dot) }
             Some('@') => { self.bump(); Ok(Token::At) }
 
-            // raw string r"..." 
+            // regex literal r"..."
             Some('r') => {
-                // Lookahead without consuming
-                if let Some('"') = self.input.clone().next() {
+                let mut clone_iter = self.input.clone();
+                let next_char = clone_iter.next();
+
+                if next_char == Some('"') {
                     self.bump(); // consume 'r'
-                    self.bump(); // consume '"'
+                    self.bump(); // consume opening '"'
+
                     let mut content = String::new();
                     while let Some(ch) = self.bump() {
-                        if ch == '"' { break; }
-                        content.push(ch);
+                        if ch == '"' {
+                            break; // closing quote
+                        }
+
+                        if ch == '\\' {
+                            // preserve the backslash literally
+                            content.push('\\');
+                            if let Some(next_ch) = self.bump() {
+                                content.push(next_ch);
+                            } else {
+                                return Err(RuneError::UnclosedString {
+                                    quote: '"',
+                                    line: self.line,
+                                    column: self.column,
+                                    hint: Some("Trailing backslash in regex".into()),
+                                    code: Some(103),
+                                });
+                            }
+                        } else {
+                            content.push(ch);
+                        }
                     }
-                    Ok(Token::String(content))
+
+                    if self.peek.is_none() {
+                        // nothing to do, regex already closed properly
+                    }
+
+                    Ok(Token::Regex(content))
                 } else {
-                    // Not a raw string, parse as identifier normally
+                    // just a normal identifier starting with 'r'
                     let mut ident = String::new();
                     ident.push(self.bump().unwrap()); // consume 'r'
                     while let Some(ch) = self.peek {
-                        if ch.is_alphanumeric() || ch == '_' { ident.push(ch); self.bump(); } 
-                        else { break; }
+                        if ch.is_alphanumeric() || ch == '_' || ch == '-' { 
+                            ident.push(ch); 
+                            self.bump(); 
+                        } else { break; }
                     }
                     Ok(Token::Ident(ident))
                 }
             }
-
 
             // normal double-quoted string
             Some('"') | Some('\'') => {
@@ -198,17 +228,19 @@ impl<'a> Lexer<'a> {
                         self.bump();
                     } else { break; }
                 }
-                let token = match ident.as_str() {
-                    "true" => Token::Bool(true),
-                    "false" => Token::Bool(false),
-                    "end" => Token::End,
-                    "gather" => Token::Gather,
-                    "as" => Token::As,
-                    _ => Token::Ident(ident),
-                };
-                Ok(token)
-            }
 
+                // map both "null" and "None" to Token::Null
+                match ident.as_str() {
+                    "true" => Ok(Token::Bool(true)),
+                    "false" => Ok(Token::Bool(false)),
+                    "end" => Ok(Token::End),
+                    "gather" => Ok(Token::Gather),
+                    "as" => Ok(Token::As),
+                    "null" | "None" => Ok(Token::Null),
+                    _ => Ok(Token::Ident(ident)),
+                }
+            }
+                
             // unexpected characters
             Some(ch) => {
                 self.bump();
@@ -245,6 +277,7 @@ name "RuneApp"
 app:
   name name
   version "1.0.0"
+  description None
 end
 "#;
 
@@ -264,10 +297,13 @@ end
             Token::Colon,
             Token::Newline,
             Token::Ident("name".into()),
-            Token::Ident("name".into()), // This should now be a simple identifier, not prefixed with $
+            Token::Ident("name".into()),
             Token::Newline,
             Token::Ident("version".into()),
             Token::String("1.0.0".into()),
+            Token::Newline,
+            Token::Ident("description".into()),
+            Token::Null,
             Token::Newline,
             Token::End,
             Token::Newline,
@@ -365,5 +401,46 @@ normal "hello"
             let tok = lexer.next_token().expect("Failed to get token");
             assert_eq!(tok, expected);
         }
+    }
+}
+
+#[test]
+fn test_regex_literal() {
+    let input = r#"r"^foo.*bar$""#;
+    let mut lexer = Lexer::new(input);
+    let tok = lexer.next_token();
+    assert_eq!(tok, Ok(Token::Regex("^foo.*bar$".into())));
+}
+
+#[test]
+fn test_regex_with_command_like_content() {
+    let input = r#"r"notify-send 'Test'""#;
+    let mut lexer = Lexer::new(input);
+    let tok = lexer.next_token();
+    assert_eq!(tok, Ok(Token::Regex("notify-send 'Test'".into())));
+}
+
+#[test]
+fn test_regex_with_escape() {
+    let input = r#"r"\d{3}-\d{2}-\d{4}""#;
+    let mut lexer = Lexer::new(input);
+    let tok = lexer.next_token();
+    assert_eq!(tok, Ok(Token::Regex("\\d{3}-\\d{2}-\\d{4}".into())));
+}
+
+#[test]
+fn test_hyphen_and_underscore_identifiers() {
+    let input = "foo-bar qux123";
+    let mut lexer = Lexer::new(input);
+
+    let expected_tokens = vec![
+        Token::Ident("foo-bar".into()),
+        Token::Ident("qux123".into()),
+        Token::Eof,
+    ];
+
+    for expected in expected_tokens {
+        let tok = lexer.next_token().unwrap();
+        assert_eq!(tok, expected);
     }
 }
