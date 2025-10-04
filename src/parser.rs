@@ -2,7 +2,8 @@ use crate::lexer::{Lexer, Token};
 use crate::RuneError;
 use crate::ast::{Document, Value};
 use std::collections::HashMap;
-use std::env;
+
+use crate::resolver::{expand_dollar_string, parse_dollar_reference};
 
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
@@ -171,76 +172,6 @@ impl<'a> Parser<'a> {
         Ok(Document { metadata, globals, items })
     }
 
-    /// Expands `$env.X`, `$sys.Y`, `$runtime.Z` inside a string
-    fn expand_dollar_variables(&self, s: &str) -> Result<Value, RuneError> {
-        let mut result = Vec::new();
-        let mut chars = s.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            if c == '$' {
-                // start of a reference
-                let mut path = Vec::new();
-
-                // read namespace
-                let mut ns = String::new();
-                while let Some(&ch) = chars.peek() {
-                    if ch.is_alphanumeric() || ch == '_' || ch == '-' {
-                        ns.push(ch);
-                        chars.next();
-                    } else { break; }
-                }
-
-                if ns != "env" && ns != "sys" && ns != "runtime" {
-                    return Err(RuneError::SyntaxError {
-                        message: format!("Unknown namespace ${}", ns),
-                        line: self.lexer.line(),
-                        column: self.lexer.column(),
-                        hint: Some("Use $env, $sys, or $runtime".into()),
-                        code: Some(209),
-                    });
-                }
-
-                path.push(ns);
-
-                while let Some(&ch) = chars.peek() {
-                    if ch == '.' {
-                        chars.next(); // consume dot
-                        let mut seg = String::new();
-                        while let Some(&ch2) = chars.peek() {
-                            if ch2.is_alphanumeric() || ch2 == '_' || ch2 == '-' {
-                                seg.push(ch2);
-                                chars.next();
-                            } else { break; }
-                        }
-                        if seg.is_empty() {
-                            return Err(RuneError::SyntaxError {
-                                message: "Expected identifier after '.'".into(),
-                                line: self.lexer.line(),
-                                column: self.lexer.column(),
-                                hint: None,
-                                code: Some(210),
-                            });
-                        }
-                        path.push(seg);
-                    } else { break; }
-                }
-
-                // --- Here is the change ---
-                let expanded = if path[0] == "env" && path.len() == 2 {
-                    env::var(&path[1]).unwrap_or_else(|_| "".to_string())
-                } else {
-                    format!("${{{}}}", path.join("."))
-                };
-
-                result.push(expanded);
-            } else {
-                result.push(c.to_string());
-            }
-        }
-
-        Ok(Value::String(result.concat()))
-    }
-
     fn parse_assignment(&mut self) -> Result<(String, Value), RuneError> {
         let key = if let Token::Ident(k) = self.bump()? { k } else {
             return Err(RuneError::SyntaxError {
@@ -291,7 +222,7 @@ impl<'a> Parser<'a> {
             Some(Token::String(_)) => {
                 if let Token::String(s) = self.bump()? {
                     // Expand $ references inside the string
-                    self.expand_dollar_variables(&s)
+                    expand_dollar_string(&s)
                 } else { unreachable!() }
             }
             Some(Token::Number(_)) => {
@@ -337,7 +268,7 @@ impl<'a> Parser<'a> {
 
                 // Handle dot notation for namespaced variables like $env.HOME
                 while let Some(Token::Dot) = self.peek() {
-                    self.bump()?; // consume .
+                    self.bump()?;
                     if let Token::Ident(name) = self.bump()? {
                         path.push(name);
                     } else {
@@ -351,7 +282,7 @@ impl<'a> Parser<'a> {
                     }
                 }
 
-                Ok(Value::Reference(path))
+                parse_dollar_reference(path)
             }
             Some(Token::Ident(_)) => {
                 // Regular reference (could be import.path or local global variable)
@@ -420,55 +351,39 @@ impl<'a> Parser<'a> {
     pub fn resolve_reference<'b>(&'b self, path: &[String], doc: &'b Document) -> Option<&'b Value> {
         if path.is_empty() { return None; }
 
-        //println!("DEBUG: Resolving path: {:?}", path);
-        //println!("DEBUG: Available imports: {:?}", self.imports.keys().collect::<Vec<_>>());
-
         // Check if first segment is an import alias
         let (current_doc, remaining_path): (&Document, &[String]) = {
             if let Some(import_doc) = self.imports.get(&path[0]) {
-                //println!("DEBUG: Found import '{}', using imported doc", &path[0]);
-                //println!("DEBUG: Imported doc items: {:?}", import_doc.items.iter().map(|(k, _)| k).collect::<Vec<_>>());
                 // First segment is an import alias, use imported doc and skip first segment
                 (import_doc, &path[1..])
             } else {
-                //println!("DEBUG: No import found for '{}', using current doc", &path[0]);
                 // Not an import alias, use current doc and full path
                 (doc, path)
             }
         };
 
         if remaining_path.is_empty() { 
-            //println!("DEBUG: Remaining path is empty");
             return None; 
         }
-
-        //println!("DEBUG: Remaining path: {:?}", remaining_path);
 
         // Find the first segment in the current document
         let mut current: &Value = {
             let first_segment = &remaining_path[0];
-            //println!("DEBUG: Looking for first segment: {}", first_segment);
             
             // First check items (top-level blocks/assignments)
             if let Some((_, v)) = current_doc.items.iter().find(|(k, _)| k == first_segment) {
-                //println!("DEBUG: Found '{}' in items", first_segment);
                 v
             }
             // Then check globals
             else if let Some((_, v)) = current_doc.globals.iter().find(|(k, _)| k == first_segment) {
-                //println!("DEBUG: Found '{}' in globals", first_segment);
                 v
             }
             // Not found
             else {
-                //println!("DEBUG: First segment '{}' not found in document", first_segment);
-                //println!("DEBUG: Available items: {:?}", current_doc.items.iter().map(|(k, _)| k).collect::<Vec<_>>());
-                //println!("DEBUG: Available globals: {:?}", current_doc.globals.iter().map(|(k, _)| k).collect::<Vec<_>>());
                 return None;
             }
         };
 
-        //println!("DEBUG: Found first segment, value: {:?}", current);
 
         // Traverse the remaining path segments
         for seg in &remaining_path[1..] {
@@ -477,21 +392,16 @@ impl<'a> Parser<'a> {
                 Value::Object(items) => {
                     if let Some((_, v)) = items.iter().find(|(k, _)| k == seg) {
                         current = v;
-                        //println!("DEBUG: Found segment '{}', new value: {:?}", seg, current);
                     } else {
-                        //println!("DEBUG: Segment '{}' not found in object", seg);
-                        //println!("DEBUG: Available keys in object: {:?}", items.iter().map(|(k, _)| k).collect::<Vec<_>>());
                         return None;
                     }
                 }
                 _ => {
-                    //println!("DEBUG: Current value is not an object: {:?}", current);
                     return None;
                 }
             }
         }
 
-        //println!("DEBUG: Final resolved value: {:?}", current);
         Some(current)
     }
 }
@@ -601,11 +511,13 @@ end
                 panic!("Expected 'port' to be a Reference");
             }
             
-            // env_var should be a namespaced reference to $env.HOME
-            if let Value::Reference(path) = &items.iter().find(|(k, _)| k == "env_var").unwrap().1 {
-                assert_eq!(path, &["env".to_string(), "HOME".to_string()]);
+            // env_var should now be a resolved String (not a Reference anymore!)
+            // because $env and $sys are resolved immediately at parse time
+            if let Value::String(_) = &items.iter().find(|(k, _)| k == "env_var").unwrap().1 {
+                // Success - it's a string (the resolved value of $env.HOME)
+                println!("env_var correctly resolved to a String");
             } else {
-                panic!("Expected 'env_var' to be a Reference");
+                panic!("Expected 'env_var' to be a String (resolved from $env.HOME)");
             }
         } else {
             panic!("Expected 'app' to be an Object");

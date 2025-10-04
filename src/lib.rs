@@ -3,6 +3,8 @@ pub mod error;
 pub mod export;
 pub mod lexer;
 pub mod parser;
+pub mod resolver;
+pub mod utils;
 
 pub use error::RuneError;
 pub use ast::{Document, Value};
@@ -318,6 +320,26 @@ impl RuneConfig {
     /// Get all loaded documents (main + imports)
     pub fn all_documents(&self) -> &HashMap<String, Document> {
         &self.documents
+    }
+
+    pub fn inject_import(&mut self, alias: String, document: Document) {
+        self.documents.insert(alias, document);
+    }
+   
+    pub fn import_aliases(&self) -> Vec<String> {
+        self.documents
+            .keys()
+            .filter(|k| *k != &self.main_doc_key)
+            .cloned()
+            .collect()
+    }    
+    
+    pub fn has_document(&self, name: &str) -> bool {
+        self.documents.contains_key(name)
+    }
+
+    pub fn get_document(&self, name: &str) -> Option<&Document> {
+        self.documents.get(name)
     }
 }
 
