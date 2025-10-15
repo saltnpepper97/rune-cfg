@@ -59,6 +59,13 @@ pub enum RuneError {
         hint: Option<String>,
         code: Option<u32>,
     },
+    ValidationError {
+        message: String,
+        line: usize,
+        column: usize,
+        hint: Option<String>,
+        code: Option<u32>,
+    },
 }
 
 impl fmt::Display for RuneError {
@@ -112,6 +119,16 @@ impl fmt::Display for RuneError {
                     hint.as_ref().map_or(String::new(), |h| format!(" Hint: {}", h)),
                     code.map_or(String::new(), |c| format!(" Code: {}", c))
                 ),
+            RuneError::ValidationError { message, hint, code, .. } => {
+                write!(f, "{}", message)?;
+                if let Some(h) = hint {
+                    write!(f, "\nHint: {}", h)?;
+                }
+                if let Some(c) = code {
+                    write!(f, " [E{}]", c)?;
+                }
+                Ok(())
+            }
         }
     }
 }

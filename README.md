@@ -31,7 +31,7 @@ Add `rune-cfg` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rune-cfg = "0.1.0"
+rune-cfg = "0.1.4"
 ```
 
 ## Quick Example
@@ -242,7 +242,6 @@ end
 
 The following features are planned for future releases:
 
-- **`$sys` namespace** - Access system information (OS, architecture, etc.)
 - **`$runtime` namespace** - Query RUNE runtime information  
 - **Conditional logic** - Simple `if` statements for dynamic configs
 - **Enhanced regex integration** - Built-in regex validation and matching functions

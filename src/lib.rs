@@ -17,30 +17,11 @@ use std::path::Path;
 pub struct RuneConfig {
     documents: HashMap<String, Document>,
     main_doc_key: String,
+    raw_content: String, // Store for error reporting
 }
 
 impl RuneConfig {
     /// Load a RUNE configuration file from disk
-    /// 
-    /// # Example (doc-test friendly)
-    /// ```rust
-    /// use rune_cfg::RuneConfig;
-    ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// // Instead of reading a file, we use inline content for doc-test
-    /// let rune_content = r#"
-    /// app:
-    ///   name "MyApp"
-    ///   version "1.0.0"
-    /// end
-    /// "#;
-    ///
-    /// let config = RuneConfig::from_str(rune_content)?;
-    /// let app_name: String = config.get("app.name")?;
-    /// println!("{}", app_name);
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, RuneError> {
         let content = fs::read_to_string(&path).map_err(|e| RuneError::FileError {
             message: format!("Failed to read file: {}", e),
@@ -53,24 +34,6 @@ impl RuneConfig {
     }
 
     /// Parse RUNE configuration from a string
-    /// 
-    /// # Example
-    /// ```rust
-    /// use rune_cfg::RuneConfig;
-    ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let content = r#"
-    /// app:
-    ///   name "MyApp"
-    ///   version "1.0.0"
-    /// end
-    /// "#;
-    /// let config = RuneConfig::from_str(content)?;
-    /// let app_name: String = config.get("app.name")?;
-    /// println!("{}", app_name);
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn from_str(content: &str) -> Result<Self, RuneError> {
         let mut parser = parser::Parser::new(content)?;
         let main_doc = parser.parse_document()?;
@@ -83,12 +46,11 @@ impl RuneConfig {
         Ok(Self {
             documents,
             main_doc_key: main_key,
+            raw_content: content.to_string(),
         })
     }
 
     /// Load a RUNE config with imports resolved from a base directory
-    /// 
-    /// This will automatically load any `gather` statements relative to the base directory
     pub fn from_file_with_imports<P: AsRef<Path>>(path: P, base_dir: P) -> Result<Self, RuneError> {
         let content = fs::read_to_string(&path).map_err(|e| RuneError::FileError {
             message: format!("Failed to read file: {}", e),
@@ -132,32 +94,11 @@ impl RuneConfig {
         Ok(Self {
             documents,
             main_doc_key: main_key,
+            raw_content: content.to_string(),
         })
     }
 
     /// Get a value from the configuration using dot notation
-    ///  
-    /// # Example
-    /// ```rust
-    /// use rune_cfg::RuneConfig;
-    ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let rune_content = r#"
-    /// app:
-    ///   server:
-    ///     host "localhost"
-    ///     port 8080
-    ///   end
-    /// end
-    /// "#;
-    /// let config = RuneConfig::from_str(rune_content)?;
-    ///
-    /// let host: String = config.get("app.server.host")?;
-    /// let port: u16 = config.get("app.server.port")?;
-    /// println!("{}:{}", host, port);
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn get<T>(&self, path: &str) -> Result<T, RuneError> 
     where
         T: TryFrom<Value, Error = RuneError>
@@ -166,12 +107,151 @@ impl RuneConfig {
         T::try_from(value)
     }
 
+    /// Get a value with validation - returns detailed error with line info if validation fails
+    pub fn get_validated<T, F>(&self, path: &str, validator: F, valid_values: &str) -> Result<T, RuneError> 
+    where
+        T: TryFrom<Value, Error = RuneError>,
+        F: FnOnce(&T) -> bool,
+    {
+        let value = self.get_value(path)?;
+        let typed_value = T::try_from(value)?;
+        
+        if !validator(&typed_value) {
+            let (line, _snippet) = self.find_config_line(path);
+            return Err(RuneError::ValidationError {
+                message: format!(
+                    "Invalid value for `{}` on line {}.\nExpected: {}\n  → {}",
+                    path, line, valid_values, _snippet
+                ),
+                line,
+                column: 0,
+                hint: Some(format!("Valid values are: {}", valid_values)),
+                code: Some(450),
+            });
+        }
+        
+        Ok(typed_value)
+    }
+
+    /// Get a string value and validate it's one of the allowed values
+    pub fn get_string_enum(&self, path: &str, allowed_values: &[&str]) -> Result<String, RuneError> {
+        let value: String = self.get(path)?;
+        let lower_value = value.to_lowercase();
+        
+        if !allowed_values.iter().any(|&v| v.to_lowercase() == lower_value) {
+            let (line, _snippet) = self.find_config_line(path);
+            return Err(RuneError::ValidationError {
+                message: format!(
+                    "Invalid value '{}' for `{}` on line {}",
+                    value, path, line
+                ),
+                line,
+                column: 0,
+                hint: Some(format!("Expected one of: {}", allowed_values.join(", "))),
+                code: Some(451),
+            });
+        }
+        
+        Ok(value)
+    }
+
+    /// Get an optional value - returns None if key doesn't exist, Error if exists but invalid
+    pub fn get_optional<T>(&self, path: &str) -> Result<Option<T>, RuneError> 
+    where
+        T: TryFrom<Value, Error = RuneError>
+    {
+        match self.get_value(path) {
+            Ok(value) => Ok(Some(T::try_from(value)?)),
+            Err(e) => {
+                // Check if it's a "not found" error vs a parsing error
+                if let RuneError::SyntaxError { code: Some(304), .. } = e {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Get an optional value with a default
+    pub fn get_or<T>(&self, path: &str, default: T) -> T 
+    where
+        T: TryFrom<Value, Error = RuneError>
+    {
+        self.get(path).unwrap_or(default)
+    }
+
+    /// Check if a path exists in the raw content (for better error reporting)
+    pub fn path_exists_in_content(&self, path: &str) -> bool {
+        let (line, _) = self.find_config_line(path);
+        line > 0
+    }
+
+    /// Find a key in the config content and return its line number + snippet
+    pub fn find_config_line(&self, key: &str) -> (usize, String) {
+        let key_parts: Vec<&str> = key.split('.').collect();
+        let mut scope_stack: Vec<String> = Vec::new();
+
+        for (idx, line) in self.raw_content.lines().enumerate() {
+            let trimmed = line.trim();
+
+            // Skip comments and blank lines
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            // Enter new scope like `launcher:` or `theme:`
+            if trimmed.ends_with(':') && !trimmed.starts_with('@') {
+                let scope_name = trimmed.trim_end_matches(':').trim().to_string();
+                scope_stack.push(scope_name);
+                continue;
+            }
+
+            // Exit scope
+            if trimmed == "end" {
+                scope_stack.pop();
+                continue;
+            }
+
+            // Skip directives like @author
+            if trimmed.starts_with('@') {
+                continue;
+            }
+
+            // Check if the line contains a key (with or without =)
+            let line_key = if let Some((k, _)) = trimmed.split_once('=') {
+                k.trim()
+            } else if let Some((k, _)) = trimmed.split_once(char::is_whitespace) {
+                k.trim()
+            } else {
+                continue;
+            };
+
+            let full_path = {
+                let mut path = scope_stack.clone();
+                path.push(line_key.to_string());
+                path.join(".")
+            };
+
+            if full_path == key {
+                return (idx + 1, trimmed.to_string());
+            }
+
+            // fallback: match the last component (e.g. "border_style")
+            let simple_key = key_parts.last().unwrap_or(&key);
+            if line_key == *simple_key {
+                return (idx + 1, trimmed.to_string());
+            }
+        }
+
+        (0, "<key not found>".into())
+    }
+
     /// Get a raw Value from the configuration
     pub fn get_value(&self, path: &str) -> Result<Value, RuneError> {
         let path_segments: Vec<String> = path.split('.').map(|s| s.to_string()).collect();
         
         if let Some(main_doc) = self.documents.get(&self.main_doc_key) {
-            // Create a temporary parser for resolution (this is a bit awkward but works with current design)
             let mut temp_parser = parser::Parser::new("").map_err(|_| RuneError::SyntaxError {
                 message: "Failed to create temporary parser".into(),
                 line: 0,
@@ -188,15 +268,27 @@ impl RuneConfig {
             }
             
             let resolved = temp_parser.resolve_reference(&path_segments, main_doc)
-                .ok_or_else(|| RuneError::SyntaxError {
-                    message: format!("Path '{}' not found in configuration", path),
-                    line: 0,
-                    column: 0,
-                    hint: Some("Check that the path exists in your config file".into()),
-                    code: Some(304),
+                .ok_or_else(|| {
+                    let (line, snippet) = self.find_config_line(path);
+                    if line > 0 {
+                        RuneError::SyntaxError {
+                            message: format!("Path '{}' found but could not be resolved on line {}", path, line),
+                            line,
+                            column: 0,
+                            hint: Some(format!("Check the value at: {}", snippet)),
+                            code: Some(304),
+                        }
+                    } else {
+                        RuneError::SyntaxError {
+                            message: format!("Path '{}' not found in configuration", path),
+                            line: 0,
+                            column: 0,
+                            hint: Some("Check that the path exists in your config file".into()),
+                            code: Some(304),
+                        }
+                    }
                 })?;
 
-            // Recursively resolve references until we get a concrete value
             self.resolve_value_recursively(resolved, &temp_parser, main_doc)
         } else {
             Err(RuneError::SyntaxError {
@@ -229,13 +321,10 @@ impl RuneConfig {
                             code: Some(308),
                         })
                 } else if path[0] == "sys" {
-                    // You could implement sys variables (like OS info)
                     Ok(Value::String(format!("sys_placeholder:{}", path[1..].join("."))))
                 } else if path[0] == "runtime" {
-                    // Implement runtime-specific variables
                     Ok(Value::String(format!("runtime_placeholder:{}", path[1..].join("."))))
                 } else {
-                    // Otherwise treat as document reference
                     let resolved = parser
                         .resolve_reference(path, main_doc)
                         .ok_or_else(|| RuneError::SyntaxError {
@@ -271,28 +360,6 @@ impl RuneConfig {
     }
 
     /// Get all keys at a given path level
-    /// 
-    /// # Example (doc-test friendly)
-    /// ```rust
-    /// use rune_cfg::RuneConfig;
-    ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let rune_content = r#"
-    /// app:
-    ///   server:
-    ///     host "localhost"
-    ///     port 8080
-    ///   end
-    /// end
-    /// "#;
-    ///
-    /// let config = RuneConfig::from_str(rune_content)?;
-    /// let server_keys = config.get_keys("app.server")?;
-    /// assert!(server_keys.contains(&"host".to_string()));
-    /// assert!(server_keys.contains(&"port".to_string()));
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn get_keys(&self, path: &str) -> Result<Vec<String>, RuneError> {
         let value = self.get_value(path)?;
         match value {
@@ -496,9 +563,7 @@ where
     }
 }
 
-// Add a FileError variant to your RuneError enum
 impl RuneError {
-    // Helper constructor for file errors
     pub fn file_error(message: String, path: String) -> Self {
         RuneError::FileError {
             message,
@@ -538,34 +603,46 @@ end
 
         let config = RuneConfig::from_str(config_content).expect("Failed to parse config");
         
-        // Test basic string value
         let app_name: String = config.get("app.name").expect("Failed to get app.name");
         assert_eq!(app_name, "TestApp");
         
-        // Test nested value
         let host: String = config.get("app.server.host").expect("Failed to get host");
         assert_eq!(host, "localhost");
         
-        // Test number conversion
         let port: u16 = config.get("app.server.port").expect("Failed to get port");
         assert_eq!(port, 8080);
         
-        // Test boolean
         let debug: bool = config.get("app.debug").expect("Failed to get debug");
         assert_eq!(debug, true);
         
-        // Test array
         let features: Vec<String> = config.get("app.features").expect("Failed to get features");
         assert_eq!(features, vec!["auth", "logging"]);
         
-        // Test has()
         assert!(config.has("app.name"));
         assert!(!config.has("app.nonexistent"));
         
-        // Test get_keys()
         let server_keys = config.get_keys("app.server").expect("Failed to get server keys");
         assert!(server_keys.contains(&"host".to_string()));
         assert!(server_keys.contains(&"port".to_string()));
     }
-}
 
+    #[test]
+    fn test_string_enum_validation() {
+        let config_content = r#"
+theme:
+  border "rounded"
+  invalid "bad_value"
+end
+"#;
+
+        let config = RuneConfig::from_str(config_content).expect("Failed to parse config");
+        
+        // Valid value should work
+        let border = config.get_string_enum("theme.border", &["plain", "rounded", "thick"]);
+        assert!(border.is_ok());
+        
+        // Invalid value should error
+        let invalid = config.get_string_enum("theme.invalid", &["good", "better"]);
+        assert!(invalid.is_err());
+    }
+}
