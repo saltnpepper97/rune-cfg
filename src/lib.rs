@@ -104,7 +104,52 @@ impl RuneConfig {
         T: TryFrom<Value, Error = RuneError>
     {
         let value = self.get_value(path)?;
-        T::try_from(value)
+        T::try_from(value).map_err(|e| {
+            // Enhance error with line information if it's a type error
+            match e {
+                RuneError::TypeError { message, hint, code, .. } => {
+                    let (line, snippet) = self.find_config_line(path);
+                    if line > 0 {
+                        RuneError::TypeError {
+                            message: format!("{}\n  → {}", message, snippet),
+                            line,
+                            column: 0,
+                            hint,
+                            code,
+                        }
+                    } else {
+                        RuneError::TypeError {
+                            message,
+                            line: 0,
+                            column: 0,
+                            hint,
+                            code,
+                        }
+                    }
+                }
+                RuneError::ValidationError { message, hint, code, .. } => {
+                    let (line, snippet) = self.find_config_line(path);
+                    if line > 0 {
+                        RuneError::ValidationError {
+                            message: format!("{}\n  → {}", message, snippet),
+                            line,
+                            column: 0,
+                            hint,
+                            code,
+                        }
+                    } else {
+                        RuneError::ValidationError {
+                            message,
+                            line: 0,
+                            column: 0,
+                            hint,
+                            code,
+                        }
+                    }
+                }
+                other => other,
+            }
+        })
     }
 
     /// Get a value with validation - returns detailed error with line info if validation fails
@@ -117,15 +162,15 @@ impl RuneConfig {
         let typed_value = T::try_from(value)?;
         
         if !validator(&typed_value) {
-            let (line, _snippet) = self.find_config_line(path);
+            let (line, snippet) = self.find_config_line(path);
             return Err(RuneError::ValidationError {
                 message: format!(
-                    "Invalid value for `{}` on line {}.\nExpected: {}\n  → {}",
-                    path, line, valid_values, _snippet
+                    "Invalid value for `{}`\nExpected: {}",
+                    path, valid_values
                 ),
                 line,
                 column: 0,
-                hint: Some(format!("Valid values are: {}", valid_values)),
+                hint: Some(format!("Valid values are: {}\n  → {}", valid_values, snippet)),
                 code: Some(450),
             });
         }
@@ -139,15 +184,15 @@ impl RuneConfig {
         let lower_value = value.to_lowercase();
         
         if !allowed_values.iter().any(|&v| v.to_lowercase() == lower_value) {
-            let (line, _snippet) = self.find_config_line(path);
+            let (line, snippet) = self.find_config_line(path);
             return Err(RuneError::ValidationError {
                 message: format!(
-                    "Invalid value '{}' for `{}` on line {}",
-                    value, path, line
+                    "Invalid value '{}' for `{}`",
+                    value, path
                 ),
                 line,
                 column: 0,
-                hint: Some(format!("Expected one of: {}", allowed_values.join(", "))),
+                hint: Some(format!("Expected one of: {}\n  → {}", allowed_values.join(", "), snippet)),
                 code: Some(451),
             });
         }
@@ -325,17 +370,14 @@ impl RuneConfig {
                 } else if path[0] == "runtime" {
                     Ok(Value::String(format!("runtime_placeholder:{}", path[1..].join("."))))
                 } else {
-                    let resolved = parser
-                        .resolve_reference(path, main_doc)
-                        .ok_or_else(|| RuneError::SyntaxError {
-                            message: format!("Reference {:?} could not be resolved", path),
-                            line: 0,
-                            column: 0,
-                            hint: Some("Check that the referenced value exists".into()),
-                            code: Some(307),
-                        })?;
-
-                    self.resolve_value_recursively(resolved, parser, main_doc)
+                    // Try to resolve the reference
+                    if let Some(resolved) = parser.resolve_reference(path, main_doc) {
+                        self.resolve_value_recursively(resolved, parser, main_doc)
+                    } else {
+                        // Reference couldn't be resolved - return as-is for better error handling
+                        // This allows TryFrom implementations to provide context-specific errors
+                        Ok(value.clone())
+                    }
                 }
             }
             Value::Array(arr) => {
@@ -526,11 +568,39 @@ impl TryFrom<Value> for bool {
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
             Value::Bool(b) => Ok(b),
+            Value::Reference(ref path) if path.len() == 1 => {
+                // Handle unresolved references that look like boolean typos
+                let ref_name = &path[0];
+                if ref_name.to_lowercase().starts_with("tru") 
+                    || ref_name.to_lowercase().starts_with("fal") {
+                    Err(RuneError::TypeError {
+                        message: format!(
+                            "Invalid boolean value '{}'. Did you mean 'true' or 'false'?",
+                            ref_name
+                        ),
+                        line: 0,
+                        column: 0,
+                        hint: None,
+                        code: Some(404),
+                    })
+                } else {
+                    Err(RuneError::TypeError {
+                        message: format!(
+                            "Expected boolean (true/false), got reference to '{}'",
+                            ref_name
+                        ),
+                        line: 0,
+                        column: 0,
+                        hint: None,
+                        code: Some(404),
+                    })
+                }
+            }
             _ => Err(RuneError::TypeError {
                 message: format!("Expected boolean, got {:?}", value),
                 line: 0,
                 column: 0,
-                hint: Some("Use true or false in your config".into()),
+                hint: None,
                 code: Some(404),
             })
         }

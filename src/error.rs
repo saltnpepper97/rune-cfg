@@ -71,54 +71,110 @@ pub enum RuneError {
 impl fmt::Display for RuneError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RuneError::SyntaxError { message, line, column, hint, code } =>
-                write!(f, "[RUNE] Syntax Error at {}:{}: {}{}{}", 
-                    line, column, message,
-                    hint.as_ref().map_or(String::new(), |h| format!(" Hint: {}", h)),
-                    code.map_or(String::new(), |c| format!(" Code: {}", c))
-                ),
-            RuneError::InvalidToken { token, line, column, hint, code } =>
-                write!(f, "[RUNE] Invalid Token '{}' at {}:{}{}{}", 
-                    token, line, column,
-                    hint.as_ref().map_or(String::new(), |h| format!(" Hint: {}", h)),
-                    code.map_or(String::new(), |c| format!(" Code: {}", c))
-                ),
-            RuneError::UnexpectedEof { message, line, column, hint, code } =>
-                write!(f, "[RUNE] Unexpected EOF at {}:{}: {}{}{}", 
-                    line, column, message,
-                    hint.as_ref().map_or(String::new(), |h| format!(" Hint: {}", h)),
-                    code.map_or(String::new(), |c| format!(" Code: {}", c))
-                ),
-            RuneError::TypeError { message, line, column, hint, code } =>
-                write!(f, "[RUNE] Type Error at {}:{}: {}{}{}", 
-                    line, column, message,
-                    hint.as_ref().map_or(String::new(), |h| format!(" Hint: {}", h)),
-                    code.map_or(String::new(), |c| format!(" Code: {}", c))
-                ),
-            RuneError::UnclosedString { quote, line, column, hint, code } =>
-                write!(f, "[RUNE] Unclosed string starting with '{}' at {}:{}{}{}", 
-                    quote, line, column,
-                    hint.as_ref().map_or(String::new(), |h| format!(" Hint: {}", h)),
-                    code.map_or(String::new(), |c| format!(" Code: {}", c))
-                ),
-            RuneError::UnexpectedCharacter { character, line, column, hint, code } =>
-                write!(f, "[RUNE] Unexpected character '{}' at {}:{}{}{}", 
-                    character, line, column,
-                    hint.as_ref().map_or(String::new(), |h| format!(" Hint: {}", h)),
-                    code.map_or(String::new(), |c| format!(" Code: {}", c))
-                ),
-            RuneError::FileError { message, path, hint, code } =>
-                write!(f, "[RUNE] File Error '{}': {}{}{}", 
-                    path, message,
-                    hint.as_ref().map_or(String::new(), |h| format!(" Hint: {}", h)),
-                    code.map_or(String::new(), |c| format!(" Code: {}", c))
-                ),
-            RuneError::RuntimeError { message, hint, code } =>
-                write!(f, "[RUNE] Runtime Error: {}{}{}", 
-                    message,
-                    hint.as_ref().map_or(String::new(), |h| format!(" Hint: {}", h)),
-                    code.map_or(String::new(), |c| format!(" Code: {}", c))
-                ),
+            RuneError::SyntaxError { message, line, hint, code, .. } => {
+                if *line > 0 {
+                    write!(f, "[RUNE] Syntax Error at line {}: {}", line, message)?;
+                } else {
+                    write!(f, "[RUNE] Syntax Error: {}", message)?;
+                }
+                if let Some(h) = hint {
+                    write!(f, " Hint: {}", h)?;
+                }
+                if let Some(c) = code {
+                    write!(f, " Code: {}", c)?;
+                }
+                Ok(())
+            }
+            RuneError::InvalidToken { token, line, hint, code, .. } => {
+                if *line > 0 {
+                    write!(f, "[RUNE] Invalid Token '{}' at line {}", token, line)?;
+                } else {
+                    write!(f, "[RUNE] Invalid Token '{}'", token)?;
+                }
+                if let Some(h) = hint {
+                    write!(f, " Hint: {}", h)?;
+                }
+                if let Some(c) = code {
+                    write!(f, " Code: {}", c)?;
+                }
+                Ok(())
+            }
+            RuneError::UnexpectedEof { message, line, hint, code, .. } => {
+                if *line > 0 {
+                    write!(f, "[RUNE] Unexpected EOF at line {}: {}", line, message)?;
+                } else {
+                    write!(f, "[RUNE] Unexpected EOF: {}", message)?;
+                }
+                if let Some(h) = hint {
+                    write!(f, " Hint: {}", h)?;
+                }
+                if let Some(c) = code {
+                    write!(f, " Code: {}", c)?;
+                }
+                Ok(())
+            }
+            RuneError::TypeError { message, line, hint, code, .. } => {
+                if *line > 0 {
+                    write!(f, "[RUNE] Type Error at line {}: {}", line, message)?;
+                } else {
+                    write!(f, "[RUNE] Type Error: {}", message)?;
+                }
+                if let Some(h) = hint {
+                    write!(f, " Hint: {}", h)?;
+                }
+                if let Some(c) = code {
+                    write!(f, " Code: {}", c)?;
+                }
+                Ok(())
+            }
+            RuneError::UnclosedString { quote, line, hint, code, .. } => {
+                if *line > 0 {
+                    write!(f, "[RUNE] Unclosed string starting with '{}' at line {}", quote, line)?;
+                } else {
+                    write!(f, "[RUNE] Unclosed string starting with '{}'", quote)?;
+                }
+                if let Some(h) = hint {
+                    write!(f, " Hint: {}", h)?;
+                }
+                if let Some(c) = code {
+                    write!(f, " Code: {}", c)?;
+                }
+                Ok(())
+            }
+            RuneError::UnexpectedCharacter { character, line, hint, code, .. } => {
+                if *line > 0 {
+                    write!(f, "[RUNE] Unexpected character '{}' at line {}", character, line)?;
+                } else {
+                    write!(f, "[RUNE] Unexpected character '{}'", character)?;
+                }
+                if let Some(h) = hint {
+                    write!(f, " Hint: {}", h)?;
+                }
+                if let Some(c) = code {
+                    write!(f, " Code: {}", c)?;
+                }
+                Ok(())
+            }
+            RuneError::FileError { message, path, hint, code } => {
+                write!(f, "[RUNE] File Error '{}': {}", path, message)?;
+                if let Some(h) = hint {
+                    write!(f, " Hint: {}", h)?;
+                }
+                if let Some(c) = code {
+                    write!(f, " Code: {}", c)?;
+                }
+                Ok(())
+            }
+            RuneError::RuntimeError { message, hint, code } => {
+                write!(f, "[RUNE] Runtime Error: {}", message)?;
+                if let Some(h) = hint {
+                    write!(f, " Hint: {}", h)?;
+                }
+                if let Some(c) = code {
+                    write!(f, " Code: {}", c)?;
+                }
+                Ok(())
+            }
             RuneError::ValidationError { message, hint, code, .. } => {
                 write!(f, "{}", message)?;
                 if let Some(h) = hint {
