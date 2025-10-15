@@ -504,6 +504,35 @@ impl TryFrom<Value> for i32 {
     }
 }
 
+impl TryFrom<Value> for u8 {
+    type Error = RuneError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Number(n) => {
+                if n >= 0.0 && n <= u8::MAX as f64 {
+                    Ok(n as u8)
+                } else {
+                    Err(RuneError::TypeError {
+                        message: format!("Number {} out of range for u8", n),
+                        line: 0,
+                        column: 0,
+                        hint: Some("Use a number between 0 and 255".into()),
+                        code: Some(407),
+                    })
+                }
+            }
+            _ => Err(RuneError::TypeError {
+                message: format!("Expected number, got {:?}", value),
+                line: 0,
+                column: 0,
+                hint: Some("Use a number value in your config".into()),
+                code: Some(402),
+            }),
+        }
+    }
+}
+
 impl TryFrom<Value> for u16 {
     type Error = RuneError;
 
