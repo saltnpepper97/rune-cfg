@@ -6,22 +6,22 @@ pub mod parser;
 pub mod resolver;
 pub mod utils;
 
-pub use error::RuneError;
-pub use ast::{Document, Value};
-
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use indexmap::IndexMap;
+
+pub use ast::{Document, Value};
+pub use error::RuneError;
+
 
 /// Main configuration struct that holds parsed RUNE documents and handles resolution
 pub struct RuneConfig {
-    documents: HashMap<String, Document>,
+    documents: IndexMap<String, Document>,
     main_doc_key: String,
     raw_content: String, // Store for error reporting
 }
 
 impl RuneConfig {
-    /// Load a RUNE configuration file from disk
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, RuneError> {
         let content = fs::read_to_string(&path).map_err(|e| RuneError::FileError {
             message: format!("Failed to read file: {}", e),
@@ -33,12 +33,11 @@ impl RuneConfig {
         Self::from_str(&content)
     }
 
-    /// Parse RUNE configuration from a string
     pub fn from_str(content: &str) -> Result<Self, RuneError> {
         let mut parser = parser::Parser::new(content)?;
         let main_doc = parser.parse_document()?;
         
-        let mut documents = HashMap::new();
+        let mut documents = IndexMap::new();
         let main_key = "main".to_string();
         
         documents.insert(main_key.clone(), main_doc);
@@ -82,7 +81,7 @@ impl RuneConfig {
             }
         }
 
-        let mut documents = HashMap::new();
+        let mut documents = IndexMap::new();
         let main_key = "main".to_string();
         
         // Store main document and all imports
@@ -427,7 +426,7 @@ impl RuneConfig {
     }
 
     /// Get all loaded documents (main + imports)
-    pub fn all_documents(&self) -> &HashMap<String, Document> {
+    pub fn all_documents(&self) -> &IndexMap<String, Document> {
         &self.documents
     }
 
@@ -744,4 +743,23 @@ end
         let invalid = config.get_string_enum("theme.invalid", &["good", "better"]);
         assert!(invalid.is_err());
     }
+}
+
+#[test]
+fn test_order_preservation() {
+    let config_content = r#"
+first "1"
+second "2"
+third "3"
+
+nested:
+    alpha "a"
+    beta "b"
+    gamma "c"
+end
+"#;
+
+    let config = RuneConfig::from_str(config_content).unwrap();
+    let keys = config.get_keys("nested").unwrap();
+    assert_eq!(keys, vec!["alpha", "beta", "gamma"]);
 }
