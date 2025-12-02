@@ -29,15 +29,28 @@ impl RuneConfig {
 
     /// Get a string value and validate it's one of the allowed values
     pub fn get_string_enum(&self, path: &str, allowed_values: &[&str]) -> Result<String, RuneError> {
-        let value: String = self.get(path)?;
-        let lower_value = value.to_lowercase();
+        // Instead of relying on TryFrom, use get_value and match directly
+        let value = self.get_value(path)?;
+        
+        let string_value = match value {
+            Value::String(s) => s,
+            _ => return Err(RuneError::TypeError {
+                message: format!("Expected string for `{}`, got {:?}", path, value),
+                line: 0,
+                column: 0,
+                hint: Some("Use a string value in your config".into()),
+                code: Some(401),
+            })
+        };
+        
+        let lower_value = string_value.to_lowercase();
         
         if !allowed_values.iter().any(|&v| v.to_lowercase() == lower_value) {
             let (line, snippet) = helpers::find_config_line(path, &self.raw_content);
             return Err(RuneError::ValidationError {
                 message: format!(
                     "Invalid value '{}' for `{}`",
-                    value, path
+                    string_value, path
                 ),
                 line,
                 column: 0,
@@ -46,7 +59,7 @@ impl RuneConfig {
             });
         }
         
-        Ok(value)
+        Ok(string_value)
     }
 
     /// Check if a path exists in the raw content (for better error reporting)

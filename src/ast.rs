@@ -18,7 +18,6 @@ pub struct Document {
     pub globals: Vec<(String, Value)>,  // global variables
 }
 
-
 impl Value {
     pub fn as_object(&self) -> Option<&Vec<(String, Value)>> {
         if let Value::Object(items) = self {

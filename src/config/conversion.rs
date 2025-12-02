@@ -1,4 +1,5 @@
 use crate::{Value, RuneError};
+use std::collections::HashMap;
 
 impl TryFrom<Value> for String {
     type Error = RuneError;
@@ -34,12 +35,46 @@ impl TryFrom<Value> for f64 {
     }
 }
 
+impl TryFrom<Value> for f32 {
+    type Error = RuneError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Number(n) => Ok(n as f32),
+            _ => Err(RuneError::TypeError {
+                message: format!("Expected number, got {:?}", value),
+                line: 0,
+                column: 0,
+                hint: Some("Use a number value in your config".into()),
+                code: Some(402),
+            })
+        }
+    }
+}
+
 impl TryFrom<Value> for i32 {
     type Error = RuneError;
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
             Value::Number(n) => Ok(n as i32),
+            _ => Err(RuneError::TypeError {
+                message: format!("Expected number, got {:?}", value),
+                line: 0,
+                column: 0,
+                hint: Some("Use a number value in your config".into()),
+                code: Some(402),
+            })
+        }
+    }
+}
+
+impl TryFrom<Value> for i64 {
+    type Error = RuneError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Number(n) => Ok(n as i64),
             _ => Err(RuneError::TypeError {
                 message: format!("Expected number, got {:?}", value),
                 line: 0,
@@ -109,6 +144,35 @@ impl TryFrom<Value> for u16 {
     }
 }
 
+impl TryFrom<Value> for u32 {
+    type Error = RuneError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Number(n) => {
+                if n >= 0.0 && n <= u32::MAX as f64 {
+                    Ok(n as u32)
+                } else {
+                    Err(RuneError::TypeError {
+                        message: format!("Number {} out of range for u32", n),
+                        line: 0,
+                        column: 0,
+                        hint: Some("Use a number between 0 and 4294967295".into()),
+                        code: Some(408),
+                    })
+                }
+            }
+            _ => Err(RuneError::TypeError {
+                message: format!("Expected number, got {:?}", value),
+                line: 0,
+                column: 0,
+                hint: Some("Use a number value in your config".into()),
+                code: Some(402),
+            })
+        }
+    }
+}
+
 impl TryFrom<Value> for u64 {
     type Error = RuneError;
 
@@ -124,6 +188,35 @@ impl TryFrom<Value> for u64 {
                         column: 0,
                         hint: Some("Use a positive number within u64 range".into()),
                         code: Some(406),
+                    })
+                }
+            }
+            _ => Err(RuneError::TypeError {
+                message: format!("Expected number, got {:?}", value),
+                line: 0,
+                column: 0,
+                hint: Some("Use a number value in your config".into()),
+                code: Some(402),
+            }),
+        }
+    }
+}
+
+impl TryFrom<Value> for usize {
+    type Error = RuneError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Number(n) => {
+                if n >= 0.0 && n.is_finite() {
+                    Ok(n as usize)
+                } else {
+                    Err(RuneError::TypeError {
+                        message: format!("Number {} out of range for usize", n),
+                        line: 0,
+                        column: 0,
+                        hint: Some("Use a positive integer".into()),
+                        code: Some(409),
                     })
                 }
             }
@@ -203,6 +296,109 @@ where
                 column: 0,
                 hint: Some("Use an array [...] in your config".into()),
                 code: Some(405),
+            })
+        }
+    }
+}
+
+impl<T> TryFrom<Value> for Option<T>
+where
+    T: TryFrom<Value, Error = RuneError>
+{
+    type Error = RuneError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Null => Ok(None),
+            v => Ok(Some(T::try_from(v)?)),
+        }
+    }
+}
+
+impl TryFrom<Value> for HashMap<String, Value> {
+    type Error = RuneError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Object(items) => {
+                let mut map = HashMap::new();
+                for (key, val) in items {
+                    map.insert(key, val);
+                }
+                Ok(map)
+            }
+            _ => Err(RuneError::TypeError {
+                message: format!("Expected object, got {:?}", value),
+                line: 0,
+                column: 0,
+                hint: Some("Use an object block in your config".into()),
+                code: Some(410),
+            })
+        }
+    }
+}
+
+impl TryFrom<Value> for HashMap<String, String> {
+    type Error = RuneError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Object(items) => {
+                let mut map = HashMap::new();
+                for (key, val) in items {
+                    let string_val = String::try_from(val)?;
+                    map.insert(key, string_val);
+                }
+                Ok(map)
+            }
+            _ => Err(RuneError::TypeError {
+                message: format!("Expected object, got {:?}", value),
+                line: 0,
+                column: 0,
+                hint: Some("Use an object block with string values".into()),
+                code: Some(410),
+            })
+        }
+    }
+}
+
+impl TryFrom<Value> for (String, String) {
+    type Error = RuneError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Array(arr) if arr.len() == 2 => {
+                let first = String::try_from(arr[0].clone())?;
+                let second = String::try_from(arr[1].clone())?;
+                Ok((first, second))
+            }
+            _ => Err(RuneError::TypeError {
+                message: "Expected array with exactly 2 string elements".into(),
+                line: 0,
+                column: 0,
+                hint: Some("Use [\"key\", \"value\"] format".into()),
+                code: Some(411),
+            })
+        }
+    }
+}
+
+impl TryFrom<Value> for (String, Value) {
+    type Error = RuneError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Array(arr) if arr.len() == 2 => {
+                let key = String::try_from(arr[0].clone())?;
+                let val = arr[1].clone();
+                Ok((key, val))
+            }
+            _ => Err(RuneError::TypeError {
+                message: "Expected array with exactly 2 elements (key and value)".into(),
+                line: 0,
+                column: 0,
+                hint: Some("Use [\"key\", value] format".into()),
+                code: Some(411),
             })
         }
     }
