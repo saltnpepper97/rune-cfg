@@ -188,13 +188,15 @@ fn tokenize_identifier_or_keyword(lexer: &mut Lexer) -> Result<Token, RuneError>
         }
     }
 
-    // Map keywords to their respective tokens
     let token = match ident.as_str() {
         "true" => Token::Bool(true),
         "false" => Token::Bool(false),
         "end" => Token::End,
         "gather" => Token::Gather,
         "as" => Token::As,
+        "if" => Token::If,
+        "else" => Token::Else,
+        "elseif" | "else-if" => Token::ElseIf,
         "null" | "None" => Token::Null,
         _ => Token::Ident(ident),
     };

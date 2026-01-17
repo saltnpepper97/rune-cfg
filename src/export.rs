@@ -1,11 +1,31 @@
-use crate::parser::Parser;
-use crate::ast::Document;
-use crate::RuneError;
-use serde_json::json;
 use std::fs;
+use serde_json::json;
 
+use crate::ast::Document;
+use crate::parser::Parser;
+use crate::RuneError;
+
+/// Export a RUNE document to JSON format.
+///
+/// Converts all RUNE values to their JSON equivalents:
+/// - Strings, numbers, booleans → direct mapping
+/// - Arrays, objects → nested JSON structures  
+/// - Regex → `{"regex": "pattern"}`
+/// - References → dotted string path
+/// - Conditionals → structured object with condition/then/else
+/// - Null → JSON null
+///
+/// # Examples
+/// ```no_run
+/// use rune_cfg::{RuneConfig, export};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = RuneConfig::from_file("config.rune")?;
+/// // Export would require internal document access
+/// # Ok(())
+/// # }
+/// ```
 pub fn export_document_to_json(doc: &Document) -> Result<String, RuneError> {
-    // Convert Document -> serde_json::Value recursively
     fn value_to_json(v: &crate::ast::Value) -> serde_json::Value {
         match v {
             crate::ast::Value::String(s) => json!(s),
@@ -17,15 +37,22 @@ pub fn export_document_to_json(doc: &Document) -> Result<String, RuneError> {
                 serde_json::Value::Object(map)
             },
             crate::ast::Value::Reference(path) => {
-                // Just serialize references as dotted strings
                 json!(path.join("."))
             },
             crate::ast::Value::Interpolated(parts) => {
                 json!(parts.iter().map(value_to_json).collect::<Vec<_>>())
             }
             crate::ast::Value::Regex(r) => {
-                // Export regex as a tagged JSON string
-                json!({ "regex": r })
+                json!({ "regex": r.as_str() })
+            }
+            crate::ast::Value::Conditional(c) => {
+                json!({
+                    "conditional": {
+                        "condition": format!("{:?}", c.condition),
+                        "then": value_to_json(&c.then_value),
+                        "else": c.else_value.as_ref().map(value_to_json)
+                    }
+                })
             }
             crate::ast::Value::Null => serde_json::Value::Null, 
         }
@@ -33,12 +60,15 @@ pub fn export_document_to_json(doc: &Document) -> Result<String, RuneError> {
 
     let mut top = serde_json::Map::new();
 
-    // Optionally include metadata and globals
     let metadata = doc.metadata.iter().map(|(k, v)| (k.clone(), value_to_json(v))).collect::<serde_json::Map<_, _>>();
-    if !metadata.is_empty() { top.insert("metadata".into(), serde_json::Value::Object(metadata)); }
+    if !metadata.is_empty() { 
+        top.insert("metadata".into(), serde_json::Value::Object(metadata)); 
+    }
 
     let globals = doc.globals.iter().map(|(k, v)| (k.clone(), value_to_json(v))).collect::<serde_json::Map<_, _>>();
-    if !globals.is_empty() { top.insert("globals".into(), serde_json::Value::Object(globals)); }
+    if !globals.is_empty() { 
+        top.insert("globals".into(), serde_json::Value::Object(globals)); 
+    }
 
     let items = doc.items.iter().map(|(k, v)| (k.clone(), value_to_json(v))).collect::<serde_json::Map<_, _>>();
     top.insert("items".into(), serde_json::Value::Object(items));
@@ -46,12 +76,31 @@ pub fn export_document_to_json(doc: &Document) -> Result<String, RuneError> {
     Ok(serde_json::to_string_pretty(&serde_json::Value::Object(top)).unwrap())
 }
 
-/// Export from a `.rune` file directly
+/// Export a RUNE file directly to JSON.
+///
+/// Convenience function that reads, parses, and exports in one call.
+///
+/// # Examples
+/// ```no_run
+/// use rune_cfg::export::export_rune_file;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let json = export_rune_file("config.rune")?;
+/// println!("{}", json);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Errors
+/// Returns error if file doesn't exist or contains invalid RUNE syntax.
 pub fn export_rune_file(path: &str) -> Result<String, RuneError> {
     let input = fs::read_to_string(path)
         .map_err(|e| RuneError::SyntaxError { 
             message: format!("Failed to read file: {}", e), 
-            line: 0, column: 0, hint: None, code: Some(500)
+            line: 0, 
+            column: 0, 
+            hint: None, 
+            code: Some(500)
         })?;
     
     let mut parser = Parser::new(&input)?;
@@ -63,52 +112,49 @@ pub fn export_rune_file(path: &str) -> Result<String, RuneError> {
 mod tests {
     use super::*;
     use crate::parser::Parser;
+    use crate::ast::{Document, Value};
+    use regex::Regex;
     use std::fs;
 
     #[test]
     fn test_export_example_rune_to_json() {
-        // Read defaults.rune
         let defaults_input = fs::read_to_string("examples/defaults.rune")
             .expect("Failed to read defaults.rune");
-        let mut defaults_parser = Parser::new(&defaults_input).expect("Failed to create parser for defaults");
-        let defaults_doc = defaults_parser.parse_document().expect("Failed to parse defaults.rune");
+        let mut defaults_parser = Parser::new(&defaults_input)
+            .expect("Failed to create parser for defaults");
+        let defaults_doc = defaults_parser.parse_document()
+            .expect("Failed to parse defaults.rune");
 
-        // Read example.rune
         let example_input = fs::read_to_string("examples/example.rune")
             .expect("Failed to read example.rune");
-        let mut parser = Parser::new(&example_input).expect("Failed to create parser for example");
-        let doc = parser.parse_document().expect("Failed to parse example.rune");
+        let mut parser = Parser::new(&example_input)
+            .expect("Failed to create parser for example");
+        let doc = parser.parse_document()
+            .expect("Failed to parse example.rune");
 
-        // Inject the defaults import
         parser.inject_import("defaults".to_string(), defaults_doc);
 
-        // Export to JSON
-        let json_output = export_document_to_json(&doc).expect("Failed to export document to JSON");
+        let json_output = export_document_to_json(&doc)
+            .expect("Failed to export document to JSON");
 
         println!("--- Exported JSON ---\n{}", json_output);
 
-        // Optional: you can deserialize and assert
         let deserialized: serde_json::Value = serde_json::from_str(&json_output).unwrap();
         assert!(deserialized.get("items").is_some());
         assert!(deserialized.get("metadata").is_some());
     }
-}
 
-#[test]
-fn test_export_regex() {
-    use crate::ast::Value;
-
-    let doc = Document {
-        items: vec![("pattern".to_string(), Value::Regex("^foo.*bar$".into()))],
-        metadata: vec![],
-        globals: vec![],
-    };
-
-    let json_output = export_document_to_json(&doc).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&json_output).unwrap();
-
-    assert_eq!(
-        v["items"]["pattern"]["regex"],
-        "^foo.*bar$"
-    );
+    #[test]
+    fn test_export_regex() {
+        let doc = Document {
+            items: vec![("pattern".to_string(), Value::Regex(Regex::new("^foo.*bar$").unwrap()))],
+            metadata: vec![],
+            globals: vec![],
+        };
+        
+        let json_output = export_document_to_json(&doc).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json_output).unwrap();
+        
+        assert_eq!(v["items"]["pattern"]["regex"], "^foo.*bar$");
+    }
 }

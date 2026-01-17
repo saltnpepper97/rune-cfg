@@ -1,7 +1,6 @@
 use super::*;
 
 impl RuneConfig {
-    /// Get a value with validation - returns detailed error with line info if validation fails
     pub fn get_validated<T, F>(&self, path: &str, validator: F, valid_values: &str) -> Result<T, RuneError> 
     where
         T: TryFrom<Value, Error = RuneError>,
@@ -27,9 +26,7 @@ impl RuneConfig {
         Ok(typed_value)
     }
 
-    /// Get a string value and validate it's one of the allowed values
     pub fn get_string_enum(&self, path: &str, allowed_values: &[&str]) -> Result<String, RuneError> {
-        // Instead of relying on TryFrom, use get_value and match directly
         let value = self.get_value(path)?;
         
         let string_value = match value {
@@ -62,7 +59,6 @@ impl RuneConfig {
         Ok(string_value)
     }
 
-    /// Check if a path exists in the raw content (for better error reporting)
     pub fn path_exists_in_content(&self, path: &str) -> bool {
         let (line, _) = helpers::find_config_line(path, &self.raw_content);
         line > 0

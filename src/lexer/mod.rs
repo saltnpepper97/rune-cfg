@@ -12,10 +12,9 @@ pub enum Token {
     Number(f64),
     Bool(bool),
     Null,
-
     Colon, Equals, LBracket, RBracket, End,
     Dollar, Dot, At, Gather, As,
-
+    If, Else, ElseIf,
     Newline,
     Eof,
 }

@@ -47,7 +47,7 @@ pub(super) fn parse_document(parser: &mut Parser) -> Result<Document, RuneError>
 }
 
 fn parse_metadata(parser: &mut Parser, metadata: &mut Vec<(String, Value)>) -> Result<(), RuneError> {
-    parser.bump()?; // consume @
+    parser.bump()?;
     
     if let Token::Ident(key) = parser.bump()? {
         let value = value::parse_value(parser)?;
@@ -77,8 +77,7 @@ fn parse_top_level_item(
     
     match parser.peek() {
         Some(Token::Colon) => {
-            // Block definition
-            parser.bump()?; // consume colon
+            parser.bump()?;
             let mut object_items = Vec::new();
 
             while let Some(tok) = parser.peek() {
@@ -108,7 +107,7 @@ fn parse_top_level_item(
         }
         Some(Token::Equals) => {
             // Explicit assignment with =
-            parser.bump()?; // consume =
+            parser.bump()?;
             let value = value::parse_value(parser)?;
             globals.push((key, value));
         }
@@ -123,7 +122,7 @@ fn parse_top_level_item(
 }
 
 fn parse_gather_statement(parser: &mut Parser) -> Result<(), RuneError> {
-    parser.bump()?; // consume gather
+    parser.bump()?;
     
     let filename = if let Token::String(f) = parser.bump()? { 
         f 
@@ -138,7 +137,7 @@ fn parse_gather_statement(parser: &mut Parser) -> Result<(), RuneError> {
     };
 
     let alias = if let Some(Token::As) = parser.peek() {
-        parser.bump()?; // consume 'as'
+        parser.bump()?;
         if let Token::Ident(a) = parser.bump()? { 
             a 
         } else {
@@ -151,7 +150,6 @@ fn parse_gather_statement(parser: &mut Parser) -> Result<(), RuneError> {
             });
         }
     } else { 
-        // Use filename (just the filename part, not full path) without extension as default alias
         use std::path::PathBuf;
         PathBuf::from(&filename)
             .file_stem()
@@ -160,7 +158,6 @@ fn parse_gather_statement(parser: &mut Parser) -> Result<(), RuneError> {
             .to_string()
     };
 
-    // Store imported alias with placeholder document (to be replaced when loaded)
     parser.imports.insert(
         alias, 
         Document { 
@@ -172,4 +169,3 @@ fn parse_gather_statement(parser: &mut Parser) -> Result<(), RuneError> {
     
     Ok(())
 }
-

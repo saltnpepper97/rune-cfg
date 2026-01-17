@@ -1,5 +1,6 @@
-use crate::{Value, RuneError};
 use std::collections::HashMap;
+
+use crate::{Value, RuneError};
 
 impl TryFrom<Value> for String {
     type Error = RuneError;

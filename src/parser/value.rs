@@ -1,5 +1,6 @@
 use super::*;
 use crate::resolver::{expand_dollar_string, parse_dollar_reference};
+use regex::Regex;
 
 pub(super) fn parse_assignment(parser: &mut Parser) -> Result<(String, Value), RuneError> {
     let key = if let Token::Ident(k) = parser.bump()? { 
@@ -16,8 +17,7 @@ pub(super) fn parse_assignment(parser: &mut Parser) -> Result<(String, Value), R
 
     match parser.peek() {
         Some(Token::Colon) => {
-            // Nested object
-            parser.bump()?; // consume colon
+            parser.bump()?;
             let mut items = Vec::new();
             
             while let Some(tok) = parser.peek() {
@@ -46,11 +46,9 @@ pub(super) fn parse_assignment(parser: &mut Parser) -> Result<(String, Value), R
             return Ok((key, Value::Object(items)));
         }
         Some(Token::Equals) => { 
-            // Explicit assignment with =
             parser.bump()?; 
         }
         _ => {
-            // Implicit assignment (no = needed)
         }
     }
 
@@ -68,6 +66,7 @@ pub(super) fn parse_value(parser: &mut Parser) -> Result<Value, RuneError> {
         Some(Token::Ident(_)) => parse_reference_value(parser),
         Some(Token::LBracket) => parse_array_value(parser),
         Some(Token::Null) => parse_null_value(parser),
+        Some(Token::If) => conditional::parse_conditional(parser),
         _ => {
             let token = parser.bump()?;
             Err(RuneError::InvalidToken {
@@ -106,20 +105,27 @@ fn parse_bool_value(parser: &mut Parser) -> Result<Value, RuneError> {
 }
 
 fn parse_regex_value(parser: &mut Parser) -> Result<Value, RuneError> {
-    if let Token::Regex(r) = parser.bump()? {
-        Ok(Value::Regex(r))
+    if let Token::Regex(pattern) = parser.bump()? {
+        let regex = Regex::new(&pattern).map_err(|e| RuneError::TypeError {
+            message: format!("Invalid regex pattern: {}", e),
+            line: parser.line(),
+            column: parser.column(),
+            hint: Some("Check your regex syntax".into()),
+            code: Some(211),
+        })?;
+        Ok(Value::Regex(regex))
     } else { 
         unreachable!() 
     }
 }
 
 fn parse_null_value(parser: &mut Parser) -> Result<Value, RuneError> {
-    parser.bump()?; // consume Null
+    parser.bump()?;
     Ok(Value::Null)
 }
 
 fn parse_dollar_reference_value(parser: &mut Parser) -> Result<Value, RuneError> {
-    parser.bump()?; // consume $
+    parser.bump()?;
 
     let namespace = if let Token::Ident(name) = parser.bump()? {
         if name != "env" && name != "sys" && name != "runtime" {
@@ -144,9 +150,8 @@ fn parse_dollar_reference_value(parser: &mut Parser) -> Result<Value, RuneError>
 
     let mut path = vec![namespace];
 
-    // Handle dot notation for namespaced variables like $env.HOME
     while let Some(Token::Dot) = parser.peek() {
-        parser.bump()?; // consume dot
+        parser.bump()?;
         if let Token::Ident(name) = parser.bump()? {
             path.push(name);
         } else {
@@ -172,9 +177,8 @@ fn parse_reference_value(parser: &mut Parser) -> Result<Value, RuneError> {
         unreachable!() 
     }
 
-    // Handle dot notation for imports or nested references
     while let Some(Token::Dot) = parser.peek() {
-        parser.bump()?; // consume dot
+        parser.bump()?;
         if let Token::Ident(name) = parser.bump()? {
             path.push(name);
         } else {
@@ -192,21 +196,20 @@ fn parse_reference_value(parser: &mut Parser) -> Result<Value, RuneError> {
 }
 
 fn parse_array_value(parser: &mut Parser) -> Result<Value, RuneError> {
-    parser.bump()?; // consume [
+    parser.bump()?;
     let mut arr = Vec::new();
     
     while let Some(tok) = parser.peek() {
         match tok {
             Token::RBracket => { 
-                parser.bump()?; // consume ]
+                parser.bump()?;
                 break; 
             }
             Token::Newline => { 
-                parser.bump()?; // skip newlines
+                parser.bump()?;
             }
             _ => {
                 arr.push(parse_value(parser)?);
-                // Commas are automatically skipped by the lexer
             }
         }
     }

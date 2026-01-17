@@ -215,6 +215,7 @@ end
 
 #[test]
 fn test_parse_regex_literal() {
+    
     let input = r#"
 pattern r"^foo.*bar$"
 "#;
@@ -223,5 +224,10 @@ pattern r"^foo.*bar$"
     let doc = parser.parse_document().expect("Failed to parse doc");
 
     let val = &doc.globals[0].1;
-    assert_eq!(val, &Value::Regex("^foo.*bar$".into()));
+    if let Value::Regex(r) = val {
+        assert_eq!(r.as_str(), "^foo.*bar$");
+    } else {
+        panic!("Expected Regex value");
+    }
 }
+

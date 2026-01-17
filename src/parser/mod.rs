@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+
 use crate::lexer::{Lexer, Token};
 use crate::RuneError;
 use crate::ast::{Document, Value};
-use std::collections::HashMap;
 
+mod conditional;
 mod document;
 mod value;
 mod reference;

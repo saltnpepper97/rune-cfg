@@ -1,30 +1,23 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
 use crate::{Value, RuneError, Document, parser};
 
-/// Parse gather statements from raw config content to extract file paths
-/// Returns a map of alias -> raw_path
 pub(super) fn parse_gather_paths(content: &str) -> HashMap<String, String> {
     let mut paths = HashMap::new();
     
-    // Simple regex-free parsing of gather statements
     for line in content.lines() {
         let trimmed = line.trim();
         
-        // Skip comments
         if trimmed.starts_with('#') {
             continue;
         }
         
-        // Look for: gather "path" [as alias]
         if trimmed.starts_with("gather") {
             if let Some(path_and_rest) = trimmed.strip_prefix("gather").map(|s| s.trim()) {
-                // Extract quoted path
                 if let Some(path) = extract_quoted_string(path_and_rest) {
-                    // Check for "as alias"
                     let alias = if let Some(as_pos) = path_and_rest.find(" as ") {
                         let after_as = &path_and_rest[as_pos + 4..].trim();
-                        // Get first word after "as"
                         after_as.split_whitespace().next()
                             .map(|s| s.to_string())
                     } else {
@@ -32,7 +25,6 @@ pub(super) fn parse_gather_paths(content: &str) -> HashMap<String, String> {
                     };
                     
                     let final_alias = alias.unwrap_or_else(|| {
-                        // Use filename without extension as default
                         PathBuf::from(&path)
                             .file_stem()
                             .and_then(|s| s.to_str())
@@ -44,12 +36,10 @@ pub(super) fn parse_gather_paths(content: &str) -> HashMap<String, String> {
                 }
             }
         }
-    }
-    
+    }    
     paths
 }
 
-/// Extract a quoted string from input like: "path/to/file" rest of line
 fn extract_quoted_string(input: &str) -> Option<String> {
     let trimmed = input.trim();
     
@@ -68,27 +58,22 @@ fn extract_quoted_string(input: &str) -> Option<String> {
     None
 }
 
-/// Resolve a path with tilde expansion and relative path handling
 pub(super) fn resolve_path(raw_path: &str, base_dir: &Path) -> PathBuf {
     let path_str = raw_path.trim();
     
-    // Handle tilde expansion
     if path_str.starts_with("~/") {
         if let Some(home) = dirs::home_dir() {
             return home.join(&path_str[2..]);
         }
     }
     
-    // Handle absolute paths
     if path_str.starts_with('/') {
         return PathBuf::from(path_str);
     }
     
-    // Handle relative paths
     base_dir.join(path_str)
 }
 
-/// Find a key in the config content and return its line number + snippet
 pub(super) fn find_config_line(key: &str, raw_content: &str) -> (usize, String) {
     let key_parts: Vec<&str> = key.split('.').collect();
     let mut scope_stack: Vec<String> = Vec::new();
@@ -142,13 +127,105 @@ pub(super) fn find_config_line(key: &str, raw_content: &str) -> (usize, String) 
     (0, "<key not found>".into())
 }
 
-/// Recursively resolve references to their final values
+pub(super) fn evaluate_conditional(
+    cond: &crate::ast::ConditionalValue,
+    parser: &parser::Parser,
+    doc: &Document,
+) -> Value {
+    use crate::resolver;
+    
+    let condition_met = match &cond.condition {
+        crate::ast::Condition::Equals(path, expected) => {
+            let path_segments: Vec<String> = path.split('.').map(String::from).collect();
+            
+            let actual = if path_segments.len() >= 2 {
+                match path_segments[0].as_str() {
+                    "env" => {
+                        resolver::parse_dollar_reference(path_segments.clone()).ok()
+                    }
+                    "sys" => {
+                        resolver::parse_dollar_reference(path_segments.clone()).ok()
+                    }
+                    _ => parser.resolve_reference(&path_segments, doc).cloned()
+                }
+            } else {
+                parser.resolve_reference(&path_segments, doc).cloned()
+            };
+            
+            if let Some(actual_value) = actual {
+                &actual_value == expected
+            } else {
+                false
+            }
+        }
+        crate::ast::Condition::NotEquals(path, expected) => {
+            let path_segments: Vec<String> = path.split('.').map(String::from).collect();
+            
+            let actual = if path_segments.len() >= 2 {
+                match path_segments[0].as_str() {
+                    "env" => {
+                        resolver::parse_dollar_reference(path_segments.clone()).ok()
+                    }
+                    "sys" => {
+                        resolver::parse_dollar_reference(path_segments.clone()).ok()
+                    }
+                    _ => parser.resolve_reference(&path_segments, doc).cloned()
+                }
+            } else {
+                parser.resolve_reference(&path_segments, doc).cloned()
+            };
+            
+            if let Some(actual_value) = actual {
+                &actual_value != expected
+            } else {
+                true
+            }
+        }
+        crate::ast::Condition::Exists(path) => {
+            let path_segments: Vec<String> = path.split('.').map(String::from).collect();
+            
+            if path_segments.len() >= 2 {
+                match path_segments[0].as_str() {
+                    "env" => resolver::parse_dollar_reference(path_segments).is_ok(),
+                    "sys" => resolver::parse_dollar_reference(path_segments).is_ok(),
+                    _ => parser.resolve_reference(&path_segments, doc).is_some()
+                }
+            } else {
+                parser.resolve_reference(&path_segments, doc).is_some()
+            }
+        }
+        crate::ast::Condition::NotExists(path) => {
+            let path_segments: Vec<String> = path.split('.').map(String::from).collect();
+            
+            if path_segments.len() >= 2 {
+                match path_segments[0].as_str() {
+                    "env" => resolver::parse_dollar_reference(path_segments).is_err(),
+                    "sys" => resolver::parse_dollar_reference(path_segments).is_err(),
+                    _ => parser.resolve_reference(&path_segments, doc).is_none()
+                }
+            } else {
+                parser.resolve_reference(&path_segments, doc).is_none()
+            }
+        }
+    };
+    
+    if condition_met {
+        cond.then_value.clone()
+    } else {
+        cond.else_value.clone().unwrap_or(Value::Null)
+    }
+}
+
 pub(super) fn resolve_value_recursively(
     value: &Value,
     parser: &parser::Parser,
     main_doc: &Document,
 ) -> Result<Value, RuneError> {
     match value {
+        Value::Conditional(cond) => {
+            let resolved = evaluate_conditional(cond, parser, main_doc);
+            resolve_value_recursively(&resolved, parser, main_doc)
+        }
         Value::Reference(path) => {
             if path[0] == "env" && path.len() == 2 {
                 let var_name = &path[1];

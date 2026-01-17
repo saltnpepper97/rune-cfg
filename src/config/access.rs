@@ -1,35 +1,67 @@
 use super::*;
 
 impl RuneConfig {
-    /// Get a value from the configuration using dot notation
+    /// Get a typed value from the configuration using dot notation.
+    ///
+    /// Automatically handles both `snake_case` and `kebab-case` key names.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use rune_cfg::RuneConfig;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let config = RuneConfig::from_file("config.rune")?;
+    /// let host: String = config.get("server.host")?;
+    /// let port: u16 = config.get("server.port")?;
+    /// let debug: bool = config.get("debug")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns error if path doesn't exist or value can't be converted to type T.
     pub fn get<T>(&self, path: &str) -> Result<T, RuneError> 
     where
         T: TryFrom<Value, Error = RuneError>
     {
-        let value = self.get_value(path)?;
+        let value = self.get_value_flexible(path)?;
         T::try_from(value).map_err(|e| {
             enhance_error_with_line_info(e, path, &self.raw_content)
         })
     }
 
-    /// Get an optional value - returns None if key doesn't exist, Error if exists but invalid
+    /// Get an optional typed value - returns `None` if key doesn't exist.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use rune_cfg::RuneConfig;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let config = RuneConfig::from_file("config.rune")?;
+    /// if let Ok(Some(api_key)) = config.get_optional::<String>("api.key") {
+    ///     println!("API key: {}", api_key);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn get_optional<T>(&self, path: &str) -> Result<Option<T>, RuneError> 
     where
         T: TryFrom<Value, Error = RuneError>
     {
-        match self.get_value(path) {
+        match self.get_value_flexible(path) {
             Ok(value) => Ok(Some(T::try_from(value)?)),
-            Err(e) => {
-                if let RuneError::SyntaxError { code: Some(304), .. } = e {
-                    Ok(None)
-                } else {
-                    Err(e)
-                }
-            }
+            Err(RuneError::SyntaxError { code: Some(304), .. }) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
-    /// Get an optional value with a default
+    /// Get a value with a fallback default.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use rune_cfg::RuneConfig;
+    /// # let config = RuneConfig::from_file("config.rune").unwrap();
+    /// let timeout = config.get_or("server.timeout", 30u64);
+    /// let debug = config.get_or("debug", false);
+    /// ```
     pub fn get_or<T>(&self, path: &str, default: T) -> T 
     where
         T: TryFrom<Value, Error = RuneError>
@@ -37,7 +69,37 @@ impl RuneConfig {
         self.get(path).unwrap_or(default)
     }
 
-    /// Get a raw Value from the configuration
+    /// Internal method that tries both snake_case and kebab-case variants.
+    ///
+    /// Allows flexible key access: `monitor_media` and `monitor-media` both work.
+    fn get_value_flexible(&self, path: &str) -> Result<Value, RuneError> {
+        let underscore_path = path.replace('-', "_");
+        let dash_path = path.replace('_', "-");
+        
+        self.get_value(path)
+            .or_else(|_| if path.contains('_') { 
+                self.get_value(&dash_path) 
+            } else { 
+                self.get_value(&underscore_path) 
+            })
+    }
+
+    /// Get a raw `Value` from the configuration.
+    ///
+    /// Resolves references, conditionals, and environment/system variables.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use rune_cfg::RuneConfig;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let config = RuneConfig::from_file("config.rune")?;
+    /// let value = config.get_value("inhibit_apps")?;
+    /// if value.matches("firefox.desktop") {
+    ///     println!("App matches pattern");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn get_value(&self, path: &str) -> Result<Value, RuneError> {
         let path_segments: Vec<String> = path.split('.').map(|s| s.to_string()).collect();
         
@@ -50,7 +112,6 @@ impl RuneConfig {
                 code: Some(303),
             })?;
             
-            // Inject all documents as imports
             for (alias, doc) in &self.documents {
                 if alias != &self.main_doc_key {
                     temp_parser.inject_import(alias.clone(), doc.clone());
@@ -91,7 +152,20 @@ impl RuneConfig {
         }
     }
 
-    /// Get all keys at a given path level
+    /// Get all keys at a given path level.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use rune_cfg::RuneConfig;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let config = RuneConfig::from_file("config.rune")?;
+    /// let keys = config.get_keys("server")?;
+    /// for key in keys {
+    ///     println!("server.{}", key);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn get_keys(&self, path: &str) -> Result<Vec<String>, RuneError> {
         let value = self.get_value(path)?;
         match value {
@@ -106,12 +180,22 @@ impl RuneConfig {
         }
     }
 
-    /// Check if a configuration path exists
+    /// Check if a configuration path exists.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use rune_cfg::RuneConfig;
+    /// # let config = RuneConfig::from_file("config.rune").unwrap();
+    /// if config.has("server.ssl.enabled") {
+    ///     println!("SSL is configured");
+    /// }
+    /// ```
     pub fn has(&self, path: &str) -> bool {
-        self.get_value(path).is_ok()
+        self.get_value_flexible(path).is_ok()
     }
 }
 
+/// Enhance type/validation errors with line number information from config file.
 fn enhance_error_with_line_info(e: RuneError, path: &str, raw_content: &str) -> RuneError {
     match e {
         RuneError::TypeError { message, hint, code, .. } => {
@@ -125,13 +209,7 @@ fn enhance_error_with_line_info(e: RuneError, path: &str, raw_content: &str) -> 
                     code,
                 }
             } else {
-                RuneError::TypeError {
-                    message,
-                    line: 0,
-                    column: 0,
-                    hint,
-                    code,
-                }
+                RuneError::TypeError { message, line: 0, column: 0, hint, code }
             }
         }
         RuneError::ValidationError { message, hint, code, .. } => {
@@ -145,13 +223,7 @@ fn enhance_error_with_line_info(e: RuneError, path: &str, raw_content: &str) -> 
                     code,
                 }
             } else {
-                RuneError::ValidationError {
-                    message,
-                    line: 0,
-                    column: 0,
-                    hint,
-                    code,
-                }
+                RuneError::ValidationError { message, line: 0, column: 0, hint, code }
             }
         }
         other => other,
