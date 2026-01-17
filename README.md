@@ -52,7 +52,7 @@ server:
   database:
     url $env.DATABASE_URL
     timeout "30s"
-    max_connections if sys.cpu_count = "8" 100 else 50
+    max_connections if $sys.cpu_count = "8" 100 else 50
     
     email_validator r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
     username_pattern r"^[a-zA-Z0-9_]{3,20}$"
