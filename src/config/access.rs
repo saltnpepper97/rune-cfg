@@ -71,17 +71,71 @@ impl RuneConfig {
 
     /// Internal method that tries both snake_case and kebab-case variants.
     ///
-    /// Allows flexible key access: `monitor_media` and `monitor-media` both work.
+    /// Allows flexible key access: `monitor_media` and `monitor-media` both work.        
     fn get_value_flexible(&self, path: &str) -> Result<Value, RuneError> {
-        let underscore_path = path.replace('-', "_");
-        let dash_path = path.replace('_', "-");
-        
-        self.get_value(path)
-            .or_else(|_| if path.contains('_') { 
-                self.get_value(&dash_path) 
-            } else { 
-                self.get_value(&underscore_path) 
+        // Fast path: exact
+        if let Ok(v) = self.get_value(path) {
+            return Ok(v);
+        }
+
+        // Root path special case handled by get_value("") already
+        if path.trim().is_empty() {
+            return self.get_value(path);
+        }
+
+        // Try segment-by-segment variants: for each segment, try {original, snake, kebab}
+        let segs: Vec<&str> = path.split('.').collect();
+
+        fn variants(seg: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            out.push(seg.to_string());
+
+            let snake = seg.replace('-', "_");
+            if snake != seg {
+                out.push(snake.clone());
+            }
+
+            let kebab = seg.replace('_', "-");
+            if kebab != seg {
+                out.push(kebab);
+            }
+
+            // de-dupe
+            out.sort();
+            out.dedup();
+            out
+        }
+
+        // DFS over combinations, stop on first that resolves
+        fn dfs(
+            cfg: &RuneConfig,
+            segs: &[&str],
+            i: usize,
+            cur: &mut Vec<String>,
+        ) -> Result<Value, RuneError> {
+            if i == segs.len() {
+                let candidate = cur.join(".");
+                return cfg.get_value(&candidate);
+            }
+
+            for v in variants(segs[i]) {
+                cur.push(v);
+                if let Ok(val) = dfs(cfg, segs, i + 1, cur) {
+                    return Ok(val);
+                }
+                cur.pop();
+            }
+
+            Err(RuneError::SyntaxError {
+                message: format!("Path '{}' not found in configuration", segs.join(".")),
+                line: 0,
+                column: 0,
+                hint: Some("Check that the path exists in your config file".into()),
+                code: Some(304),
             })
+        }
+
+        dfs(self, &segs, 0, &mut Vec::new())
     }
 
     /// Get a raw `Value` from the configuration.
@@ -99,10 +153,44 @@ impl RuneConfig {
     /// }
     /// # Ok(())
     /// # }
-    /// ```
+    /// ```       
     pub fn get_value(&self, path: &str) -> Result<Value, RuneError> {
+        // Root lookup: return the fully-resolved main document as a Value::Object.
+        if path.trim().is_empty() {
+            let main_doc = self
+                .documents
+                .get(&self.main_doc_key)
+                .ok_or_else(|| RuneError::SyntaxError {
+                    message: "No main document loaded".into(),
+                    line: 0,
+                    column: 0,
+                    hint: None,
+                    code: Some(305),
+                })?;
+
+            let mut temp_parser = parser::Parser::new("").map_err(|_| RuneError::SyntaxError {
+                message: "Failed to create temporary parser".into(),
+                line: 0,
+                column: 0,
+                hint: None,
+                code: Some(303),
+            })?;
+
+            for (alias, doc) in &self.documents {
+                if alias != &self.main_doc_key {
+                    temp_parser.inject_import(alias.clone(), doc.clone());
+                }
+            }
+
+            // Build a root Value from the document's top-level items.
+            // (items are already Vec<(String, Value)> and match Value::Object)
+            let root_value = Value::Object(main_doc.items.clone());
+
+            return helpers::resolve_value_recursively(&root_value, &temp_parser, main_doc);
+        }
+
         let path_segments: Vec<String> = path.split('.').map(|s| s.to_string()).collect();
-        
+
         if let Some(main_doc) = self.documents.get(&self.main_doc_key) {
             let mut temp_parser = parser::Parser::new("").map_err(|_| RuneError::SyntaxError {
                 message: "Failed to create temporary parser".into(),
@@ -111,19 +199,23 @@ impl RuneConfig {
                 hint: None,
                 code: Some(303),
             })?;
-            
+
             for (alias, doc) in &self.documents {
                 if alias != &self.main_doc_key {
                     temp_parser.inject_import(alias.clone(), doc.clone());
                 }
             }
-            
-            let resolved = temp_parser.resolve_reference(&path_segments, main_doc)
+
+            let resolved = temp_parser
+                .resolve_reference(&path_segments, main_doc)
                 .ok_or_else(|| {
                     let (line, snippet) = helpers::find_config_line(path, &self.raw_content);
                     if line > 0 {
                         RuneError::SyntaxError {
-                            message: format!("Path '{}' found but could not be resolved on line {}", path, line),
+                            message: format!(
+                                "Path '{}' found but could not be resolved on line {}",
+                                path, line
+                            ),
                             line,
                             column: 0,
                             hint: Some(format!("Check the value at: {}", snippet)),
