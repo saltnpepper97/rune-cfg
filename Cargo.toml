@@ -1,6 +1,6 @@
 [package]
 name = "rune-cfg"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 authors = ["Dustin Pilgrim <dustin.pilgrim1997@gmail.com>"]
 description = "A modern, simple, and safe config language inspired by Markdown."
