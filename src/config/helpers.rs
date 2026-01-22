@@ -1,50 +1,115 @@
 // Author: Dustin Pilgrim
 // License MIT
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::{parser, Document, RuneError, Value};
 
-pub(super) fn parse_gather_paths(content: &str) -> HashMap<String, String> {
-    let mut paths = HashMap::new();
+/// Gather statement parsed from a file.
+#[derive(Debug, Clone)]
+pub(super) struct GatherSpec {
+    /// The alias key the parser will use for this gather (either explicit `as`, or file stem).
+    pub alias: String,
+    /// The raw path string inside quotes.
+    pub raw_path: String,
+    /// True if the config explicitly used `as alias`.
+    pub explicit_alias: bool,
+}
+
+/// Parse gather statements from raw file content.
+/// - Skips fully-commented lines (starting with '#').
+/// - Supports `gather "path"` or `gather "path" as alias`.
+/// - Allows trailing inline comments.
+pub(super) fn parse_gather_specs(content: &str) -> Vec<GatherSpec> {
+    let mut out = Vec::new();
 
     for line in content.lines() {
         let trimmed = line.trim();
 
-        if trimmed.starts_with('#') {
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
 
-        if trimmed.starts_with("gather") {
-            if let Some(path_and_rest) = trimmed.strip_prefix("gather").map(|s| s.trim()) {
-                if let Some(path) = extract_quoted_string(path_and_rest) {
-                    let alias = if let Some(as_pos) = path_and_rest.find(" as ") {
-                        let after_as = &path_and_rest[as_pos + 4..].trim();
-                        after_as
-                            .split_whitespace()
-                            .next()
-                            .map(|s| s.to_string())
-                    } else {
-                        None
-                    };
-
-                    let final_alias = alias.unwrap_or_else(|| {
-                        PathBuf::from(&path)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("imported")
-                            .to_string()
-                    });
-
-                    paths.insert(final_alias, path);
-                }
-            }
+        if !trimmed.starts_with("gather") {
+            continue;
         }
+
+        let Some(rest) = trimmed.strip_prefix("gather").map(|s| s.trim()) else {
+            continue;
+        };
+
+        // Extract the quoted path
+        let Some(path) = extract_quoted_string(rest) else {
+            continue;
+        };
+
+        // Determine if there is an explicit `as alias` after the quoted path.
+        // We search the remainder after the closing quote.
+        let (explicit_alias, alias_opt) = {
+            let quote_char = rest.chars().next().unwrap_or('"');
+            let after_open = &rest[1..];
+
+            let end_rel = if quote_char == '"' {
+                after_open.find('"')
+            } else if quote_char == '\'' {
+                after_open.find('\'')
+            } else {
+                None
+            };
+
+            if let Some(end_rel) = end_rel {
+                // +2 accounts for opening quote + the closing quote itself
+                let after_quote = rest[(end_rel + 2)..].trim();
+
+                // allow: `as alias` (with arbitrary whitespace)
+                if let Some(_as_pos) = after_quote.find("as") {
+                    // require `as` to be a standalone token boundary-ish:
+                    // simplest: split whitespace and look for "as"
+                    let mut it = after_quote.split_whitespace();
+                    let mut found_as = false;
+                    let mut alias: Option<String> = None;
+
+                    while let Some(tok) = it.next() {
+                        if !found_as && tok == "as" {
+                            found_as = true;
+                            alias = it.next().map(|s| s.to_string());
+                            break;
+                        }
+                    }
+
+                    if found_as {
+                        (true, alias)
+                    } else {
+                        (false, None)
+                    }
+                } else {
+                    (false, None)
+                }
+            } else {
+                (false, None)
+            }
+        };
+
+        let alias = alias_opt.unwrap_or_else(|| {
+            PathBuf::from(&path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("imported")
+                .to_string()
+        });
+
+        out.push(GatherSpec {
+            alias,
+            raw_path: path,
+            explicit_alias,
+        });
     }
-    paths
+
+    out
 }
 
+/// Extract the first quoted string from the input.
+/// Supports "double" or 'single' quotes.
 fn extract_quoted_string(input: &str) -> Option<String> {
     let trimmed = input.trim();
 
@@ -61,22 +126,6 @@ fn extract_quoted_string(input: &str) -> Option<String> {
     }
 
     None
-}
-
-pub(super) fn resolve_path(raw_path: &str, base_dir: &Path) -> PathBuf {
-    let path_str = raw_path.trim();
-
-    if path_str.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(&path_str[2..]);
-        }
-    }
-
-    if path_str.starts_with('/') {
-        return PathBuf::from(path_str);
-    }
-
-    base_dir.join(path_str)
 }
 
 pub(super) fn find_config_line(key: &str, raw_content: &str) -> (usize, String) {
@@ -148,12 +197,7 @@ fn condition_is_met(
 ) -> bool {
     use crate::resolver;
 
-    // resolve a dotted path into a Value (or None)
-    fn resolve_path_value(
-        parser: &parser::Parser,
-        doc: &Document,
-        path: &str,
-    ) -> Option<Value> {
+    fn resolve_path_value(parser: &parser::Parser, doc: &Document, path: &str) -> Option<Value> {
         let segs: Vec<String> = path.split('.').map(String::from).collect();
 
         if segs.len() >= 2 {
@@ -167,18 +211,14 @@ fn condition_is_met(
     }
 
     match condition {
-        crate::ast::Condition::Equals(path, expected) => {
-            resolve_path_value(parser, doc, path)
-                .as_ref()
-                .map(|actual| actual == expected)
-                .unwrap_or(false)
-        }
-        crate::ast::Condition::NotEquals(path, expected) => {
-            resolve_path_value(parser, doc, path)
-                .as_ref()
-                .map(|actual| actual != expected)
-                .unwrap_or(true)
-        }
+        crate::ast::Condition::Equals(path, expected) => resolve_path_value(parser, doc, path)
+            .as_ref()
+            .map(|actual| actual == expected)
+            .unwrap_or(false),
+        crate::ast::Condition::NotEquals(path, expected) => resolve_path_value(parser, doc, path)
+            .as_ref()
+            .map(|actual| actual != expected)
+            .unwrap_or(true),
         crate::ast::Condition::Exists(path) => resolve_path_value(parser, doc, path).is_some(),
         crate::ast::Condition::NotExists(path) => resolve_path_value(parser, doc, path).is_none(),
     }
@@ -208,7 +248,6 @@ pub(super) fn resolve_value_recursively(
         }
 
         Value::Reference(path) => {
-            // NOTE: this branch handles Value::Reference([...]) (not $env token form).
             if path.get(0).map(|s| s.as_str()) == Some("env") && path.len() == 2 {
                 let var_name = &path[1];
                 std::env::var(var_name)
@@ -221,16 +260,11 @@ pub(super) fn resolve_value_recursively(
             } else if path.get(0).map(|s| s.as_str()) == Some("sys") {
                 Ok(Value::String(format!("sys_placeholder:{}", path[1..].join("."))))
             } else if path.get(0).map(|s| s.as_str()) == Some("runtime") {
-                Ok(Value::String(format!(
-                    "runtime_placeholder:{}",
-                    path[1..].join(".")
-                )))
+                Ok(Value::String(format!("runtime_placeholder:{}", path[1..].join("."))))
+            } else if let Some(resolved) = parser.resolve_reference(path, main_doc) {
+                resolve_value_recursively(resolved, parser, main_doc)
             } else {
-                if let Some(resolved) = parser.resolve_reference(path, main_doc) {
-                    resolve_value_recursively(resolved, parser, main_doc)
-                } else {
-                    Ok(value.clone())
-                }
+                Ok(value.clone())
             }
         }
 
@@ -245,7 +279,6 @@ pub(super) fn resolve_value_recursively(
         Value::Object(items) => {
             use crate::ast::ObjectItem;
 
-            // Flatten block if/endif by selecting a branch and splicing its assigns into the object.
             fn flatten_items(
                 out: &mut Vec<ObjectItem>,
                 items: &[ObjectItem],
@@ -265,7 +298,6 @@ pub(super) fn resolve_value_recursively(
                             } else {
                                 block.else_items.as_deref().unwrap_or(&[])
                             };
-                            // recursively flatten the chosen branch
                             flatten_items(out, branch, parser, doc)?;
                         }
                     }

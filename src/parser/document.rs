@@ -3,6 +3,14 @@
 
 use super::*;
 
+/// NOTE:
+/// `gather` statements are handled in the config loader (`RuneConfig::from_file_with_base`)
+/// which reads the file(s) from disk and injects imported documents.
+/// The parser only needs to record the alias so references like `alias.key.path` can resolve
+/// after imports are injected.
+///
+/// This parser intentionally inserts a placeholder Document for the alias. The loader will
+/// overwrite it with the real parsed Document.
 pub(super) fn parse_document(parser: &mut Parser) -> Result<Document, RuneError> {
     let mut metadata = Vec::new();
     let mut globals = Vec::new();
@@ -129,7 +137,7 @@ fn parse_top_level_item(
 }
 
 fn parse_gather_statement(parser: &mut Parser) -> Result<(), RuneError> {
-    parser.bump()?;
+    parser.bump()?; // consume `gather`
 
     let filename = if let Token::String(f) = parser.bump()? {
         f
@@ -144,7 +152,7 @@ fn parse_gather_statement(parser: &mut Parser) -> Result<(), RuneError> {
     };
 
     let alias = if let Some(Token::As) = parser.peek() {
-        parser.bump()?;
+        parser.bump()?; // consume `as`
         if let Token::Ident(a) = parser.bump()? {
             a
         } else {
@@ -157,22 +165,27 @@ fn parse_gather_statement(parser: &mut Parser) -> Result<(), RuneError> {
             });
         }
     } else {
-        use std::path::PathBuf;
-        PathBuf::from(&filename)
+        // Default alias: file stem (no extension)
+        let stem = std::path::Path::new(&filename)
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("imported")
-            .to_string()
+            .unwrap_or("imported");
+        stem.to_string()
     };
 
-    parser.imports.insert(
-        alias,
-        Document {
-            metadata: vec![],
-            globals: vec![],
-            items: vec![],
-        },
-    );
+    // IMPORTANT:
+    // Insert a placeholder import so reference resolution can treat the first segment as an alias.
+    // The loader (RuneConfig::from_file_with_base) will overwrite this with the real document.
+    if !parser.imports.contains_key(&alias) {
+        parser.imports.insert(
+            alias,
+            Document {
+                metadata: vec![],
+                globals: vec![],
+                items: vec![],
+            },
+        );
+    }
 
     Ok(())
 }
