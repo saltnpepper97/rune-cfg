@@ -1,7 +1,13 @@
+// Author: Dustin Pilgrim
+// License: MIT
+
 use super::*;
 use super::scanner::{bump, skip_whitespace_and_comments};
 
-pub(super) fn next_token_with_flag(lexer: &mut Lexer, skip_newlines: bool) -> Result<Token, RuneError> {
+pub(super) fn next_token_with_flag(
+    lexer: &mut Lexer,
+    skip_newlines: bool,
+) -> Result<Token, RuneError> {
     skip_whitespace_and_comments(lexer, skip_newlines);
 
     let token = match lexer.peek {
@@ -85,16 +91,16 @@ fn tokenize_regex_literal(lexer: &mut Lexer) -> Result<Token, RuneError> {
 fn tokenize_identifier_starting_with_r(lexer: &mut Lexer) -> Result<Token, RuneError> {
     let mut ident = String::new();
     ident.push(bump(lexer).unwrap()); // consume 'r'
-    
+
     while let Some(ch) = lexer.peek {
-        if ch.is_alphanumeric() || ch == '_' || ch == '-' { 
-            ident.push(ch); 
-            bump(lexer); 
-        } else { 
-            break; 
+        if ch.is_alphanumeric() || ch == '_' || ch == '-' {
+            ident.push(ch);
+            bump(lexer);
+        } else {
+            break;
         }
     }
-    
+
     Ok(Token::Ident(ident))
 }
 
@@ -103,7 +109,7 @@ fn tokenize_string(lexer: &mut Lexer) -> Result<Token, RuneError> {
     let mut content = String::new();
 
     while let Some(ch) = lexer.peek {
-        if ch == quote { 
+        if ch == quote {
             bump(lexer); // consume the closing quote
             break;
         }
@@ -155,16 +161,16 @@ fn tokenize_string(lexer: &mut Lexer) -> Result<Token, RuneError> {
 
 fn tokenize_number(lexer: &mut Lexer) -> Result<Token, RuneError> {
     let mut num = String::new();
-    
+
     while let Some(ch) = lexer.peek {
-        if ch.is_digit(10) || ch == '.' { 
-            num.push(ch); 
-            bump(lexer); 
-        } else { 
-            break; 
+        if ch.is_digit(10) || ch == '.' {
+            num.push(ch);
+            bump(lexer);
+        } else {
+            break;
         }
     }
-    
+
     num.parse::<f64>()
         .map(Token::Number)
         .map_err(|_| RuneError::TypeError {
@@ -178,25 +184,29 @@ fn tokenize_number(lexer: &mut Lexer) -> Result<Token, RuneError> {
 
 fn tokenize_identifier_or_keyword(lexer: &mut Lexer) -> Result<Token, RuneError> {
     let mut ident = String::new();
-    
+
     while let Some(ch) = lexer.peek {
         if ch.is_alphanumeric() || ch == '_' || ch == '-' {
             ident.push(ch);
             bump(lexer);
-        } else { 
-            break; 
+        } else {
+            break;
         }
     }
 
     let token = match ident.as_str() {
         "true" => Token::Bool(true),
         "false" => Token::Bool(false),
+
         "end" => Token::End,
+        "endif" => Token::EndIf, // <-- NEW: closes if-blocks
+
         "gather" => Token::Gather,
         "as" => Token::As,
         "if" => Token::If,
         "else" => Token::Else,
         "elseif" | "else-if" => Token::ElseIf,
+
         "null" | "None" => Token::Null,
         _ => Token::Ident(ident),
     };

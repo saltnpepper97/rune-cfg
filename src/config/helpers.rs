@@ -1,29 +1,34 @@
+// Author: Dustin Pilgrim
+// License MIT
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::{Value, RuneError, Document, parser};
+use crate::{parser, Document, RuneError, Value};
 
 pub(super) fn parse_gather_paths(content: &str) -> HashMap<String, String> {
     let mut paths = HashMap::new();
-    
+
     for line in content.lines() {
         let trimmed = line.trim();
-        
+
         if trimmed.starts_with('#') {
             continue;
         }
-        
+
         if trimmed.starts_with("gather") {
             if let Some(path_and_rest) = trimmed.strip_prefix("gather").map(|s| s.trim()) {
                 if let Some(path) = extract_quoted_string(path_and_rest) {
                     let alias = if let Some(as_pos) = path_and_rest.find(" as ") {
                         let after_as = &path_and_rest[as_pos + 4..].trim();
-                        after_as.split_whitespace().next()
+                        after_as
+                            .split_whitespace()
+                            .next()
                             .map(|s| s.to_string())
                     } else {
                         None
                     };
-                    
+
                     let final_alias = alias.unwrap_or_else(|| {
                         PathBuf::from(&path)
                             .file_stem()
@@ -31,46 +36,46 @@ pub(super) fn parse_gather_paths(content: &str) -> HashMap<String, String> {
                             .unwrap_or("imported")
                             .to_string()
                     });
-                    
+
                     paths.insert(final_alias, path);
                 }
             }
         }
-    }    
+    }
     paths
 }
 
 fn extract_quoted_string(input: &str) -> Option<String> {
     let trimmed = input.trim();
-    
+
     if trimmed.starts_with('"') {
         if let Some(end_quote) = trimmed[1..].find('"') {
             return Some(trimmed[1..end_quote + 1].to_string());
         }
     }
-    
+
     if trimmed.starts_with('\'') {
         if let Some(end_quote) = trimmed[1..].find('\'') {
             return Some(trimmed[1..end_quote + 1].to_string());
         }
     }
-    
+
     None
 }
 
 pub(super) fn resolve_path(raw_path: &str, base_dir: &Path) -> PathBuf {
     let path_str = raw_path.trim();
-    
+
     if path_str.starts_with("~/") {
         if let Some(home) = dirs::home_dir() {
             return home.join(&path_str[2..]);
         }
     }
-    
+
     if path_str.starts_with('/') {
         return PathBuf::from(path_str);
     }
-    
+
     base_dir.join(path_str)
 }
 
@@ -85,18 +90,26 @@ pub(super) fn find_config_line(key: &str, raw_content: &str) -> (usize, String) 
             continue;
         }
 
+        // scope open: foo:
         if trimmed.ends_with(':') && !trimmed.starts_with('@') {
             let scope_name = trimmed.trim_end_matches(':').trim().to_string();
             scope_stack.push(scope_name);
             continue;
         }
 
-        if trimmed == "end" {
+        // scope close: end / endif
+        if trimmed == "end" || trimmed == "endif" {
             scope_stack.pop();
             continue;
         }
 
+        // ignore metadata
         if trimmed.starts_with('@') {
+            continue;
+        }
+
+        // ignore control keywords lines (if / else / elseif)
+        if trimmed.starts_with("if ") || trimmed == "else:" || trimmed.starts_with("elseif ") {
             continue;
         }
 
@@ -127,89 +140,56 @@ pub(super) fn find_config_line(key: &str, raw_content: &str) -> (usize, String) 
     (0, "<key not found>".into())
 }
 
+/// Shared condition evaluation for both inline conditionals and block if/endif.
+fn condition_is_met(
+    condition: &crate::ast::Condition,
+    parser: &parser::Parser,
+    doc: &Document,
+) -> bool {
+    use crate::resolver;
+
+    // resolve a dotted path into a Value (or None)
+    fn resolve_path_value(
+        parser: &parser::Parser,
+        doc: &Document,
+        path: &str,
+    ) -> Option<Value> {
+        let segs: Vec<String> = path.split('.').map(String::from).collect();
+
+        if segs.len() >= 2 {
+            match segs[0].as_str() {
+                "env" | "sys" | "runtime" => resolver::parse_dollar_reference(segs).ok(),
+                _ => parser.resolve_reference(&segs, doc).cloned(),
+            }
+        } else {
+            parser.resolve_reference(&segs, doc).cloned()
+        }
+    }
+
+    match condition {
+        crate::ast::Condition::Equals(path, expected) => {
+            resolve_path_value(parser, doc, path)
+                .as_ref()
+                .map(|actual| actual == expected)
+                .unwrap_or(false)
+        }
+        crate::ast::Condition::NotEquals(path, expected) => {
+            resolve_path_value(parser, doc, path)
+                .as_ref()
+                .map(|actual| actual != expected)
+                .unwrap_or(true)
+        }
+        crate::ast::Condition::Exists(path) => resolve_path_value(parser, doc, path).is_some(),
+        crate::ast::Condition::NotExists(path) => resolve_path_value(parser, doc, path).is_none(),
+    }
+}
+
 pub(super) fn evaluate_conditional(
     cond: &crate::ast::ConditionalValue,
     parser: &parser::Parser,
     doc: &Document,
 ) -> Value {
-    use crate::resolver;
-    
-    let condition_met = match &cond.condition {
-        crate::ast::Condition::Equals(path, expected) => {
-            let path_segments: Vec<String> = path.split('.').map(String::from).collect();
-            
-            let actual = if path_segments.len() >= 2 {
-                match path_segments[0].as_str() {
-                    "env" => {
-                        resolver::parse_dollar_reference(path_segments.clone()).ok()
-                    }
-                    "sys" => {
-                        resolver::parse_dollar_reference(path_segments.clone()).ok()
-                    }
-                    _ => parser.resolve_reference(&path_segments, doc).cloned()
-                }
-            } else {
-                parser.resolve_reference(&path_segments, doc).cloned()
-            };
-            
-            if let Some(actual_value) = actual {
-                &actual_value == expected
-            } else {
-                false
-            }
-        }
-        crate::ast::Condition::NotEquals(path, expected) => {
-            let path_segments: Vec<String> = path.split('.').map(String::from).collect();
-            
-            let actual = if path_segments.len() >= 2 {
-                match path_segments[0].as_str() {
-                    "env" => {
-                        resolver::parse_dollar_reference(path_segments.clone()).ok()
-                    }
-                    "sys" => {
-                        resolver::parse_dollar_reference(path_segments.clone()).ok()
-                    }
-                    _ => parser.resolve_reference(&path_segments, doc).cloned()
-                }
-            } else {
-                parser.resolve_reference(&path_segments, doc).cloned()
-            };
-            
-            if let Some(actual_value) = actual {
-                &actual_value != expected
-            } else {
-                true
-            }
-        }
-        crate::ast::Condition::Exists(path) => {
-            let path_segments: Vec<String> = path.split('.').map(String::from).collect();
-            
-            if path_segments.len() >= 2 {
-                match path_segments[0].as_str() {
-                    "env" => resolver::parse_dollar_reference(path_segments).is_ok(),
-                    "sys" => resolver::parse_dollar_reference(path_segments).is_ok(),
-                    _ => parser.resolve_reference(&path_segments, doc).is_some()
-                }
-            } else {
-                parser.resolve_reference(&path_segments, doc).is_some()
-            }
-        }
-        crate::ast::Condition::NotExists(path) => {
-            let path_segments: Vec<String> = path.split('.').map(String::from).collect();
-            
-            if path_segments.len() >= 2 {
-                match path_segments[0].as_str() {
-                    "env" => resolver::parse_dollar_reference(path_segments).is_err(),
-                    "sys" => resolver::parse_dollar_reference(path_segments).is_err(),
-                    _ => parser.resolve_reference(&path_segments, doc).is_none()
-                }
-            } else {
-                parser.resolve_reference(&path_segments, doc).is_none()
-            }
-        }
-    };
-    
-    if condition_met {
+    if condition_is_met(&cond.condition, parser, doc) {
         cond.then_value.clone()
     } else {
         cond.else_value.clone().unwrap_or(Value::Null)
@@ -226,8 +206,10 @@ pub(super) fn resolve_value_recursively(
             let resolved = evaluate_conditional(cond, parser, main_doc);
             resolve_value_recursively(&resolved, parser, main_doc)
         }
+
         Value::Reference(path) => {
-            if path[0] == "env" && path.len() == 2 {
+            // NOTE: this branch handles Value::Reference([...]) (not $env token form).
+            if path.get(0).map(|s| s.as_str()) == Some("env") && path.len() == 2 {
                 let var_name = &path[1];
                 std::env::var(var_name)
                     .map(Value::String)
@@ -236,10 +218,13 @@ pub(super) fn resolve_value_recursively(
                         hint: Some("Make sure the environment variable is defined".into()),
                         code: Some(308),
                     })
-            } else if path[0] == "sys" {
+            } else if path.get(0).map(|s| s.as_str()) == Some("sys") {
                 Ok(Value::String(format!("sys_placeholder:{}", path[1..].join("."))))
-            } else if path[0] == "runtime" {
-                Ok(Value::String(format!("runtime_placeholder:{}", path[1..].join("."))))
+            } else if path.get(0).map(|s| s.as_str()) == Some("runtime") {
+                Ok(Value::String(format!(
+                    "runtime_placeholder:{}",
+                    path[1..].join(".")
+                )))
             } else {
                 if let Some(resolved) = parser.resolve_reference(path, main_doc) {
                     resolve_value_recursively(resolved, parser, main_doc)
@@ -248,6 +233,7 @@ pub(super) fn resolve_value_recursively(
                 }
             }
         }
+
         Value::Array(arr) => {
             let mut resolved_array = Vec::new();
             for item in arr {
@@ -255,16 +241,43 @@ pub(super) fn resolve_value_recursively(
             }
             Ok(Value::Array(resolved_array))
         }
+
         Value::Object(items) => {
-            let mut resolved_object = Vec::new();
-            for (key, val) in items {
-                resolved_object.push((
-                    key.clone(),
-                    resolve_value_recursively(val, parser, main_doc)?,
-                ));
+            use crate::ast::ObjectItem;
+
+            // Flatten block if/endif by selecting a branch and splicing its assigns into the object.
+            fn flatten_items(
+                out: &mut Vec<ObjectItem>,
+                items: &[ObjectItem],
+                parser: &parser::Parser,
+                doc: &Document,
+            ) -> Result<(), RuneError> {
+                for item in items {
+                    match item {
+                        ObjectItem::Assign(k, v) => {
+                            let rv = super::helpers::resolve_value_recursively(v, parser, doc)?;
+                            out.push(ObjectItem::Assign(k.clone(), rv));
+                        }
+                        ObjectItem::IfBlock(block) => {
+                            let take_then = super::helpers::condition_is_met(&block.condition, parser, doc);
+                            let branch: &[ObjectItem] = if take_then {
+                                &block.then_items
+                            } else {
+                                block.else_items.as_deref().unwrap_or(&[])
+                            };
+                            // recursively flatten the chosen branch
+                            flatten_items(out, branch, parser, doc)?;
+                        }
+                    }
+                }
+                Ok(())
             }
-            Ok(Value::Object(resolved_object))
+
+            let mut flattened: Vec<ObjectItem> = Vec::new();
+            flatten_items(&mut flattened, items, parser, main_doc)?;
+            Ok(Value::Object(flattened))
         }
+
         _ => Ok(value.clone()),
     }
 }

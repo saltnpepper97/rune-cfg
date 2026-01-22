@@ -1,3 +1,6 @@
+// Author: Dustin Pilgrim
+// License: MIT
+
 use regex::Regex;
 
 #[derive(Debug, Clone)]
@@ -27,6 +30,19 @@ pub struct ConditionalValue {
     pub else_value: Option<Value>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ObjectItem {
+    Assign(String, Value),
+    IfBlock(Box<IfBlock>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IfBlock {
+    pub condition: Condition,
+    pub then_items: Vec<ObjectItem>,
+    pub else_items: Option<Vec<ObjectItem>>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Value {
     String(String),
@@ -34,10 +50,16 @@ pub enum Value {
     Bool(bool),
     Regex(Regex),
     Array(Vec<Value>),
-    Object(Vec<(String, Value)>),
+
+    /// Object blocks now contain items (assignments + if-blocks)
+    Object(Vec<ObjectItem>),
+
     Reference(Vec<String>),
     Interpolated(Vec<Value>),
+
+    /// Inline/value conditional: `x = if cond a else b`
     Conditional(Box<ConditionalValue>),
+
     Null,
 }
 
@@ -60,7 +82,7 @@ impl PartialEq for Value {
 }
 
 impl Value {
-    pub fn as_object(&self) -> Option<&Vec<(String, Value)>> {
+    pub fn as_object(&self) -> Option<&Vec<ObjectItem>> {
         if let Value::Object(items) = self {
             Some(items)
         } else {
@@ -75,7 +97,7 @@ impl Value {
             None
         }
     }
-    
+
     pub fn matches(&self, text: &str) -> bool {
         match self {
             Value::Regex(r) => r.is_match(text),

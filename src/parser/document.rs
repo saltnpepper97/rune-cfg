@@ -1,3 +1,6 @@
+// Author: Dustin Pilgrim
+// License: MIT
+
 use super::*;
 
 pub(super) fn parse_document(parser: &mut Parser) -> Result<Document, RuneError> {
@@ -7,11 +10,11 @@ pub(super) fn parse_document(parser: &mut Parser) -> Result<Document, RuneError>
 
     while let Some(tok) = parser.peek() {
         match tok {
-            Token::Newline => { 
-                parser.bump()?; 
+            Token::Newline => {
+                parser.bump()?;
             }
-            Token::Eof => { 
-                break; 
+            Token::Eof => {
+                break;
             }
             Token::At => {
                 parse_metadata(parser, &mut metadata)?;
@@ -27,7 +30,9 @@ pub(super) fn parse_document(parser: &mut Parser) -> Result<Document, RuneError>
                     message: "Dollar variables ($env, $sys, $runtime) cannot be assigned at top level".into(),
                     line: parser.line(),
                     column: parser.column(),
-                    hint: Some("Dollar variables can only be used as values, not as top-level definitions".into()),
+                    hint: Some(
+                        "Dollar variables can only be used as values, not as top-level definitions".into(),
+                    ),
                     code: Some(213),
                 });
             }
@@ -48,7 +53,7 @@ pub(super) fn parse_document(parser: &mut Parser) -> Result<Document, RuneError>
 
 fn parse_metadata(parser: &mut Parser, metadata: &mut Vec<(String, Value)>) -> Result<(), RuneError> {
     parser.bump()?;
-    
+
     if let Token::Ident(key) = parser.bump()? {
         let value = value::parse_value(parser)?;
         metadata.push((key, value));
@@ -65,44 +70,46 @@ fn parse_metadata(parser: &mut Parser, metadata: &mut Vec<(String, Value)>) -> R
 }
 
 fn parse_top_level_item(
-    parser: &mut Parser, 
+    parser: &mut Parser,
     globals: &mut Vec<(String, Value)>,
-    items: &mut Vec<(String, Value)>
+    items: &mut Vec<(String, Value)>,
 ) -> Result<(), RuneError> {
-    let key = if let Token::Ident(k) = parser.bump()? { 
-        k 
-    } else { 
-        unreachable!() 
-    };
-    
+    let key = if let Token::Ident(k) = parser.bump()? { k } else { unreachable!() };
+
     match parser.peek() {
         Some(Token::Colon) => {
             parser.bump()?;
-            let mut object_items = Vec::new();
+            let mut object_items: Vec<crate::ast::ObjectItem> = Vec::new();
 
             while let Some(tok) = parser.peek() {
                 match tok {
-                    Token::Ident(_) => { 
-                        object_items.push(value::parse_assignment(parser)?); 
+                    Token::Ident(_) => {
+                        let (k, v) = value::parse_assignment(parser)?;
+                        object_items.push(crate::ast::ObjectItem::Assign(k, v));
                     }
-                    Token::End => { 
-                        parser.bump()?; 
-                        break; 
+                    Token::If => {
+                        // block if: if condition: ... endif
+                        object_items.push(conditional::parse_if_block(parser)?);
                     }
-                    Token::Newline => { 
-                        parser.bump()?; 
+                    Token::End => {
+                        parser.bump()?;
+                        break;
                     }
-                    _ => { 
+                    Token::Newline => {
+                        parser.bump()?;
+                    }
+                    _ => {
                         return Err(RuneError::InvalidToken {
                             token: format!("{:?}", tok),
                             line: parser.line(),
                             column: parser.column(),
-                            hint: Some("Expected key or 'end'".into()),
+                            hint: Some("Expected key, 'if', or 'end'".into()),
                             code: Some(207),
-                        }); 
+                        });
                     }
                 }
             }
+
             items.push((key, Value::Object(object_items)));
         }
         Some(Token::Equals) => {
@@ -117,15 +124,15 @@ fn parse_top_level_item(
             globals.push((key, value));
         }
     }
-    
+
     Ok(())
 }
 
 fn parse_gather_statement(parser: &mut Parser) -> Result<(), RuneError> {
     parser.bump()?;
-    
-    let filename = if let Token::String(f) = parser.bump()? { 
-        f 
+
+    let filename = if let Token::String(f) = parser.bump()? {
+        f
     } else {
         return Err(RuneError::SyntaxError {
             message: "Expected string after gather".into(),
@@ -138,8 +145,8 @@ fn parse_gather_statement(parser: &mut Parser) -> Result<(), RuneError> {
 
     let alias = if let Some(Token::As) = parser.peek() {
         parser.bump()?;
-        if let Token::Ident(a) = parser.bump()? { 
-            a 
+        if let Token::Ident(a) = parser.bump()? {
+            a
         } else {
             return Err(RuneError::SyntaxError {
                 message: "Expected identifier after 'as'".into(),
@@ -149,7 +156,7 @@ fn parse_gather_statement(parser: &mut Parser) -> Result<(), RuneError> {
                 code: Some(212),
             });
         }
-    } else { 
+    } else {
         use std::path::PathBuf;
         PathBuf::from(&filename)
             .file_stem()
@@ -159,13 +166,13 @@ fn parse_gather_statement(parser: &mut Parser) -> Result<(), RuneError> {
     };
 
     parser.imports.insert(
-        alias, 
-        Document { 
-            metadata: vec![], 
-            globals: vec![], 
-            items: vec![] 
-        }
+        alias,
+        Document {
+            metadata: vec![],
+            globals: vec![],
+            items: vec![],
+        },
     );
-    
+
     Ok(())
 }

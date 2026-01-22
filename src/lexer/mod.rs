@@ -1,3 +1,6 @@
+// Author: Dustin Pilgrim
+// License: MIT
+
 use std::str::Chars;
 use crate::RuneError;
 
@@ -6,15 +9,36 @@ mod tokenizer;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
+    // --- literals ---
     Ident(String),
     String(String),
     Regex(String),
     Number(f64),
     Bool(bool),
     Null,
-    Colon, Equals, LBracket, RBracket, End,
-    Dollar, Dot, At, Gather, As,
-    If, Else, ElseIf,
+
+    // --- structure ---
+    Colon,
+    Equals,
+    LBracket,
+    RBracket,
+
+    End,
+    EndIf,
+
+    // --- symbols ---
+    Dollar,
+    Dot,
+    At,
+
+    // --- keywords ---
+    Gather,
+    As,
+    If,
+    Else,
+    ElseIf,
+
+    // --- layout ---
     Newline,
     Eof,
 }
@@ -46,10 +70,12 @@ impl<'a> Lexer<'a> {
         self.column
     }
 
+    /// Normal tokenization (newlines are significant)
     pub fn next_token(&mut self) -> Result<Token, RuneError> {
         tokenizer::next_token_with_flag(self, false)
     }
 
+    /// Tokenization inside arrays (newlines ignored)
     pub fn next_token_in_array(&mut self) -> Result<Token, RuneError> {
         tokenizer::next_token_with_flag(self, true)
     }

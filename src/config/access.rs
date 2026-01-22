@@ -19,14 +19,12 @@ impl RuneConfig {
     ///
     /// # Errors
     /// Returns error if path doesn't exist or value can't be converted to type T.
-    pub fn get<T>(&self, path: &str) -> Result<T, RuneError> 
+    pub fn get<T>(&self, path: &str) -> Result<T, RuneError>
     where
-        T: TryFrom<Value, Error = RuneError>
+        T: TryFrom<Value, Error = RuneError>,
     {
         let value = self.get_value_flexible(path)?;
-        T::try_from(value).map_err(|e| {
-            enhance_error_with_line_info(e, path, &self.raw_content)
-        })
+        T::try_from(value).map_err(|e| enhance_error_with_line_info(e, path, &self.raw_content))
     }
 
     /// Get an optional typed value - returns `None` if key doesn't exist.
@@ -42,9 +40,9 @@ impl RuneConfig {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn get_optional<T>(&self, path: &str) -> Result<Option<T>, RuneError> 
+    pub fn get_optional<T>(&self, path: &str) -> Result<Option<T>, RuneError>
     where
-        T: TryFrom<Value, Error = RuneError>
+        T: TryFrom<Value, Error = RuneError>,
     {
         match self.get_value_flexible(path) {
             Ok(value) => Ok(Some(T::try_from(value)?)),
@@ -62,16 +60,16 @@ impl RuneConfig {
     /// let timeout = config.get_or("server.timeout", 30u64);
     /// let debug = config.get_or("debug", false);
     /// ```
-    pub fn get_or<T>(&self, path: &str, default: T) -> T 
+    pub fn get_or<T>(&self, path: &str, default: T) -> T
     where
-        T: TryFrom<Value, Error = RuneError>
+        T: TryFrom<Value, Error = RuneError>,
     {
         self.get(path).unwrap_or(default)
     }
 
     /// Internal method that tries both snake_case and kebab-case variants.
     ///
-    /// Allows flexible key access: `monitor_media` and `monitor-media` both work.        
+    /// Allows flexible key access: `monitor_media` and `monitor-media` both work.
     fn get_value_flexible(&self, path: &str) -> Result<Value, RuneError> {
         // Fast path: exact
         if let Ok(v) = self.get_value(path) {
@@ -107,12 +105,7 @@ impl RuneConfig {
         }
 
         // DFS over combinations, stop on first that resolves
-        fn dfs(
-            cfg: &RuneConfig,
-            segs: &[&str],
-            i: usize,
-            cur: &mut Vec<String>,
-        ) -> Result<Value, RuneError> {
+        fn dfs(cfg: &RuneConfig, segs: &[&str], i: usize, cur: &mut Vec<String>) -> Result<Value, RuneError> {
             if i == segs.len() {
                 let candidate = cur.join(".");
                 return cfg.get_value(&candidate);
@@ -153,95 +146,98 @@ impl RuneConfig {
     /// }
     /// # Ok(())
     /// # }
-    /// ```       
+    /// ```
     pub fn get_value(&self, path: &str) -> Result<Value, RuneError> {
-        // Root lookup: return the fully-resolved main document as a Value::Object.
-        if path.trim().is_empty() {
-            let main_doc = self
-                .documents
-                .get(&self.main_doc_key)
-                .ok_or_else(|| RuneError::SyntaxError {
-                    message: "No main document loaded".into(),
-                    line: 0,
-                    column: 0,
-                    hint: None,
-                    code: Some(305),
-                })?;
+        use crate::ast::ObjectItem;
 
-            let mut temp_parser = parser::Parser::new("").map_err(|_| RuneError::SyntaxError {
-                message: "Failed to create temporary parser".into(),
-                line: 0,
-                column: 0,
-                hint: None,
-                code: Some(303),
-            })?;
-
-            for (alias, doc) in &self.documents {
-                if alias != &self.main_doc_key {
-                    temp_parser.inject_import(alias.clone(), doc.clone());
-                }
-            }
-
-            // Build a root Value from the document's top-level items.
-            // (items are already Vec<(String, Value)> and match Value::Object)
-            let root_value = Value::Object(main_doc.items.clone());
-
-            return helpers::resolve_value_recursively(&root_value, &temp_parser, main_doc);
-        }
-
-        let path_segments: Vec<String> = path.split('.').map(|s| s.to_string()).collect();
-
-        if let Some(main_doc) = self.documents.get(&self.main_doc_key) {
-            let mut temp_parser = parser::Parser::new("").map_err(|_| RuneError::SyntaxError {
-                message: "Failed to create temporary parser".into(),
-                line: 0,
-                column: 0,
-                hint: None,
-                code: Some(303),
-            })?;
-
-            for (alias, doc) in &self.documents {
-                if alias != &self.main_doc_key {
-                    temp_parser.inject_import(alias.clone(), doc.clone());
-                }
-            }
-
-            let resolved = temp_parser
-                .resolve_reference(&path_segments, main_doc)
-                .ok_or_else(|| {
-                    let (line, snippet) = helpers::find_config_line(path, &self.raw_content);
-                    if line > 0 {
-                        RuneError::SyntaxError {
-                            message: format!(
-                                "Path '{}' found but could not be resolved on line {}",
-                                path, line
-                            ),
-                            line,
-                            column: 0,
-                            hint: Some(format!("Check the value at: {}", snippet)),
-                            code: Some(304),
-                        }
-                    } else {
-                        RuneError::SyntaxError {
-                            message: format!("Path '{}' not found in configuration", path),
-                            line: 0,
-                            column: 0,
-                            hint: Some("Check that the path exists in your config file".into()),
-                            code: Some(304),
-                        }
-                    }
-                })?;
-
-            helpers::resolve_value_recursively(resolved, &temp_parser, main_doc)
-        } else {
-            Err(RuneError::SyntaxError {
+        let main_doc = self
+            .documents
+            .get(&self.main_doc_key)
+            .ok_or_else(|| RuneError::SyntaxError {
                 message: "No main document loaded".into(),
                 line: 0,
                 column: 0,
                 hint: None,
                 code: Some(305),
-            })
+            })?;
+
+        // Build a temporary parser and inject imports (same as before).
+        let mut temp_parser = parser::Parser::new("").map_err(|_| RuneError::SyntaxError {
+            message: "Failed to create temporary parser".into(),
+            line: 0,
+            column: 0,
+            hint: None,
+            code: Some(303),
+        })?;
+
+        for (alias, doc) in &self.documents {
+            if alias != &self.main_doc_key {
+                temp_parser.inject_import(alias.clone(), doc.clone());
+            }
         }
+
+        // Build a unified "root" object that contains both globals and items as Assigns.
+        // This is crucial because block `if ... endif` can hide assignments inside ObjectItem::IfBlock,
+        // and resolve_reference() cannot see those until we resolve/flatten the object.
+        let mut root_items: Vec<ObjectItem> = Vec::new();
+
+        for (k, v) in &main_doc.globals {
+            root_items.push(ObjectItem::Assign(k.clone(), v.clone()));
+        }
+        for (k, v) in &main_doc.items {
+            root_items.push(ObjectItem::Assign(k.clone(), v.clone()));
+        }
+
+        // Resolve + flatten everything (references, $env/$sys, inline if, and block if/endif).
+        let resolved_root =
+            helpers::resolve_value_recursively(&Value::Object(root_items), &temp_parser, main_doc)?;
+
+        // Root lookup: return fully resolved root
+        if path.trim().is_empty() {
+            return Ok(resolved_root);
+        }
+
+        // Now traverse the resolved Value tree to find the requested path.
+        fn lookup_path(v: &Value, segs: &[&str]) -> Option<Value> {
+            use crate::ast::ObjectItem;
+
+            let mut cur = v;
+            for seg in segs {
+                match cur {
+                    Value::Object(items) => {
+                        let next = items.iter().find_map(|it| match it {
+                            ObjectItem::Assign(k, val) if k == seg => Some(val),
+                            _ => None,
+                        })?;
+                        cur = next;
+                    }
+                    _ => return None,
+                }
+            }
+            Some(cur.clone())
+        }
+
+        let segs: Vec<&str> = path.split('.').collect();
+        lookup_path(&resolved_root, &segs).ok_or_else(|| {
+            let (line, snippet) = helpers::find_config_line(path, &self.raw_content);
+            if line > 0 {
+                RuneError::SyntaxError {
+                    message: format!("Path '{}' not found in configuration (near line {})", path, line),
+                    line,
+                    column: 0,
+                    hint: Some(format!("Check around: {}", snippet)),
+                    code: Some(304),
+                }
+            } else {
+                RuneError::SyntaxError {
+                    message: format!("Path '{}' not found in configuration", path),
+                    line: 0,
+                    column: 0,
+                    hint: Some("Check that the path exists in your config file".into()),
+                    code: Some(304),
+                }
+            }
+        })
     }
 
     /// Get all keys at a given path level.
@@ -259,16 +255,24 @@ impl RuneConfig {
     /// # }
     /// ```
     pub fn get_keys(&self, path: &str) -> Result<Vec<String>, RuneError> {
+        use crate::ast::ObjectItem;
+
         let value = self.get_value(path)?;
         match value {
-            Value::Object(items) => Ok(items.iter().map(|(k, _)| k.clone()).collect()),
+            Value::Object(items) => Ok(items
+                .iter()
+                .filter_map(|it| match it {
+                    ObjectItem::Assign(k, _) => Some(k.clone()),
+                    _ => None,
+                })
+                .collect()),
             _ => Err(RuneError::TypeError {
                 message: format!("Path '{}' is not an object", path),
                 line: 0,
                 column: 0,
                 hint: Some("Only objects have keys".into()),
                 code: Some(306),
-            })
+            }),
         }
     }
 
@@ -301,7 +305,13 @@ fn enhance_error_with_line_info(e: RuneError, path: &str, raw_content: &str) -> 
                     code,
                 }
             } else {
-                RuneError::TypeError { message, line: 0, column: 0, hint, code }
+                RuneError::TypeError {
+                    message,
+                    line: 0,
+                    column: 0,
+                    hint,
+                    code,
+                }
             }
         }
         RuneError::ValidationError { message, hint, code, .. } => {
@@ -315,7 +325,13 @@ fn enhance_error_with_line_info(e: RuneError, path: &str, raw_content: &str) -> 
                     code,
                 }
             } else {
-                RuneError::ValidationError { message, line: 0, column: 0, hint, code }
+                RuneError::ValidationError {
+                    message,
+                    line: 0,
+                    column: 0,
+                    hint,
+                    code,
+                }
             }
         }
         other => other,

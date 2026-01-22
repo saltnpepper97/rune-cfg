@@ -1,3 +1,6 @@
+// Author: Dustin Pilgrim
+// License: MIT
+
 pub fn format_uptime(seconds: u64) -> String {
     if seconds < 60 {
         format!("{} sec{}", seconds, if seconds != 1 { "s" } else { "" })

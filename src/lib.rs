@@ -1,3 +1,6 @@
+// Author: Dustin
+// License: MIT
+
 //! # rune-cfg
 //!
 //! A minimal, powerful configuration language with native regex support.

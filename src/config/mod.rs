@@ -1,3 +1,6 @@
+// Author: Dustin Pilgrim
+// License: MIT
+
 use std::fs;
 use std::path::Path;
 use indexmap::IndexMap;

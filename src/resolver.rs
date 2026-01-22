@@ -1,3 +1,6 @@
+// Author: Dustin Pilgrim
+// License: MIT
+
 use std::env;
 use sysinfo::{Product, System};
 

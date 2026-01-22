@@ -1,3 +1,6 @@
+// Author: Dustin Pilgrim
+// License: MIT
+
 #[cfg(test)]
 use super::*;
 
@@ -167,5 +170,62 @@ fn test_hyphen_and_underscore_identifiers() {
     for expected in expected_tokens {
         let tok = lexer.next_token().unwrap();
         assert_eq!(tok, expected);
+    }
+}
+
+#[test]
+fn test_endif_token() {
+    let input = r#"
+if something:
+endif
+"#;
+
+    let mut lexer = Lexer::new(input);
+
+    let expected_tokens = vec![
+        Token::Newline,
+        Token::If,
+        Token::Ident("something".into()),
+        Token::Colon,
+        Token::Newline,
+        Token::EndIf,
+        Token::Newline,
+        Token::Eof,
+    ];
+
+    for expected in expected_tokens {
+        let tok = lexer.next_token();
+        println!("{:?}", tok);
+        assert_eq!(tok, Ok(expected));
+    }
+}
+
+#[test]
+fn test_else_and_endif_tokens() {
+    let input = r#"
+if something:
+else:
+endif
+"#;
+
+    let mut lexer = Lexer::new(input);
+
+    let expected_tokens = vec![
+        Token::Newline,
+        Token::If,
+        Token::Ident("something".into()),
+        Token::Colon,
+        Token::Newline,
+        Token::Else,
+        Token::Colon,
+        Token::Newline,
+        Token::EndIf,
+        Token::Newline,
+        Token::Eof,
+    ];
+
+    for expected in expected_tokens {
+        let tok = lexer.next_token();
+        assert_eq!(tok, Ok(expected));
     }
 }

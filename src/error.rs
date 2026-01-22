@@ -1,3 +1,6 @@
+// Author: Dustin Pilgrim
+// License: MIT
+
 use std::fmt;
 
 /// The main error type for RUNE parsing and lexing.

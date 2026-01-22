@@ -1,10 +1,14 @@
+// Author: Dustin Pilgrim
+// License: MIT
+
 use super::*;
+use crate::ast::ObjectItem;
 use crate::resolver::{expand_dollar_string, parse_dollar_reference};
 use regex::Regex;
 
 pub(super) fn parse_assignment(parser: &mut Parser) -> Result<(String, Value), RuneError> {
-    let key = if let Token::Ident(k) = parser.bump()? { 
-        k 
+    let key = if let Token::Ident(k) = parser.bump()? {
+        k
     } else {
         return Err(RuneError::SyntaxError {
             message: "Expected identifier for assignment".into(),
@@ -18,38 +22,43 @@ pub(super) fn parse_assignment(parser: &mut Parser) -> Result<(String, Value), R
     match parser.peek() {
         Some(Token::Colon) => {
             parser.bump()?;
-            let mut items = Vec::new();
-            
+            let mut items: Vec<ObjectItem> = Vec::new();
+
             while let Some(tok) = parser.peek() {
                 match tok {
-                    Token::Ident(_) => { 
-                        items.push(parse_assignment(parser)?); 
+                    Token::Ident(_) => {
+                        let (k, v) = parse_assignment(parser)?;
+                        items.push(ObjectItem::Assign(k, v));
                     }
-                    Token::End => { 
-                        parser.bump()?; 
-                        break; 
+                    Token::If => {
+                        // block if: if condition: ... endif
+                        items.push(conditional::parse_if_block(parser)?);
                     }
-                    Token::Newline => { 
-                        parser.bump()?; 
+                    Token::End => {
+                        parser.bump()?;
+                        break;
                     }
-                    _ => { 
+                    Token::Newline => {
+                        parser.bump()?;
+                    }
+                    _ => {
                         return Err(RuneError::InvalidToken {
                             token: format!("{:?}", tok),
                             line: parser.line(),
                             column: parser.column(),
-                            hint: Some("Expected key or 'end'".into()),
+                            hint: Some("Expected key, 'if', or 'end'".into()),
                             code: Some(207),
-                        }); 
+                        });
                     }
                 }
             }
+
             return Ok((key, Value::Object(items)));
         }
-        Some(Token::Equals) => { 
-            parser.bump()?; 
+        Some(Token::Equals) => {
+            parser.bump()?;
         }
-        _ => {
-        }
+        _ => {}
     }
 
     let value = parse_value(parser)?;
@@ -66,7 +75,14 @@ pub(super) fn parse_value(parser: &mut Parser) -> Result<Value, RuneError> {
         Some(Token::Ident(_)) => parse_reference_value(parser),
         Some(Token::LBracket) => parse_array_value(parser),
         Some(Token::Null) => parse_null_value(parser),
-        Some(Token::If) => conditional::parse_conditional(parser),
+        Some(Token::If) => {
+            // IMPORTANT:
+            // - In value position, `if` means inline conditional:
+            //     x = if cond a else b
+            // - Block ifs are only parsed inside objects:
+            //     if cond: ... endif
+            conditional::parse_conditional(parser)
+        }
         _ => {
             let token = parser.bump()?;
             Err(RuneError::InvalidToken {
@@ -83,24 +99,24 @@ pub(super) fn parse_value(parser: &mut Parser) -> Result<Value, RuneError> {
 fn parse_string_value(parser: &mut Parser) -> Result<Value, RuneError> {
     if let Token::String(s) = parser.bump()? {
         expand_dollar_string(&s)
-    } else { 
-        unreachable!() 
+    } else {
+        unreachable!()
     }
 }
 
 fn parse_number_value(parser: &mut Parser) -> Result<Value, RuneError> {
     if let Token::Number(n) = parser.bump()? {
         Ok(Value::Number(n))
-    } else { 
-        unreachable!() 
+    } else {
+        unreachable!()
     }
 }
 
 fn parse_bool_value(parser: &mut Parser) -> Result<Value, RuneError> {
     if let Token::Bool(b) = parser.bump()? {
         Ok(Value::Bool(b))
-    } else { 
-        unreachable!() 
+    } else {
+        unreachable!()
     }
 }
 
@@ -114,8 +130,8 @@ fn parse_regex_value(parser: &mut Parser) -> Result<Value, RuneError> {
             code: Some(211),
         })?;
         Ok(Value::Regex(regex))
-    } else { 
-        unreachable!() 
+    } else {
+        unreachable!()
     }
 }
 
@@ -125,7 +141,7 @@ fn parse_null_value(parser: &mut Parser) -> Result<Value, RuneError> {
 }
 
 fn parse_dollar_reference_value(parser: &mut Parser) -> Result<Value, RuneError> {
-    parser.bump()?;
+    parser.bump()?; // $
 
     let namespace = if let Token::Ident(name) = parser.bump()? {
         if name != "env" && name != "sys" && name != "runtime" {
@@ -170,11 +186,11 @@ fn parse_dollar_reference_value(parser: &mut Parser) -> Result<Value, RuneError>
 
 fn parse_reference_value(parser: &mut Parser) -> Result<Value, RuneError> {
     let mut path = Vec::new();
-    
+
     if let Token::Ident(name) = parser.bump()? {
         path.push(name);
-    } else { 
-        unreachable!() 
+    } else {
+        unreachable!()
     }
 
     while let Some(Token::Dot) = parser.peek() {
@@ -196,16 +212,16 @@ fn parse_reference_value(parser: &mut Parser) -> Result<Value, RuneError> {
 }
 
 fn parse_array_value(parser: &mut Parser) -> Result<Value, RuneError> {
-    parser.bump()?;
+    parser.bump()?; // '['
     let mut arr = Vec::new();
-    
+
     while let Some(tok) = parser.peek() {
         match tok {
-            Token::RBracket => { 
+            Token::RBracket => {
                 parser.bump()?;
-                break; 
+                break;
             }
-            Token::Newline => { 
+            Token::Newline => {
                 parser.bump()?;
             }
             _ => {
@@ -213,6 +229,6 @@ fn parse_array_value(parser: &mut Parser) -> Result<Value, RuneError> {
             }
         }
     }
-    
+
     Ok(Value::Array(arr))
 }

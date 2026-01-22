@@ -1,3 +1,6 @@
+// Author: Dustin Pilgrim
+// License: MIT
+
 use super::*;
 
 /// Advance the character iterator and update line/column tracking

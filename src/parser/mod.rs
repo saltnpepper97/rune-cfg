@@ -1,3 +1,6 @@
+// Author: Dustin Pilgrim
+// License: MIT
+
 use std::collections::HashMap;
 
 use crate::lexer::{Lexer, Token};

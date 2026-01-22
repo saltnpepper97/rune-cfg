@@ -18,7 +18,7 @@ RUNE is a configuration language designed to combine **readability, simplicity, 
 **Key Features:**
 - **Clean syntax** - Minimal and readable, no complex indentation rules
 - **Native regex** - First-class regex support with `r"pattern"` syntax
-- **Conditionals** - Simple `if/else` for dynamic configurations
+- **Conditionals** - Inline `if/else` expressions *and* block-style `if / else / endif`
 - **Memory-safe** - Written in Rust with strong type safety
 - **System integration** - Access environment variables with `$env` and system info with `$sys`
 - **Flexible keys** - Automatic `snake_case` and `kebab-case` handling
@@ -31,7 +31,7 @@ Add `rune-cfg` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rune-cfg = "0.3.1"
+rune-cfg = "0.4.0"
 ```
 
 ## Quick Example
@@ -138,7 +138,9 @@ for ip in &["192.168.1.100", "10.0.0.50", "172.16.0.1"] {
 
 ### Conditionals
 
-Simple `if/else` statements for dynamic configuration:
+RUNE supports **two kinds of conditionals**:
+
+#### 1. Simple inline `if/else` statements:
 
 ```rune
 environment "production"
@@ -153,6 +155,25 @@ log_level if debug_mode "debug" else "info"
 feature_flags:
   analytics if environment = "production" true else false
   debug_panel if debug_mode true else false
+end
+```
+
+#### 2. Block conditionals (inside objects)
+
+```rune
+For more complex configuration, RUNE supports **block-style conditionals**
+inside object blocks using `if / else / endif`
+
+app:
+  name "MyApp"
+
+  if environment = "production":
+    debug false
+    workers 8
+  else:
+    debug true
+    workers 2
+  endif
 end
 ```
 

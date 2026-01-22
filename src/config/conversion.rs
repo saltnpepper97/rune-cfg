@@ -1,6 +1,10 @@
+// Author: Dustin Pilgrim
+// License: MIT
+
 use std::collections::HashMap;
 
 use crate::{Value, RuneError};
+use crate::ast::ObjectItem;
 
 impl TryFrom<Value> for String {
     type Error = RuneError;
@@ -14,7 +18,7 @@ impl TryFrom<Value> for String {
                 column: 0,
                 hint: Some("Use a string value in your config".into()),
                 code: Some(401),
-            })
+            }),
         }
     }
 }
@@ -31,7 +35,7 @@ impl TryFrom<Value> for f64 {
                 column: 0,
                 hint: Some("Use a number value in your config".into()),
                 code: Some(402),
-            })
+            }),
         }
     }
 }
@@ -48,7 +52,7 @@ impl TryFrom<Value> for f32 {
                 column: 0,
                 hint: Some("Use a number value in your config".into()),
                 code: Some(402),
-            })
+            }),
         }
     }
 }
@@ -65,7 +69,7 @@ impl TryFrom<Value> for i32 {
                 column: 0,
                 hint: Some("Use a number value in your config".into()),
                 code: Some(402),
-            })
+            }),
         }
     }
 }
@@ -82,7 +86,7 @@ impl TryFrom<Value> for i64 {
                 column: 0,
                 hint: Some("Use a number value in your config".into()),
                 code: Some(402),
-            })
+            }),
         }
     }
 }
@@ -140,7 +144,7 @@ impl TryFrom<Value> for u16 {
                 column: 0,
                 hint: Some("Use a number value in your config".into()),
                 code: Some(402),
-            })
+            }),
         }
     }
 }
@@ -169,7 +173,7 @@ impl TryFrom<Value> for u32 {
                 column: 0,
                 hint: Some("Use a number value in your config".into()),
                 code: Some(402),
-            })
+            }),
         }
     }
 }
@@ -240,13 +244,9 @@ impl TryFrom<Value> for bool {
             Value::Bool(b) => Ok(b),
             Value::Reference(ref path) if path.len() == 1 => {
                 let ref_name = &path[0];
-                if ref_name.to_lowercase().starts_with("tru") 
-                    || ref_name.to_lowercase().starts_with("fal") {
+                if ref_name.to_lowercase().starts_with("tru") || ref_name.to_lowercase().starts_with("fal") {
                     Err(RuneError::TypeError {
-                        message: format!(
-                            "Invalid boolean value '{}'. Did you mean 'true' or 'false'?",
-                            ref_name
-                        ),
+                        message: format!("Invalid boolean value '{}'. Did you mean 'true' or 'false'?", ref_name),
                         line: 0,
                         column: 0,
                         hint: None,
@@ -254,10 +254,7 @@ impl TryFrom<Value> for bool {
                     })
                 } else {
                     Err(RuneError::TypeError {
-                        message: format!(
-                            "Expected boolean (true/false), got reference to '{}'",
-                            ref_name
-                        ),
+                        message: format!("Expected boolean (true/false), got reference to '{}'", ref_name),
                         line: 0,
                         column: 0,
                         hint: None,
@@ -271,14 +268,14 @@ impl TryFrom<Value> for bool {
                 column: 0,
                 hint: None,
                 code: Some(404),
-            })
+            }),
         }
     }
 }
 
-impl<T> TryFrom<Value> for Vec<T> 
+impl<T> TryFrom<Value> for Vec<T>
 where
-    T: TryFrom<Value, Error = RuneError>
+    T: TryFrom<Value, Error = RuneError>,
 {
     type Error = RuneError;
 
@@ -297,14 +294,14 @@ where
                 column: 0,
                 hint: Some("Use an array [...] in your config".into()),
                 code: Some(405),
-            })
+            }),
         }
     }
 }
 
 impl<T> TryFrom<Value> for Option<T>
 where
-    T: TryFrom<Value, Error = RuneError>
+    T: TryFrom<Value, Error = RuneError>,
 {
     type Error = RuneError;
 
@@ -316,25 +313,49 @@ where
     }
 }
 
+/// Convert an object `Value` to a map, **expecting the object to be fully-resolved**.
+///
+/// With block `if ... endif` support, objects can contain conditional items. By the time you
+/// convert to a `HashMap`, those conditionals should have been evaluated and flattened into
+/// plain assignments.
+///
+/// If this conversion sees an `IfBlock`, it returns a type error with a helpful hint.
+fn object_items_to_map(items: Vec<ObjectItem>) -> Result<HashMap<String, Value>, RuneError> {
+    let mut map = HashMap::new();
+
+    for item in items {
+        match item {
+            ObjectItem::Assign(key, val) => {
+                map.insert(key, val);
+            }
+            ObjectItem::IfBlock(_) => {
+                return Err(RuneError::TypeError {
+                    message: "Expected object with only key/value pairs, but found an if-block".into(),
+                    line: 0,
+                    column: 0,
+                    hint: Some("This usually means if-blocks were not resolved. Ensure you resolve/evaluate the config before converting it to a HashMap.".into()),
+                    code: Some(410),
+                });
+            }
+        }
+    }
+
+    Ok(map)
+}
+
 impl TryFrom<Value> for HashMap<String, Value> {
     type Error = RuneError;
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
-            Value::Object(items) => {
-                let mut map = HashMap::new();
-                for (key, val) in items {
-                    map.insert(key, val);
-                }
-                Ok(map)
-            }
+            Value::Object(items) => object_items_to_map(items),
             _ => Err(RuneError::TypeError {
                 message: format!("Expected object, got {:?}", value),
                 line: 0,
                 column: 0,
                 hint: Some("Use an object block in your config".into()),
                 code: Some(410),
-            })
+            }),
         }
     }
 }
@@ -345,8 +366,9 @@ impl TryFrom<Value> for HashMap<String, String> {
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
             Value::Object(items) => {
+                let base = object_items_to_map(items)?;
                 let mut map = HashMap::new();
-                for (key, val) in items {
+                for (key, val) in base {
                     let string_val = String::try_from(val)?;
                     map.insert(key, string_val);
                 }
@@ -358,7 +380,7 @@ impl TryFrom<Value> for HashMap<String, String> {
                 column: 0,
                 hint: Some("Use an object block with string values".into()),
                 code: Some(410),
-            })
+            }),
         }
     }
 }
@@ -379,7 +401,7 @@ impl TryFrom<Value> for (String, String) {
                 column: 0,
                 hint: Some("Use [\"key\", \"value\"] format".into()),
                 code: Some(411),
-            })
+            }),
         }
     }
 }
@@ -400,12 +422,15 @@ impl TryFrom<Value> for (String, Value) {
                 column: 0,
                 hint: Some("Use [\"key\", value] format".into()),
                 code: Some(411),
-            })
+            }),
         }
     }
 }
 
 impl RuneError {
+    /// Helper for file-related errors when loading/parsing configs.
+    ///
+    /// Keeps a consistent error code and a friendly default hint.
     pub fn file_error(message: String, path: String) -> Self {
         RuneError::FileError {
             message,
