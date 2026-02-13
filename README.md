@@ -385,4 +385,4 @@ RUNE is production-ready and actively maintained. All core features are stable a
 
 ## License
 
-[MIT License](LICENSE)
+[GPLv3License](LICENSE)
