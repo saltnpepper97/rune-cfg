@@ -2,11 +2,32 @@
 // License: MIT
 
 use std::env;
-use sysinfo::{Product, System};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use sysinfo::System;
 
 use crate::ast::Value;
 use crate::RuneError;
-use crate::utils::{format_uptime, format_bytes};
+use crate::utils::{format_bytes, format_uptime};
+
+/// Cache for sysinfo::System to avoid allocating and refreshing on every $sys lookup.
+struct SysCache {
+    sys: System,
+    last_mem_refresh: Instant,
+}
+
+static SYS_CACHE: OnceLock<Mutex<SysCache>> = OnceLock::new();
+
+fn sys_cache() -> &'static Mutex<SysCache> {
+    SYS_CACHE.get_or_init(|| {
+        Mutex::new(SysCache {
+            sys: System::new(), // NOT new_all()
+            // Force first access to refresh memory if requested.
+            last_mem_refresh: Instant::now() - Duration::from_secs(3600),
+        })
+    })
+}
 
 /// Expands a dollar if it refers to $env or $sys.
 /// Otherwise, keeps it as a Reference.
@@ -127,7 +148,6 @@ pub fn expand_dollar_string(s: &str) -> Result<Value, RuneError> {
     Ok(Value::String(result))
 }
 
-
 /// Resolve a `Value::Reference` during evaluation
 pub fn resolve_reference_value(value: &Value) -> Result<Value, RuneError> {
     match value {
@@ -146,7 +166,7 @@ pub fn parse_dollar_reference(path: Vec<String>) -> Result<Value, RuneError> {
     if path.is_empty() {
         return Ok(Value::Reference(path));
     }
-    
+
     match path[0].as_str() {
         "env" => Ok(Value::String(resolve_env(&path)?)),
         "sys" => Ok(Value::String(resolve_sys(&path)?)),
@@ -169,11 +189,36 @@ fn resolve_env(path: &[String]) -> Result<String, RuneError> {
     Ok(env::var(&path[1]).unwrap_or_default())
 }
 
-/// $sys resolver using sysinfo crate
-fn resolve_sys(path: &[String]) -> Result<String, RuneError> {
-    let mut sys = System::new_all();
-    sys.refresh_all();
+/// Helper: consistent "unresolved" error for $sys.<key>
+fn sys_unresolved(key: &str) -> RuneError {
+    RuneError::SyntaxError {
+        message: format!("Unable to resolve $sys.{}", key),
+        line: 0,
+        column: 0,
+        hint: None,
+        code: Some(213),
+    }
+}
 
+/// Run `f` with a cached System, refreshing memory at most once per second.
+fn with_sys_memory_refreshed<F>(f: F) -> Result<String, RuneError>
+where
+    F: FnOnce(&System) -> Result<String, RuneError>,
+{
+    let cache = sys_cache();
+    let mut guard = cache.lock().unwrap();
+
+    // Rate-limit memory refresh (tune as desired)
+    if guard.last_mem_refresh.elapsed() >= Duration::from_secs(1) {
+        guard.sys.refresh_memory();
+        guard.last_mem_refresh = Instant::now();
+    }
+
+    f(&guard.sys)
+}
+
+/// $sys resolver using sysinfo crate (cached, targeted refresh)
+fn resolve_sys(path: &[String]) -> Result<String, RuneError> {
     // Get the key and ensure it exists
     let key = path.get(1).ok_or_else(|| RuneError::SyntaxError {
         message: format!("Missing key in $sys path: {}", path.join(".")),
@@ -183,38 +228,50 @@ fn resolve_sys(path: &[String]) -> Result<String, RuneError> {
         code: Some(211),
     })?;
 
-    let value = match key.as_str() {
-        "os" => System::name(),
-        "kernel_version" | "kernel-version" => System::kernel_version(),
-        "os_version" | "os-version" => System::os_version(),
-        "hostname" => System::host_name(),
-        "product_name" | "product-name" => Product::name(),
-        "cpu_arch" | "cpu-arch" => Some(System::cpu_arch()),
-        "cpu_count" | "cpu-count" => Some(sys.cpus().len().to_string()),
-        "memory_total" | "memory-total" => Some(format_bytes(sys.total_memory())),
-        "memory_free" | "memory-free" => Some(format_bytes(sys.free_memory())),
-        "memory_used" | "memory-used" => Some(format_bytes(sys.used_memory())),
-        "uptime" => Some(format_uptime(System::uptime())),
-        other => {
-            return Err(RuneError::SyntaxError {
-                message: format!("Unknown $sys key: {}", other),
-                line: 0,
-                column: 0,
-                hint: Some(
-                    "Available keys: os, kernel_version, os_version, hostname, cpu_count, memory_total, memory_free, uptime".into()
-                ),
-                code: Some(212),
-            })
+    match key.as_str() {
+        // These are static / cheap; no System instance needed
+        "os" => System::name().ok_or_else(|| sys_unresolved(key)),
+        "kernel_version" | "kernel-version" => System::kernel_version().ok_or_else(|| sys_unresolved(key)),
+        "os_version" | "os-version" => System::os_version().ok_or_else(|| sys_unresolved(key)),
+        "hostname" => System::host_name().ok_or_else(|| sys_unresolved(key)),
+        "cpu_arch" | "cpu-arch" => {
+            let arch = System::cpu_arch();
+            if arch.is_empty() {
+                Err(sys_unresolved(key))
+            } else {
+                Ok(arch)
+            }
         }
-    };
+        "uptime" => Ok(format_uptime(System::uptime())),
 
-    value.ok_or_else(|| RuneError::SyntaxError {
-        message: format!("Unable to resolve $sys.{}", key),
-        line: 0,
-        column: 0,
-        hint: None,
-        code: Some(213),
-    })
+        // Needs cached System; no refresh required for cpu list length
+        "cpu_count" | "cpu-count" => {
+            let cache = sys_cache();
+            let guard = cache.lock().unwrap();
+            Ok(guard.sys.cpus().len().to_string())
+        }
+
+        // Memory needs refresh; we refresh memory only, and rate-limit it
+        "memory_total" | "memory-total" => {
+            with_sys_memory_refreshed(|sys| Ok(format_bytes(sys.total_memory())))
+        }
+        "memory_free" | "memory-free" => {
+            with_sys_memory_refreshed(|sys| Ok(format_bytes(sys.free_memory())))
+        }
+        "memory_used" | "memory-used" => {
+            with_sys_memory_refreshed(|sys| Ok(format_bytes(sys.used_memory())))
+        }
+
+        other => Err(RuneError::SyntaxError {
+            message: format!("Unknown $sys key: {}", other),
+            line: 0,
+            column: 0,
+            hint: Some(
+                "Available keys: os, kernel_version, os_version, hostname, cpu_arch, cpu_count, memory_total, memory_free, memory_used, uptime".into()
+            ),
+            code: Some(212),
+        }),
+    }
 }
 
 // -- Tests --
@@ -238,7 +295,6 @@ mod tests {
             "memory_free",
             "memory_used",
             "uptime",
-            "product-name"
         ];
 
         for &key in &keys {
@@ -316,10 +372,10 @@ mod tests {
         unsafe {
             std::env::set_var("TEST_VAR", "test_value");
         }
-        
+
         let path = vec!["env".to_string(), "TEST_VAR".to_string()];
         let result = parse_dollar_reference(path).expect("Failed to parse $env reference");
-        
+
         match result {
             Value::String(s) => assert_eq!(s, "test_value"),
             _ => panic!("Expected Value::String for $env.TEST_VAR"),
@@ -330,7 +386,7 @@ mod tests {
     fn test_parse_dollar_reference_sys() {
         let path = vec!["sys".to_string(), "hostname".to_string()];
         let result = parse_dollar_reference(path).expect("Failed to parse $sys reference");
-        
+
         match result {
             Value::String(s) => assert!(!s.is_empty(), "Hostname should not be empty"),
             _ => panic!("Expected Value::String for $sys.hostname"),

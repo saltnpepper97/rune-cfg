@@ -191,10 +191,10 @@ impl RuneConfig {
 /// Expand "~/" and resolve relative paths against base_dir.
 fn resolve_gather_path(raw_path: &str, base_dir: &Path) -> Result<PathBuf, RuneError> {
     let mut p = if let Some(rest) = raw_path.strip_prefix("~/") {
-        let home = dirs::home_dir().ok_or_else(|| RuneError::FileError {
+        let home = home_dir_fallback().ok_or_else(|| RuneError::FileError {
             message: "Could not determine home directory for ~ expansion".into(),
             path: raw_path.to_string(),
-            hint: Some("Set HOME or use an absolute path in gather".into()),
+            hint: Some("Set HOME (or USERPROFILE on Windows) or use an absolute path in gather".into()),
             code: Some(300),
         })?;
         home.join(rest)
@@ -206,6 +206,32 @@ fn resolve_gather_path(raw_path: &str, base_dir: &Path) -> Result<PathBuf, RuneE
         p = base_dir.join(p);
     }
     Ok(p)
+}
+
+/// Best-effort home directory lookup without external crates.
+fn home_dir_fallback() -> Option<PathBuf> {
+    // Unix-like: HOME
+    if let Some(home) = std::env::var_os("HOME") {
+        if !home.is_empty() {
+            return Some(PathBuf::from(home));
+        }
+    }
+
+    // Windows: USERPROFILE, or HOMEDRIVE + HOMEPATH
+    if let Some(up) = std::env::var_os("USERPROFILE") {
+        if !up.is_empty() {
+            return Some(PathBuf::from(up));
+        }
+    }
+
+    let drive = std::env::var_os("HOMEDRIVE");
+    let path = std::env::var_os("HOMEPATH");
+    match (drive, path) {
+        (Some(d), Some(p)) if !d.is_empty() && !p.is_empty() => {
+            Some(PathBuf::from(d).join(PathBuf::from(p)))
+        }
+        _ => None,
+    }
 }
 
 /// Load an import file, parse its doc, inject into `documents` under `alias`,
