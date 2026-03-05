@@ -1,8 +1,8 @@
 // Author: Dustin Pilgrim
 // License: MIT
 
-use super::*;
 use super::scanner::{bump, skip_whitespace_and_comments};
+use super::*;
 
 pub(super) fn next_token_with_flag(
     lexer: &mut Lexer,

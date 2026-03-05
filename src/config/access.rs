@@ -46,7 +46,9 @@ impl RuneConfig {
     {
         match self.get_value_flexible(path) {
             Ok(value) => Ok(Some(T::try_from(value)?)),
-            Err(RuneError::SyntaxError { code: Some(304), .. }) => Ok(None),
+            Err(RuneError::SyntaxError {
+                code: Some(304), ..
+            }) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -105,7 +107,12 @@ impl RuneConfig {
         }
 
         // DFS over combinations, stop on first that resolves
-        fn dfs(cfg: &RuneConfig, segs: &[&str], i: usize, cur: &mut Vec<String>) -> Result<Value, RuneError> {
+        fn dfs(
+            cfg: &RuneConfig,
+            segs: &[&str],
+            i: usize,
+            cur: &mut Vec<String>,
+        ) -> Result<Value, RuneError> {
             if i == segs.len() {
                 let candidate = cur.join(".");
                 return cfg.get_value(&candidate);
@@ -150,16 +157,16 @@ impl RuneConfig {
     pub fn get_value(&self, path: &str) -> Result<Value, RuneError> {
         use crate::ast::ObjectItem;
 
-        let main_doc = self
-            .documents
-            .get(&self.main_doc_key)
-            .ok_or_else(|| RuneError::SyntaxError {
-                message: "No main document loaded".into(),
-                line: 0,
-                column: 0,
-                hint: None,
-                code: Some(305),
-            })?;
+        let main_doc =
+            self.documents
+                .get(&self.main_doc_key)
+                .ok_or_else(|| RuneError::SyntaxError {
+                    message: "No main document loaded".into(),
+                    line: 0,
+                    column: 0,
+                    hint: None,
+                    code: Some(305),
+                })?;
 
         // Build a temporary parser and inject imports (same as before).
         let mut temp_parser = parser::Parser::new("").map_err(|_| RuneError::SyntaxError {
@@ -222,7 +229,10 @@ impl RuneConfig {
             let (line, snippet) = helpers::find_config_line(path, &self.raw_content);
             if line > 0 {
                 RuneError::SyntaxError {
-                    message: format!("Path '{}' not found in configuration (near line {})", path, line),
+                    message: format!(
+                        "Path '{}' not found in configuration (near line {})",
+                        path, line
+                    ),
                     line,
                     column: 0,
                     hint: Some(format!("Check around: {}", snippet)),
@@ -294,7 +304,12 @@ impl RuneConfig {
 /// Enhance type/validation errors with line number information from config file.
 fn enhance_error_with_line_info(e: RuneError, path: &str, raw_content: &str) -> RuneError {
     match e {
-        RuneError::TypeError { message, hint, code, .. } => {
+        RuneError::TypeError {
+            message,
+            hint,
+            code,
+            ..
+        } => {
             let (line, snippet) = helpers::find_config_line(path, raw_content);
             if line > 0 {
                 RuneError::TypeError {
@@ -314,7 +329,12 @@ fn enhance_error_with_line_info(e: RuneError, path: &str, raw_content: &str) -> 
                 }
             }
         }
-        RuneError::ValidationError { message, hint, code, .. } => {
+        RuneError::ValidationError {
+            message,
+            hint,
+            code,
+            ..
+        } => {
             let (line, snippet) = helpers::find_config_line(path, raw_content);
             if line > 0 {
                 RuneError::ValidationError {

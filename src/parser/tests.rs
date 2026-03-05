@@ -29,8 +29,16 @@ end
     assert_eq!(doc.items.len(), 1);
 
     if let Value::Object(items) = &doc.items[0].1 {
-        assert!(items.iter().any(|it| matches!(it, ObjectItem::Assign(k, _) if k == "name")));
-        assert!(items.iter().any(|it| matches!(it, ObjectItem::Assign(k, _) if k == "version")));
+        assert!(
+            items
+                .iter()
+                .any(|it| matches!(it, ObjectItem::Assign(k, _) if k == "name"))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|it| matches!(it, ObjectItem::Assign(k, _) if k == "version"))
+        );
     } else {
         panic!("Expected top-level 'app' to be an object");
     }
@@ -317,7 +325,11 @@ end
     let doc = parser.parse_document().expect("Failed to parse doc");
 
     if let Value::Object(items) = &doc.items[0].1 {
-        assert!(items.iter().any(|it| matches!(it, ObjectItem::Assign(k, _) if k == "name")));
+        assert!(
+            items
+                .iter()
+                .any(|it| matches!(it, ObjectItem::Assign(k, _) if k == "name"))
+        );
         assert!(items.iter().any(|it| matches!(it, ObjectItem::IfBlock(_))));
     } else {
         panic!("Expected 'app' to be an Object");

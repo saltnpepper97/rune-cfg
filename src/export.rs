@@ -1,12 +1,12 @@
 // Author: Dustin Pilgrim
 // License: MIT
 
-use std::fs;
 use serde_json::json;
+use std::fs;
 
+use crate::RuneError;
 use crate::ast::Document;
 use crate::parser::Parser;
-use crate::RuneError;
 
 /// Export a RUNE document to JSON format.
 ///
@@ -165,8 +165,8 @@ pub fn export_rune_file(path: &str) -> Result<String, RuneError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{Document, ObjectItem, Value};
     use crate::parser::Parser;
-    use crate::ast::{Document, Value, ObjectItem};
     use regex::Regex;
     use std::fs;
 
@@ -183,7 +183,9 @@ mod tests {
         let example_input =
             fs::read_to_string("examples/example.rune").expect("Failed to read example.rune");
         let mut parser = Parser::new(&example_input).expect("Failed to create parser for example");
-        let doc = parser.parse_document().expect("Failed to parse example.rune");
+        let doc = parser
+            .parse_document()
+            .expect("Failed to parse example.rune");
 
         parser.inject_import("defaults".to_string(), defaults_doc);
 
@@ -219,10 +221,7 @@ mod tests {
         let doc = Document {
             items: vec![(
                 "root".to_string(),
-                Value::Object(vec![ObjectItem::Assign(
-                    "a".into(),
-                    Value::Number(1.0),
-                )]),
+                Value::Object(vec![ObjectItem::Assign("a".into(), Value::Number(1.0))]),
             )],
             metadata: vec![],
             globals: vec![],

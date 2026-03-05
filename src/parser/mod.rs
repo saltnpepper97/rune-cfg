@@ -3,14 +3,14 @@
 
 use std::collections::HashMap;
 
-use crate::lexer::{Lexer, Token};
 use crate::RuneError;
 use crate::ast::{Document, Value};
+use crate::lexer::{Lexer, Token};
 
 mod conditional;
 mod document;
-mod value;
 mod reference;
+mod value;
 
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
@@ -22,10 +22,10 @@ impl<'a> Parser<'a> {
     pub fn new(input: &'a str) -> Result<Self, RuneError> {
         let mut lexer = Lexer::new(input);
         let peek = Some(lexer.next_token()?);
-        Ok(Self { 
-            lexer, 
-            peek, 
-            imports: HashMap::new() 
+        Ok(Self {
+            lexer,
+            peek,
+            imports: HashMap::new(),
         })
     }
 
@@ -77,7 +77,11 @@ impl<'a> Parser<'a> {
         document::parse_document(self)
     }
 
-    pub fn resolve_reference<'b>(&'b self, path: &[String], doc: &'b Document) -> Option<&'b Value> {
+    pub fn resolve_reference<'b>(
+        &'b self,
+        path: &[String],
+        doc: &'b Document,
+    ) -> Option<&'b Value> {
         reference::resolve_reference(self, path, doc)
     }
 }

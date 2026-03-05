@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 
-use crate::{Value, RuneError};
 use crate::ast::ObjectItem;
+use crate::{RuneError, Value};
 
 impl TryFrom<Value> for String {
     type Error = RuneError;
@@ -244,9 +244,14 @@ impl TryFrom<Value> for bool {
             Value::Bool(b) => Ok(b),
             Value::Reference(ref path) if path.len() == 1 => {
                 let ref_name = &path[0];
-                if ref_name.to_lowercase().starts_with("tru") || ref_name.to_lowercase().starts_with("fal") {
+                if ref_name.to_lowercase().starts_with("tru")
+                    || ref_name.to_lowercase().starts_with("fal")
+                {
                     Err(RuneError::TypeError {
-                        message: format!("Invalid boolean value '{}'. Did you mean 'true' or 'false'?", ref_name),
+                        message: format!(
+                            "Invalid boolean value '{}'. Did you mean 'true' or 'false'?",
+                            ref_name
+                        ),
                         line: 0,
                         column: 0,
                         hint: None,
@@ -254,7 +259,10 @@ impl TryFrom<Value> for bool {
                     })
                 } else {
                     Err(RuneError::TypeError {
-                        message: format!("Expected boolean (true/false), got reference to '{}'", ref_name),
+                        message: format!(
+                            "Expected boolean (true/false), got reference to '{}'",
+                            ref_name
+                        ),
                         line: 0,
                         column: 0,
                         hint: None,

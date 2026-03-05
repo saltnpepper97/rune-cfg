@@ -35,11 +35,14 @@ pub(super) fn parse_document(parser: &mut Parser) -> Result<Document, RuneError>
             }
             Token::Dollar => {
                 return Err(RuneError::SyntaxError {
-                    message: "Dollar variables ($env, $sys, $runtime) cannot be assigned at top level".into(),
+                    message:
+                        "Dollar variables ($env, $sys, $runtime) cannot be assigned at top level"
+                            .into(),
                     line: parser.line(),
                     column: parser.column(),
                     hint: Some(
-                        "Dollar variables can only be used as values, not as top-level definitions".into(),
+                        "Dollar variables can only be used as values, not as top-level definitions"
+                            .into(),
                     ),
                     code: Some(213),
                 });
@@ -56,10 +59,17 @@ pub(super) fn parse_document(parser: &mut Parser) -> Result<Document, RuneError>
         }
     }
 
-    Ok(Document { metadata, globals, items })
+    Ok(Document {
+        metadata,
+        globals,
+        items,
+    })
 }
 
-fn parse_metadata(parser: &mut Parser, metadata: &mut Vec<(String, Value)>) -> Result<(), RuneError> {
+fn parse_metadata(
+    parser: &mut Parser,
+    metadata: &mut Vec<(String, Value)>,
+) -> Result<(), RuneError> {
     parser.bump()?;
 
     if let Token::Ident(key) = parser.bump()? {
@@ -82,7 +92,11 @@ fn parse_top_level_item(
     globals: &mut Vec<(String, Value)>,
     items: &mut Vec<(String, Value)>,
 ) -> Result<(), RuneError> {
-    let key = if let Token::Ident(k) = parser.bump()? { k } else { unreachable!() };
+    let key = if let Token::Ident(k) = parser.bump()? {
+        k
+    } else {
+        unreachable!()
+    };
 
     match parser.peek() {
         Some(Token::Colon) => {

@@ -1,8 +1,8 @@
 // Author: Dustin Pilgrim
 // License: MIT
 
-use std::str::Chars;
 use crate::RuneError;
+use std::str::Chars;
 
 mod scanner;
 mod tokenizer;

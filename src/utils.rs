@@ -10,9 +10,12 @@ pub fn format_uptime(seconds: u64) -> String {
     } else {
         let hours = seconds / 3600;
         let minutes = (seconds % 3600) / 60;
-        format!("{} hr{}, {} min{}", 
-            hours, if hours != 1 { "s" } else { "" },
-            minutes, if minutes != 1 { "s" } else { "" }
+        format!(
+            "{} hr{}, {} min{}",
+            hours,
+            if hours != 1 { "s" } else { "" },
+            minutes,
+            if minutes != 1 { "s" } else { "" }
         )
     }
 }

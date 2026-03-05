@@ -22,20 +22,20 @@ pub(super) fn bump(lexer: &mut Lexer) -> Option<char> {
 pub(super) fn skip_whitespace_and_comments(lexer: &mut Lexer, skip_newlines: bool) {
     while let Some(c) = lexer.peek {
         match c {
-            ' ' | '\t' => { 
-                bump(lexer); 
+            ' ' | '\t' => {
+                bump(lexer);
             }
-            '\n' if skip_newlines => { 
-                bump(lexer); 
+            '\n' if skip_newlines => {
+                bump(lexer);
             }
             '\n' => break,
-            '#' => { 
+            '#' => {
                 // Skip comment until end of line
-                while let Some(ch) = bump(lexer) { 
-                    if ch == '\n' { 
-                        break; 
-                    } 
-                } 
+                while let Some(ch) = bump(lexer) {
+                    if ch == '\n' {
+                        break;
+                    }
+                }
             }
             _ => break,
         }

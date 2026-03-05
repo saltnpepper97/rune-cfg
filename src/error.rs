@@ -74,7 +74,13 @@ pub enum RuneError {
 impl fmt::Display for RuneError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RuneError::SyntaxError { message, line, hint, code, .. } => {
+            RuneError::SyntaxError {
+                message,
+                line,
+                hint,
+                code,
+                ..
+            } => {
                 if *line > 0 {
                     write!(f, "[RUNE] Syntax Error at line {}: {}", line, message)?;
                 } else {
@@ -88,7 +94,13 @@ impl fmt::Display for RuneError {
                 }
                 Ok(())
             }
-            RuneError::InvalidToken { token, line, hint, code, .. } => {
+            RuneError::InvalidToken {
+                token,
+                line,
+                hint,
+                code,
+                ..
+            } => {
                 if *line > 0 {
                     write!(f, "[RUNE] Invalid Token '{}' at line {}", token, line)?;
                 } else {
@@ -102,7 +114,13 @@ impl fmt::Display for RuneError {
                 }
                 Ok(())
             }
-            RuneError::UnexpectedEof { message, line, hint, code, .. } => {
+            RuneError::UnexpectedEof {
+                message,
+                line,
+                hint,
+                code,
+                ..
+            } => {
                 if *line > 0 {
                     write!(f, "[RUNE] Unexpected EOF at line {}: {}", line, message)?;
                 } else {
@@ -116,7 +134,13 @@ impl fmt::Display for RuneError {
                 }
                 Ok(())
             }
-            RuneError::TypeError { message, line, hint, code, .. } => {
+            RuneError::TypeError {
+                message,
+                line,
+                hint,
+                code,
+                ..
+            } => {
                 if *line > 0 {
                     write!(f, "[RUNE] Type Error at line {}: {}", line, message)?;
                 } else {
@@ -130,9 +154,19 @@ impl fmt::Display for RuneError {
                 }
                 Ok(())
             }
-            RuneError::UnclosedString { quote, line, hint, code, .. } => {
+            RuneError::UnclosedString {
+                quote,
+                line,
+                hint,
+                code,
+                ..
+            } => {
                 if *line > 0 {
-                    write!(f, "[RUNE] Unclosed string starting with '{}' at line {}", quote, line)?;
+                    write!(
+                        f,
+                        "[RUNE] Unclosed string starting with '{}' at line {}",
+                        quote, line
+                    )?;
                 } else {
                     write!(f, "[RUNE] Unclosed string starting with '{}'", quote)?;
                 }
@@ -144,9 +178,19 @@ impl fmt::Display for RuneError {
                 }
                 Ok(())
             }
-            RuneError::UnexpectedCharacter { character, line, hint, code, .. } => {
+            RuneError::UnexpectedCharacter {
+                character,
+                line,
+                hint,
+                code,
+                ..
+            } => {
                 if *line > 0 {
-                    write!(f, "[RUNE] Unexpected character '{}' at line {}", character, line)?;
+                    write!(
+                        f,
+                        "[RUNE] Unexpected character '{}' at line {}",
+                        character, line
+                    )?;
                 } else {
                     write!(f, "[RUNE] Unexpected character '{}'", character)?;
                 }
@@ -158,7 +202,12 @@ impl fmt::Display for RuneError {
                 }
                 Ok(())
             }
-            RuneError::FileError { message, path, hint, code } => {
+            RuneError::FileError {
+                message,
+                path,
+                hint,
+                code,
+            } => {
                 write!(f, "[RUNE] File Error '{}': {}", path, message)?;
                 if let Some(h) = hint {
                     write!(f, " Hint: {}", h)?;
@@ -168,7 +217,11 @@ impl fmt::Display for RuneError {
                 }
                 Ok(())
             }
-            RuneError::RuntimeError { message, hint, code } => {
+            RuneError::RuntimeError {
+                message,
+                hint,
+                code,
+            } => {
                 write!(f, "[RUNE] Runtime Error: {}", message)?;
                 if let Some(h) = hint {
                     write!(f, " Hint: {}", h)?;
@@ -178,7 +231,12 @@ impl fmt::Display for RuneError {
                 }
                 Ok(())
             }
-            RuneError::ValidationError { message, hint, code, .. } => {
+            RuneError::ValidationError {
+                message,
+                hint,
+                code,
+                ..
+            } => {
                 write!(f, "{}", message)?;
                 if let Some(h) = hint {
                     write!(f, "\nHint: {}", h)?;

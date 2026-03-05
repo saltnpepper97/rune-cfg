@@ -6,14 +6,14 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 
+use crate::RuneError;
 use crate::ast::{Document, Value};
 use crate::parser;
-use crate::RuneError;
 
 mod access;
-mod validation;
 mod conversion;
 mod helpers;
+mod validation;
 
 /// Main configuration struct that holds parsed RUNE documents and handles resolution
 pub struct RuneConfig {
@@ -42,7 +42,10 @@ impl RuneConfig {
     ///
     /// Tries to load from the primary path first. If that fails (file not found),
     /// attempts to load from the fallback path.
-    pub fn from_file_with_fallback<P: AsRef<Path>>(primary: P, fallback: P) -> Result<Self, RuneError> {
+    pub fn from_file_with_fallback<P: AsRef<Path>>(
+        primary: P,
+        fallback: P,
+    ) -> Result<Self, RuneError> {
         match Self::from_file(&primary) {
             Ok(config) => Ok(config),
             Err(RuneError::FileError { .. }) => {
@@ -194,7 +197,9 @@ fn resolve_gather_path(raw_path: &str, base_dir: &Path) -> Result<PathBuf, RuneE
         let home = home_dir_fallback().ok_or_else(|| RuneError::FileError {
             message: "Could not determine home directory for ~ expansion".into(),
             path: raw_path.to_string(),
-            hint: Some("Set HOME (or USERPROFILE on Windows) or use an absolute path in gather".into()),
+            hint: Some(
+                "Set HOME (or USERPROFILE on Windows) or use an absolute path in gather".into(),
+            ),
             code: Some(300),
         })?;
         home.join(rest)

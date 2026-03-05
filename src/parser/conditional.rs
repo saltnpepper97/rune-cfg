@@ -114,7 +114,10 @@ enum StopAt {
     EndIfOnly,
 }
 
-fn parse_object_items_until(parser: &mut Parser, stop: StopAt) -> Result<Vec<ObjectItem>, RuneError> {
+fn parse_object_items_until(
+    parser: &mut Parser,
+    stop: StopAt,
+) -> Result<Vec<ObjectItem>, RuneError> {
     let mut items: Vec<ObjectItem> = Vec::new();
 
     while let Some(tok) = parser.peek() {
