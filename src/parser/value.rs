@@ -144,12 +144,12 @@ fn parse_dollar_reference_value(parser: &mut Parser) -> Result<Value, RuneError>
     parser.bump()?; // $
 
     let namespace = if let Token::Ident(name) = parser.bump()? {
-        if name != "env" && name != "sys" && name != "runtime" {
+        if name != "env" && name != "sys" && name != "runtime" && name != "var" {
             return Err(RuneError::SyntaxError {
                 message: format!("Unknown namespace ${}", name),
                 line: parser.line(),
                 column: parser.column(),
-                hint: Some("Use $env, $sys, or $runtime".into()),
+                hint: Some("Use $env, $sys, $runtime, or $var".into()),
                 code: Some(209),
             });
         }

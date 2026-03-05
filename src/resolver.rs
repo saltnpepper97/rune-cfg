@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use sysinfo::System;
 
-use crate::ast::Value;
 use crate::RuneError;
+use crate::ast::Value;
 use crate::utils::{format_bytes, format_uptime};
 
 /// Cache for sysinfo::System to avoid allocating and refreshing on every $sys lookup.
@@ -82,11 +82,15 @@ pub fn expand_dollar_string(s: &str) -> Result<Value, RuneError> {
             }
         }
 
-        return match path[0].as_str() {
-            "env" => Ok(Value::String(resolve_env(&path)?)),
-            "sys" => Ok(Value::String(resolve_sys(&path)?)),
-            _ => Ok(Value::Reference(path)),
-        };
+        // Only treat as pure reference when the whole string is exactly "$ns.path".
+        // Otherwise (e.g. "$var.mod+r"), fall through to inline interpolation logic.
+        if chars.peek().is_none() && !path.first().is_some_and(|p| p.is_empty()) {
+            return match path[0].as_str() {
+                "env" => Ok(Value::String(resolve_env(&path)?)),
+                "sys" => Ok(Value::String(resolve_sys(&path)?)),
+                _ => Ok(Value::Reference(path)),
+            };
+        }
     }
 
     // Otherwise: do inline interpolation → replace $env/$sys in string
@@ -303,11 +307,7 @@ mod tests {
 
             match result {
                 Value::String(s) => {
-                    assert!(
-                        !s.is_empty(),
-                        "Value for $sys.{} should not be empty",
-                        key
-                    );
+                    assert!(!s.is_empty(), "Value for $sys.{} should not be empty", key);
                     println!("$sys.{} = {}", key, s);
                 }
                 _ => panic!("Expected Value::String for $sys.{}", key),

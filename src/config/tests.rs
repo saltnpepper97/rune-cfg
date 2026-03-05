@@ -48,7 +48,9 @@ end
     assert!(config.has("app.name"));
     assert!(!config.has("app.nonexistent"));
 
-    let server_keys = config.get_keys("app.server").expect("Failed to get server keys");
+    let server_keys = config
+        .get_keys("app.server")
+        .expect("Failed to get server keys");
     assert!(server_keys.contains(&"host".to_string()));
     assert!(server_keys.contains(&"port".to_string()));
 }
@@ -85,6 +87,44 @@ end
     let config = RuneConfig::from_str(config_content).unwrap();
     let keys = config.get_keys("nested").unwrap();
     assert_eq!(keys, vec!["alpha", "beta", "gamma"]);
+}
+
+#[test]
+fn test_var_reference_resolves_top_level_variable() {
+    let config_content = r#"
+mod_main "alt"
+
+dev:
+  keybinds:
+    modifier $var.mod_main
+  end
+end
+"#;
+
+    let config = RuneConfig::from_str(config_content).expect("Failed to parse config");
+    let modifier: String = config
+        .get("dev.keybinds.modifier")
+        .expect("Failed to resolve $var.mod_main");
+    assert_eq!(modifier, "alt");
+}
+
+#[test]
+fn test_var_interpolation_inside_string() {
+    let config_content = r#"
+mod_main "alt+shift"
+
+dev:
+  keybinds:
+    reload_config "$var.mod_main+r"
+  end
+end
+"#;
+
+    let config = RuneConfig::from_str(config_content).expect("Failed to parse config");
+    let chord: String = config
+        .get("dev.keybinds.reload_config")
+        .expect("Failed to resolve interpolated $var in string");
+    assert_eq!(chord, "alt+shift+r");
 }
 
 // ===== String Conversion Tests =====
@@ -246,7 +286,11 @@ fn test_vec_string_conversion() {
 
 #[test]
 fn test_vec_number_conversion() {
-    let value = Value::Array(vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)]);
+    let value = Value::Array(vec![
+        Value::Number(1.0),
+        Value::Number(2.0),
+        Value::Number(3.0),
+    ]);
 
     let result: Result<Vec<i32>, RuneError> = value.try_into();
     assert!(result.is_ok());
@@ -255,7 +299,11 @@ fn test_vec_number_conversion() {
 
 #[test]
 fn test_vec_bool_conversion() {
-    let value = Value::Array(vec![Value::Bool(true), Value::Bool(false), Value::Bool(true)]);
+    let value = Value::Array(vec![
+        Value::Bool(true),
+        Value::Bool(false),
+        Value::Bool(true),
+    ]);
 
     let result: Result<Vec<bool>, RuneError> = value.try_into();
     assert!(result.is_ok());
@@ -357,19 +405,22 @@ fn test_hashmap_string_conversion_error() {
 
 #[test]
 fn test_tuple_string_string_conversion() {
-    let value = Value::Array(vec![Value::String("key".to_string()), Value::String("value".to_string())]);
+    let value = Value::Array(vec![
+        Value::String("key".to_string()),
+        Value::String("value".to_string()),
+    ]);
 
     let result: Result<(String, String), RuneError> = value.try_into();
     assert!(result.is_ok());
-    assert_eq!(
-        result.unwrap(),
-        ("key".to_string(), "value".to_string())
-    );
+    assert_eq!(result.unwrap(), ("key".to_string(), "value".to_string()));
 }
 
 #[test]
 fn test_tuple_string_value_conversion() {
-    let value = Value::Array(vec![Value::String("config".to_string()), Value::Number(42.0)]);
+    let value = Value::Array(vec![
+        Value::String("config".to_string()),
+        Value::Number(42.0),
+    ]);
 
     let result: Result<(String, Value), RuneError> = value.try_into();
     assert!(result.is_ok());

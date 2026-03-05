@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use crate::{parser, Document, RuneError, Value};
+use crate::{Document, RuneError, Value, parser};
 
 /// Gather statement parsed from a file.
 #[derive(Debug, Clone)]
@@ -203,6 +203,7 @@ fn condition_is_met(
         if segs.len() >= 2 {
             match segs[0].as_str() {
                 "env" | "sys" | "runtime" => resolver::parse_dollar_reference(segs).ok(),
+                "var" => parser.resolve_reference(&segs[1..], doc).cloned(),
                 _ => parser.resolve_reference(&segs, doc).cloned(),
             }
         } else {
@@ -236,6 +237,127 @@ pub(super) fn evaluate_conditional(
     }
 }
 
+fn stringify_interpolated_value(value: &Value) -> Result<String, RuneError> {
+    match value {
+        Value::String(s) => Ok(s.clone()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Null => Ok(String::new()),
+        other => Err(RuneError::TypeError {
+            message: format!(
+                "$var interpolation requires a scalar value, got {:?}",
+                other
+            ),
+            line: 0,
+            column: 0,
+            hint: Some("Use string/number/bool/null for $var interpolation".into()),
+            code: Some(401),
+        }),
+    }
+}
+
+fn resolve_var_reference(
+    path: &[String],
+    parser: &parser::Parser,
+    main_doc: &Document,
+) -> Result<Value, RuneError> {
+    if path.len() < 2 {
+        return Err(RuneError::SyntaxError {
+            message: "Invalid $var path".into(),
+            line: 0,
+            column: 0,
+            hint: Some("Use $var.<name> or $var.<path.to.value>".into()),
+            code: Some(209),
+        });
+    }
+
+    let target = &path[1..];
+    let Some(resolved) = parser.resolve_reference(target, main_doc) else {
+        return Err(RuneError::RuntimeError {
+            message: format!(
+                "Variable '{}' not found for $var reference",
+                target.join(".")
+            ),
+            hint: Some("Define the variable before using $var.<name>".into()),
+            code: Some(309),
+        });
+    };
+    resolve_value_recursively(resolved, parser, main_doc)
+}
+
+fn interpolate_var_refs_in_string(
+    input: &str,
+    parser: &parser::Parser,
+    main_doc: &Document,
+) -> Result<String, RuneError> {
+    let mut out = String::new();
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        if chars[i] != '$' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        let mut j = i + 1;
+        let mut ns = String::new();
+        while j < chars.len() {
+            let ch = chars[j];
+            if ch.is_alphanumeric() || ch == '_' || ch == '-' {
+                ns.push(ch);
+                j += 1;
+            } else {
+                break;
+            }
+        }
+
+        if ns.is_empty() {
+            out.push('$');
+            i += 1;
+            continue;
+        }
+
+        let mut path = vec![ns.clone()];
+        while j < chars.len() && chars[j] == '.' {
+            j += 1;
+            let mut seg = String::new();
+            while j < chars.len() {
+                let ch = chars[j];
+                if ch.is_alphanumeric() || ch == '_' || ch == '-' {
+                    seg.push(ch);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if seg.is_empty() {
+                return Err(RuneError::SyntaxError {
+                    message: "Expected identifier after '.'".into(),
+                    line: 0,
+                    column: 0,
+                    hint: None,
+                    code: Some(210),
+                });
+            }
+            path.push(seg);
+        }
+
+        if ns == "var" {
+            let v = resolve_var_reference(&path, parser, main_doc)?;
+            out.push_str(&stringify_interpolated_value(&v)?);
+        } else {
+            out.push('$');
+            out.push_str(&path.join("."));
+        }
+
+        i = j;
+    }
+
+    Ok(out)
+}
+
 pub(super) fn resolve_value_recursively(
     value: &Value,
     parser: &parser::Parser,
@@ -258,15 +380,27 @@ pub(super) fn resolve_value_recursively(
                         code: Some(308),
                     })
             } else if path.get(0).map(|s| s.as_str()) == Some("sys") {
-                Ok(Value::String(format!("sys_placeholder:{}", path[1..].join("."))))
+                Ok(Value::String(format!(
+                    "sys_placeholder:{}",
+                    path[1..].join(".")
+                )))
             } else if path.get(0).map(|s| s.as_str()) == Some("runtime") {
-                Ok(Value::String(format!("runtime_placeholder:{}", path[1..].join("."))))
+                Ok(Value::String(format!(
+                    "runtime_placeholder:{}",
+                    path[1..].join(".")
+                )))
+            } else if path.get(0).map(|s| s.as_str()) == Some("var") {
+                resolve_var_reference(path, parser, main_doc)
             } else if let Some(resolved) = parser.resolve_reference(path, main_doc) {
                 resolve_value_recursively(resolved, parser, main_doc)
             } else {
                 Ok(value.clone())
             }
         }
+
+        Value::String(s) => Ok(Value::String(interpolate_var_refs_in_string(
+            s, parser, main_doc,
+        )?)),
 
         Value::Array(arr) => {
             let mut resolved_array = Vec::new();
@@ -292,7 +426,8 @@ pub(super) fn resolve_value_recursively(
                             out.push(ObjectItem::Assign(k.clone(), rv));
                         }
                         ObjectItem::IfBlock(block) => {
-                            let take_then = super::helpers::condition_is_met(&block.condition, parser, doc);
+                            let take_then =
+                                super::helpers::condition_is_met(&block.condition, parser, doc);
                             let branch: &[ObjectItem] = if take_then {
                                 &block.then_items
                             } else {
