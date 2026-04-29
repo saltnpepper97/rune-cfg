@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 
 use crate::RuneError;
-use crate::ast::{Document, Value};
+use crate::ast::{Document, ObjectItem, Value};
 use crate::parser;
 
 mod access;
@@ -123,17 +123,7 @@ impl RuneConfig {
                 let imported = documents.get(&spec.alias).cloned();
                 if let Some(import_doc) = imported {
                     if let Some(main_doc_mut) = documents.get_mut(&main_key) {
-                        // Include semantics: bring assignments into main.
-                        // NOTE: duplicates are okay; later resolution is "first match wins" in current resolver,
-                        // so we append imported values AFTER main? We want MAIN to win, so append imported FIRST.
-                        // We'll *prepend* by rebuilding vectors.
-                        let mut new_globals = import_doc.globals.clone();
-                        new_globals.extend(main_doc_mut.globals.clone());
-                        main_doc_mut.globals = new_globals;
-
-                        let mut new_items = import_doc.items.clone();
-                        new_items.extend(main_doc_mut.items.clone());
-                        main_doc_mut.items = new_items;
+                        merge_defaults_into_document(main_doc_mut, &import_doc);
                     }
                 }
             }
@@ -188,6 +178,49 @@ impl RuneConfig {
 
     pub fn get_document(&self, name: &str) -> Option<&Document> {
         self.documents.get(name)
+    }
+}
+
+fn merge_defaults_into_document(target: &mut Document, defaults: &Document) {
+    merge_named_values(&mut target.globals, &defaults.globals);
+    merge_named_values(&mut target.items, &defaults.items);
+}
+
+fn merge_named_values(target: &mut Vec<(String, Value)>, defaults: &[(String, Value)]) {
+    for (default_key, default_value) in defaults {
+        let Some((_, target_value)) = target.iter_mut().find(|(key, _)| key == default_key) else {
+            target.push((default_key.clone(), default_value.clone()));
+            continue;
+        };
+
+        if let (Value::Object(target_items), Value::Object(default_items)) =
+            (target_value, default_value)
+        {
+            merge_object_items(target_items, default_items);
+        }
+    }
+}
+
+fn merge_object_items(target: &mut Vec<ObjectItem>, defaults: &[ObjectItem]) {
+    for default_item in defaults {
+        let ObjectItem::Assign(default_key, default_value) = default_item else {
+            target.push(default_item.clone());
+            continue;
+        };
+
+        let Some(ObjectItem::Assign(_, target_value)) = target
+            .iter_mut()
+            .find(|item| matches!(item, ObjectItem::Assign(key, _) if key == default_key))
+        else {
+            target.push(default_item.clone());
+            continue;
+        };
+
+        if let (Value::Object(target_items), Value::Object(default_items)) =
+            (target_value, default_value)
+        {
+            merge_object_items(target_items, default_items);
+        }
     }
 }
 

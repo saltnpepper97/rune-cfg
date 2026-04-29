@@ -90,6 +90,114 @@ end
 }
 
 #[test]
+fn test_unaliased_gather_deep_merges_sections_with_main_precedence() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let defaults_path = dir.path().join("defaults.rune");
+    let config_path = dir.path().join("config.rune");
+
+    std::fs::write(
+        &defaults_path,
+        r##"
+field:
+  gap 44.0
+  pins:
+    colour "#d65d26"
+    size 2.0
+  end
+end
+"##,
+    )
+    .expect("write defaults");
+    std::fs::write(
+        &config_path,
+        r##"
+gather "defaults.rune"
+
+field:
+  gap 20.0
+  pins:
+    corner "top-right"
+    size 1.0
+  end
+end
+"##,
+    )
+    .expect("write config");
+
+    let config = RuneConfig::from_file(&config_path).expect("config should parse");
+
+    assert_eq!(config.get::<f32>("field.gap").unwrap(), 20.0);
+    assert_eq!(
+        config.get::<String>("field.pins.colour").unwrap(),
+        "#d65d26"
+    );
+    assert_eq!(
+        config.get::<String>("field.pins.corner").unwrap(),
+        "top-right"
+    );
+    assert_eq!(config.get::<f32>("field.pins.size").unwrap(), 1.0);
+}
+
+#[test]
+fn test_unaliased_gather_merges_multiple_default_sections_in_order() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let first_path = dir.path().join("first.rune");
+    let second_path = dir.path().join("second.rune");
+    let config_path = dir.path().join("config.rune");
+
+    std::fs::write(
+        &first_path,
+        r##"
+app:
+  theme:
+    foreground "#ffffff"
+    background "#000000"
+  end
+end
+"##,
+    )
+    .expect("write first defaults");
+    std::fs::write(
+        &second_path,
+        r##"
+app:
+  theme:
+    foreground "#eeeeee"
+    accent "#d65d26"
+  end
+end
+"##,
+    )
+    .expect("write second defaults");
+    std::fs::write(
+        &config_path,
+        r##"
+gather "first.rune"
+gather "second.rune"
+
+app:
+  theme:
+    background "#111111"
+  end
+end
+"##,
+    )
+    .expect("write config");
+
+    let config = RuneConfig::from_file(&config_path).expect("config should parse");
+
+    assert_eq!(
+        config.get::<String>("app.theme.foreground").unwrap(),
+        "#ffffff"
+    );
+    assert_eq!(
+        config.get::<String>("app.theme.background").unwrap(),
+        "#111111"
+    );
+    assert_eq!(config.get::<String>("app.theme.accent").unwrap(), "#d65d26");
+}
+
+#[test]
 fn test_var_reference_resolves_top_level_variable() {
     let config_content = r#"
 mod_main "alt"
