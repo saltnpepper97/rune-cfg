@@ -90,7 +90,7 @@ end
 }
 
 #[test]
-fn test_unaliased_gather_deep_merges_sections_with_main_precedence() {
+fn test_unaliased_gather_deep_merges_sections_with_gather_precedence() {
     let dir = tempfile::tempdir().expect("temp dir");
     let defaults_path = dir.path().join("defaults.rune");
     let config_path = dir.path().join("config.rune");
@@ -126,7 +126,7 @@ end
 
     let config = RuneConfig::from_file(&config_path).expect("config should parse");
 
-    assert_eq!(config.get::<f32>("field.gap").unwrap(), 20.0);
+    assert_eq!(config.get::<f32>("field.gap").unwrap(), 44.0);
     assert_eq!(
         config.get::<String>("field.pins.colour").unwrap(),
         "#d65d26"
@@ -135,7 +135,7 @@ end
         config.get::<String>("field.pins.corner").unwrap(),
         "top-right"
     );
-    assert_eq!(config.get::<f32>("field.pins.size").unwrap(), 1.0);
+    assert_eq!(config.get::<f32>("field.pins.size").unwrap(), 2.0);
 }
 
 #[test]
@@ -188,11 +188,11 @@ end
 
     assert_eq!(
         config.get::<String>("app.theme.foreground").unwrap(),
-        "#ffffff"
+        "#eeeeee"
     );
     assert_eq!(
         config.get::<String>("app.theme.background").unwrap(),
-        "#111111"
+        "#000000"
     );
     assert_eq!(config.get::<String>("app.theme.accent").unwrap(), "#d65d26");
 }

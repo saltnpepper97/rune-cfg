@@ -123,7 +123,7 @@ impl RuneConfig {
                 let imported = documents.get(&spec.alias).cloned();
                 if let Some(import_doc) = imported {
                     if let Some(main_doc_mut) = documents.get_mut(&main_key) {
-                        merge_defaults_into_document(main_doc_mut, &import_doc);
+                        merge_overrides_into_document(main_doc_mut, &import_doc);
                     }
                 }
             }
@@ -181,45 +181,49 @@ impl RuneConfig {
     }
 }
 
-fn merge_defaults_into_document(target: &mut Document, defaults: &Document) {
-    merge_named_values(&mut target.globals, &defaults.globals);
-    merge_named_values(&mut target.items, &defaults.items);
+fn merge_overrides_into_document(target: &mut Document, overrides: &Document) {
+    merge_named_values(&mut target.globals, &overrides.globals);
+    merge_named_values(&mut target.items, &overrides.items);
 }
 
-fn merge_named_values(target: &mut Vec<(String, Value)>, defaults: &[(String, Value)]) {
-    for (default_key, default_value) in defaults {
-        let Some((_, target_value)) = target.iter_mut().find(|(key, _)| key == default_key) else {
-            target.push((default_key.clone(), default_value.clone()));
+fn merge_named_values(target: &mut Vec<(String, Value)>, overrides: &[(String, Value)]) {
+    for (override_key, override_value) in overrides {
+        let Some((_, target_value)) = target.iter_mut().find(|(key, _)| key == override_key) else {
+            target.push((override_key.clone(), override_value.clone()));
             continue;
         };
 
-        if let (Value::Object(target_items), Value::Object(default_items)) =
-            (target_value, default_value)
+        if let (Value::Object(target_items), Value::Object(override_items)) =
+            (&mut *target_value, override_value)
         {
-            merge_object_items(target_items, default_items);
+            merge_object_items(target_items, override_items);
+        } else {
+            *target_value = override_value.clone();
         }
     }
 }
 
-fn merge_object_items(target: &mut Vec<ObjectItem>, defaults: &[ObjectItem]) {
-    for default_item in defaults {
-        let ObjectItem::Assign(default_key, default_value) = default_item else {
-            target.push(default_item.clone());
+fn merge_object_items(target: &mut Vec<ObjectItem>, overrides: &[ObjectItem]) {
+    for override_item in overrides {
+        let ObjectItem::Assign(override_key, override_value) = override_item else {
+            target.push(override_item.clone());
             continue;
         };
 
         let Some(ObjectItem::Assign(_, target_value)) = target
             .iter_mut()
-            .find(|item| matches!(item, ObjectItem::Assign(key, _) if key == default_key))
+            .find(|item| matches!(item, ObjectItem::Assign(key, _) if key == override_key))
         else {
-            target.push(default_item.clone());
+            target.push(override_item.clone());
             continue;
         };
 
-        if let (Value::Object(target_items), Value::Object(default_items)) =
-            (target_value, default_value)
+        if let (Value::Object(target_items), Value::Object(override_items)) =
+            (&mut *target_value, override_value)
         {
-            merge_object_items(target_items, default_items);
+            merge_object_items(target_items, override_items);
+        } else {
+            *target_value = override_value.clone();
         }
     }
 }
