@@ -447,7 +447,7 @@ println!("{}", json);
 
 ## Language Server
 
-RUNE includes an experimental diagnostics-only language server binary named `rune-lsp`.
+RUNE includes an experimental language server binary named `rune-lsp`.
 
 Neovim runtime files are included under `editors/nvim/`. These provide highlighting, filetype detection, and 2-space indentation. The language server provides diagnostics. They are separate pieces and can be used together.
 
@@ -460,7 +460,38 @@ Current capabilities:
 - hover text for schema-backed fields
 - document symbols for object blocks and keys
 - a quickfix code action for missing `end` diagnostics
+- optional `@schema` references for app-provided schemas
 - automatic `schema.rune` discovery from the config file directory upward to the workspace root
+
+Schemas are optional. `rune-lsp` supports three levels of editor intelligence:
+
+- Plain RUNE: no schema required; syntax diagnostics still work.
+- Local schema: place `schema.rune` beside a config file or in a parent directory for validation, completion, and hover.
+- App-provided schema: add `@schema "name"` or `@schema "./path/to/schema.rune"` to use a named or explicit schema.
+
+Explicit schema references are resolved before local discovery. Path references may be relative to the config file directory or absolute:
+
+```rune
+@schema "./schemas/app.rune"
+@schema "../schemas/app.rune"
+@schema "/usr/share/rune/schemas/app.rune"
+```
+
+Named schemas use the schema name plus `.rune` and search these locations:
+
+```text
+./schemas/<name>.rune
+./.rune/schemas/<name>.rune
+~/.config/rune/schemas/<name>.rune
+/usr/local/share/rune/schemas/<name>.rune
+/usr/share/rune/schemas/<name>.rune
+```
+
+For example:
+
+```rune
+@schema "stasis"
+```
 
 Run the server directly with:
 
@@ -519,7 +550,7 @@ vim.lsp.start({
 })
 ```
 
-Place a `schema.rune` next to your config file or in a parent directory. When the config is opened, `rune-lsp` validates it against that schema and publishes diagnostics to the editor.
+Place a `schema.rune` next to your config file or in a parent directory, or use `@schema` to point at an app-provided schema. When a schema is available, `rune-lsp` validates the config and uses the schema for completion and hover. Without a schema, `rune-lsp` stays in plain RUNE mode and only reports syntax-level diagnostics.
 
 ## Error Messages
 

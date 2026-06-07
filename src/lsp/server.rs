@@ -27,6 +27,13 @@ struct OpenDocument {
     version: i32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaDirective {
+    reference: String,
+    line: usize,
+    column: usize,
+}
+
 pub struct RuneLanguageServer {
     client: Client,
     root_uri: RwLock<Option<Url>>,
@@ -83,8 +90,10 @@ impl RuneLanguageServer {
             Err(error) => return vec![diagnostic_from_error(error)],
         };
 
-        let Some(schema_text) = self.schema_text_for(uri).await else {
-            return Vec::new();
+        let schema_text = match self.schema_text_for_document(uri, text).await {
+            Ok(Some(schema_text)) => schema_text,
+            Ok(None) => return Vec::new(),
+            Err(diagnostic) => return vec![diagnostic],
         };
 
         let schema = match SchemaDocument::from_str(&schema_text) {
@@ -96,14 +105,64 @@ impl RuneLanguageServer {
     }
 
     async fn schema_text_for(&self, uri: &Url) -> Option<String> {
-        let schema_uri = self.schema_uri_for(uri).await?;
+        let text = self.document_text_for(uri).await?;
+        self.schema_text_for_document(uri, &text)
+            .await
+            .ok()
+            .flatten()
+    }
 
+    async fn schema_text_for_document(
+        &self,
+        uri: &Url,
+        text: &str,
+    ) -> Result<Option<String>, RuneDiagnostic> {
+        if let Some(directive) = schema_directive(text) {
+            let schema_uri = self.resolve_schema_directive_uri(uri, &directive).await?;
+            return self
+                .schema_text_for_uri(&schema_uri)
+                .await
+                .map(Some)
+                .ok_or_else(|| schema_reference_diagnostic(&directive));
+        }
+
+        let Some(schema_uri) = self.schema_uri_for(uri).await else {
+            return Ok(None);
+        };
+
+        Ok(self.schema_text_for_uri(&schema_uri).await)
+    }
+
+    async fn schema_text_for_uri(&self, schema_uri: &Url) -> Option<String> {
         if let Some(document) = self.documents.read().await.get(&schema_uri) {
             return Some(document.text.clone());
         }
 
         let path = schema_uri.to_file_path().ok()?;
         std::fs::read_to_string(path).ok()
+    }
+
+    async fn resolve_schema_directive_uri(
+        &self,
+        uri: &Url,
+        directive: &SchemaDirective,
+    ) -> Result<Url, RuneDiagnostic> {
+        let path = uri
+            .to_file_path()
+            .map_err(|_| schema_reference_diagnostic(directive))?;
+        let config_dir = path
+            .parent()
+            .ok_or_else(|| schema_reference_diagnostic(directive))?;
+
+        for candidate in schema_candidates(&directive.reference, config_dir) {
+            if candidate.exists() || self.is_open_uri_for_path(&candidate).await {
+                if let Ok(uri) = Url::from_file_path(candidate) {
+                    return Ok(uri);
+                }
+            }
+        }
+
+        Err(schema_reference_diagnostic(directive))
     }
 
     async fn schema_for(&self, uri: &Url) -> Option<SchemaDocument> {
@@ -338,6 +397,118 @@ fn is_schema_file(uri: &Url) -> bool {
         .ok()
         .and_then(|path| path.file_name().map(|name| name == "schema.rune"))
         .unwrap_or(false)
+}
+
+fn schema_directive(text: &str) -> Option<SchemaDirective> {
+    for (index, line) in text.lines().enumerate() {
+        let code = code_part(line).trim_start();
+        let leading_whitespace = line.len().saturating_sub(line.trim_start().len());
+        let Some(after_schema) = code.strip_prefix("@schema") else {
+            continue;
+        };
+
+        let after_schema = after_schema.trim_start();
+        let quote_offset = code.find('"')?;
+        let Some(reference) = parse_quoted_string(after_schema) else {
+            continue;
+        };
+
+        return Some(SchemaDirective {
+            reference,
+            line: index + 1,
+            column: leading_whitespace + quote_offset + 1,
+        });
+    }
+
+    None
+}
+
+fn parse_quoted_string(input: &str) -> Option<String> {
+    let rest = input.strip_prefix('"')?;
+    let mut escaped = false;
+    let mut value = String::new();
+
+    for ch in rest.chars() {
+        if escaped {
+            value.push(ch);
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if ch == '"' {
+            return Some(value);
+        }
+
+        value.push(ch);
+    }
+
+    None
+}
+
+fn schema_candidates(reference: &str, config_dir: &Path) -> Vec<PathBuf> {
+    if is_schema_path_reference(reference) {
+        return vec![expand_schema_path(reference, config_dir)];
+    }
+
+    let file_name = format!("{}.rune", reference);
+    let mut candidates = vec![
+        config_dir.join("schemas").join(&file_name),
+        config_dir.join(".rune").join("schemas").join(&file_name),
+    ];
+
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(
+            PathBuf::from(home)
+                .join(".config")
+                .join("rune")
+                .join("schemas")
+                .join(&file_name),
+        );
+    }
+
+    candidates.push(PathBuf::from("/usr/local/share/rune/schemas").join(&file_name));
+    candidates.push(PathBuf::from("/usr/share/rune/schemas").join(&file_name));
+    candidates
+}
+
+fn is_schema_path_reference(reference: &str) -> bool {
+    reference.starts_with('.')
+        || reference.starts_with('/')
+        || reference.starts_with('~')
+        || reference.contains('/')
+        || reference.contains('\\')
+        || reference.ends_with(".rune")
+}
+
+fn expand_schema_path(reference: &str, config_dir: &Path) -> PathBuf {
+    if let Some(rest) = reference.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+
+    let path = PathBuf::from(reference);
+    if path.is_absolute() {
+        path
+    } else {
+        config_dir.join(path)
+    }
+}
+
+fn schema_reference_diagnostic(directive: &SchemaDirective) -> RuneDiagnostic {
+    RuneDiagnostic::error(format!("Schema '{}' was not found", directive.reference))
+        .with_range(
+            directive.line,
+            directive.column,
+            directive.column + directive.reference.len() + 2,
+        )
+        .with_hint("Check the @schema path or install the named schema")
+        .with_code(701)
 }
 
 fn diagnostic_from_error(error: RuneError) -> RuneDiagnostic {
@@ -865,5 +1036,70 @@ fn line_symbol(
             end: Position::new(line, end),
         },
         children: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_schema_directive() {
+        let directive = schema_directive(
+            r#"
+app:
+  name "RuneApp"
+end
+@schema "stasis"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(directive.reference, "stasis");
+        assert_eq!(directive.line, 5);
+        assert_eq!(directive.column, 9);
+    }
+
+    #[test]
+    fn schema_directive_allows_path_references() {
+        let directive = schema_directive(r#"@schema "./schemas/app.rune""#).unwrap();
+        assert_eq!(directive.reference, "./schemas/app.rune");
+    }
+
+    #[test]
+    fn named_schema_candidates_include_project_and_system_paths() {
+        let config_dir = Path::new("/tmp/rune-project");
+        let candidates = schema_candidates("stasis", config_dir);
+
+        assert!(candidates.contains(&PathBuf::from("/tmp/rune-project/schemas/stasis.rune")));
+        assert!(candidates.contains(&PathBuf::from(
+            "/tmp/rune-project/.rune/schemas/stasis.rune"
+        )));
+        assert!(candidates.contains(&PathBuf::from("/usr/local/share/rune/schemas/stasis.rune")));
+        assert!(candidates.contains(&PathBuf::from("/usr/share/rune/schemas/stasis.rune")));
+    }
+
+    #[test]
+    fn path_schema_candidate_resolves_relative_to_config_dir() {
+        let config_dir = Path::new("/tmp/rune-project/config");
+        let candidates = schema_candidates("../schemas/app.rune", config_dir);
+
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from(
+                "/tmp/rune-project/config/../schemas/app.rune"
+            )]
+        );
+    }
+
+    #[test]
+    fn rune_file_name_is_treated_as_path_reference() {
+        let config_dir = Path::new("/tmp/rune-project");
+        let candidates = schema_candidates("stasis.rune", config_dir);
+
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from("/tmp/rune-project/stasis.rune")]
+        );
     }
 }
