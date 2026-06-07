@@ -460,6 +460,8 @@ Current capabilities:
 - hover text for schema-backed fields
 - document symbols for object blocks and keys
 - a quickfix code action for missing `end` diagnostics
+- quickfix code actions for invalid enum values and missing required fields
+- schema field descriptions from leading comments in `schema.rune`
 - optional `@schema` references for app-provided schemas
 - automatic `schema.rune` discovery from the config file directory upward to the workspace root
 
@@ -492,6 +494,24 @@ For example:
 ```rune
 @schema "stasis"
 ```
+
+Schema comments immediately before fields become editor hover/completion documentation:
+
+```rune
+schema app:
+  # Deployment environment for this application.
+  environment enum ["dev", "staging", "production"] required
+
+  # Server listener settings.
+  server:
+    # Public host name or IP address.
+    host string required
+    port int range 1..65535 default 8080
+  end
+end
+```
+
+Completion uses the active schema to suggest only fields that belong in the current object, filters fields already present in that object, and uses snippets for common value shapes such as booleans, arrays, enums, and object blocks.
 
 Run the server directly with:
 

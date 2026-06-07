@@ -20,6 +20,7 @@ pub struct SchemaBlock {
 pub struct SchemaField {
     pub name: String,
     pub kind: SchemaType,
+    pub description: Option<String>,
     pub required: bool,
     pub default: Option<Value>,
     pub range: Option<(f64, f64)>,
@@ -57,7 +58,7 @@ impl SchemaDocument {
         let lines: Vec<(usize, String)> = content
             .lines()
             .enumerate()
-            .map(|(idx, line)| (idx + 1, strip_comment(line).trim().to_string()))
+            .map(|(idx, line)| (idx + 1, line.trim().to_string()))
             .collect();
 
         let mut blocks = Vec::new();
@@ -65,6 +66,7 @@ impl SchemaDocument {
 
         while index < lines.len() {
             let (line_no, line) = &lines[index];
+            let line = strip_comment(line).trim();
             if line.is_empty() {
                 index += 1;
                 continue;
@@ -112,9 +114,17 @@ fn parse_fields_until_end(
     index: &mut usize,
 ) -> Result<Vec<SchemaField>, RuneError> {
     let mut fields = Vec::new();
+    let mut pending_description = Vec::new();
 
     while *index < lines.len() {
-        let (line_no, line) = &lines[*index];
+        let (line_no, raw_line) = &lines[*index];
+        let line = strip_comment(raw_line).trim();
+        if let Some(comment) = schema_comment(raw_line) {
+            pending_description.push(comment.to_string());
+            *index += 1;
+            continue;
+        }
+
         if line.is_empty() {
             *index += 1;
             continue;
@@ -139,6 +149,7 @@ fn parse_fields_until_end(
             fields.push(SchemaField {
                 name: name.to_string(),
                 kind: SchemaType::Object,
+                description: take_description(&mut pending_description),
                 required: false,
                 default: None,
                 range: None,
@@ -148,7 +159,9 @@ fn parse_fields_until_end(
             continue;
         }
 
-        fields.push(parse_field(line, *line_no)?);
+        let mut field = parse_field(line, *line_no)?;
+        field.description = take_description(&mut pending_description);
+        fields.push(field);
         *index += 1;
     }
 
@@ -176,6 +189,7 @@ fn parse_field(line: &str, line_no: usize) -> Result<SchemaField, RuneError> {
     Ok(SchemaField {
         name: name.to_string(),
         kind,
+        description: None,
         required,
         default,
         range,
@@ -384,6 +398,20 @@ fn strip_comment(line: &str) -> &str {
         .unwrap_or(line)
 }
 
+fn schema_comment(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let comment = trimmed.strip_prefix('#')?.trim();
+    (!comment.is_empty()).then_some(comment)
+}
+
+fn take_description(lines: &mut Vec<String>) -> Option<String> {
+    if lines.is_empty() {
+        None
+    } else {
+        Some(std::mem::take(lines).join("\n"))
+    }
+}
+
 fn schema_error(message: impl Into<String>, line: usize, hint: impl Into<String>) -> RuneError {
     RuneError::SyntaxError {
         message: message.into(),
@@ -438,5 +466,37 @@ end
         assert_eq!(schema.blocks[0].root, "app");
         assert_eq!(schema.blocks[0].fields.len(), 5);
         assert_eq!(schema.blocks[0].fields[3].kind, SchemaType::Object);
+    }
+
+    #[test]
+    fn leading_comments_become_field_descriptions() {
+        let schema = SchemaDocument::from_str(
+            r#"
+schema app:
+  # Environment shown in editor hover.
+  # Usually production for deployed apps.
+  environment enum ["dev", "production"] required
+  # Server settings.
+  server:
+    # Public hostname.
+    host string required
+  end
+end
+"#,
+        )
+        .expect("schema should parse");
+
+        let environment = &schema.blocks[0].fields[0];
+        assert_eq!(
+            environment.description.as_deref(),
+            Some("Environment shown in editor hover.\nUsually production for deployed apps.")
+        );
+
+        let server = &schema.blocks[0].fields[1];
+        assert_eq!(server.description.as_deref(), Some("Server settings."));
+        assert_eq!(
+            server.fields[0].description.as_deref(),
+            Some("Public hostname.")
+        );
     }
 }

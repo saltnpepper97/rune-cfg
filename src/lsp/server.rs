@@ -87,7 +87,12 @@ impl RuneLanguageServer {
     async fn config_diagnostics(&self, uri: &Url, text: &str) -> Vec<RuneDiagnostic> {
         let config = match RuneConfig::from_str(text) {
             Ok(config) => config,
-            Err(error) => return vec![diagnostic_from_error(error)],
+            Err(error) => {
+                let mut diagnostics = vec![diagnostic_from_error(error)];
+                diagnostics.extend(recovery_diagnostics(text));
+                dedupe_diagnostics(&mut diagnostics);
+                return diagnostics;
+            }
         };
 
         let schema_text = match self.schema_text_for_document(uri, text).await {
@@ -317,34 +322,125 @@ impl LanguageServer for RuneLanguageServer {
     async fn code_action(&self, params: CodeActionParams) -> LspResult<Option<CodeActionResponse>> {
         let uri = params.text_document.uri;
         let mut actions = Vec::new();
+        let text = self.document_text_for(&uri).await.unwrap_or_default();
+        let schema = self.schema_for(&uri).await;
 
         for diagnostic in params.context.diagnostics {
             if diagnostic.message.contains("Unclosed object block") {
-                let edit = TextEdit {
-                    range: Range {
-                        start: diagnostic.range.start,
-                        end: diagnostic.range.start,
+                actions.push(text_edit_action(
+                    uri.clone(),
+                    "Insert missing end",
+                    TextEdit {
+                        range: Range {
+                            start: diagnostic.range.start,
+                            end: diagnostic.range.start,
+                        },
+                        new_text: "end\n".into(),
                     },
-                    new_text: "end\n".into(),
+                    diagnostic,
+                    true,
+                ));
+                continue;
+            }
+
+            if let Some((path, values)) = enum_values_from_message(&diagnostic.message) {
+                if let Some(range) = value_range_for_path(&text, &path) {
+                    for (index, value) in values.iter().enumerate() {
+                        actions.push(text_edit_action(
+                            uri.clone(),
+                            format!("Replace with \"{}\"", value),
+                            TextEdit {
+                                range,
+                                new_text: format!("\"{}\"", value),
+                            },
+                            diagnostic.clone(),
+                            index == 0,
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            if let (Some(schema), Some((parent_path, field_name))) = (
+                schema.as_ref(),
+                missing_required_field_from_message(&diagnostic.message),
+            ) {
+                let mut path = split_path(&parent_path);
+                path.push(field_name.clone());
+                if let (Some(field), Some(insert)) = (
+                    find_field_by_path(schema, &path),
+                    insert_position_for_object(&text, &split_path(&parent_path)),
+                ) {
+                    actions.push(text_edit_action(
+                        uri.clone(),
+                        format!("Insert missing field '{}'", field_name),
+                        TextEdit {
+                            range: Range {
+                                start: insert.position,
+                                end: insert.position,
+                            },
+                            new_text: format!(
+                                "{}{} {}\n",
+                                insert.indent,
+                                field_name,
+                                sample_value_for_field(field)
+                            ),
+                        },
+                        diagnostic,
+                        true,
+                    ));
+                }
+                continue;
+            }
+
+            if let Some(reference) = missing_schema_from_message(&diagnostic.message) {
+                let path = if is_schema_path_reference(&reference) {
+                    expand_schema_path(
+                        &reference,
+                        uri.to_file_path()
+                            .ok()
+                            .as_deref()
+                            .and_then(Path::parent)
+                            .unwrap_or_else(|| Path::new(".")),
+                    )
+                } else {
+                    uri.to_file_path()
+                        .ok()
+                        .as_deref()
+                        .and_then(Path::parent)
+                        .unwrap_or_else(|| Path::new("."))
+                        .join("schemas")
+                        .join(format!("{}.rune", reference))
                 };
 
-                let mut changes = HashMap::new();
-                changes.insert(uri.clone(), vec![edit]);
+                if let Ok(schema_uri) = Url::from_file_path(path) {
+                    let mut changes = HashMap::new();
+                    changes.insert(
+                        schema_uri,
+                        vec![TextEdit {
+                            range: Range {
+                                start: Position::new(0, 0),
+                                end: Position::new(0, 0),
+                            },
+                            new_text: "schema app:\n  name string required\nend\n".into(),
+                        }],
+                    );
 
-                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                    title: "Insert missing end".into(),
-                    kind: Some(CodeActionKind::QUICKFIX),
-                    diagnostics: Some(vec![diagnostic]),
-                    edit: Some(WorkspaceEdit {
-                        changes: Some(changes),
-                        document_changes: None,
-                        change_annotations: None,
-                    }),
-                    command: None,
-                    is_preferred: Some(true),
-                    disabled: None,
-                    data: None,
-                }));
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: format!("Create schema '{}'", reference),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: Some(vec![diagnostic]),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(changes),
+                            document_changes: None,
+                            change_annotations: None,
+                        }),
+                        command: None,
+                        is_preferred: Some(false),
+                        disabled: None,
+                        data: None,
+                    }));
+                }
             }
         }
 
@@ -509,6 +605,238 @@ fn schema_reference_diagnostic(directive: &SchemaDirective) -> RuneDiagnostic {
         )
         .with_hint("Check the @schema path or install the named schema")
         .with_code(701)
+}
+
+fn recovery_diagnostics(text: &str) -> Vec<RuneDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut stack: Vec<(String, usize, usize)> = Vec::new();
+
+    for (index, line) in text.lines().enumerate() {
+        let line_no = index + 1;
+        let code = code_part(line);
+        let trimmed = code.trim();
+        if trimmed.is_empty() || trimmed.starts_with('@') || trimmed.starts_with("gather ") {
+            continue;
+        }
+
+        if trimmed == "end" || trimmed == "endif" {
+            stack.pop();
+            continue;
+        }
+
+        if let Some(name) = block_name(trimmed) {
+            let column = line.find(&name).unwrap_or(0) + 1;
+            stack.push((name, line_no, column));
+            continue;
+        }
+
+        if let Some(key) = assignment_key(trimmed) {
+            let rest = trimmed.get(key.len()..).unwrap_or_default().trim();
+            if rest.is_empty() {
+                let column = line.find(&key).unwrap_or(0) + 1;
+                diagnostics.push(
+                    RuneDiagnostic::error(format!("Missing value for '{}'", key))
+                        .with_range(line_no, column, column + key.len())
+                        .with_hint("Add a value after the key"),
+                );
+            }
+        }
+    }
+
+    for (name, line_no, column) in stack {
+        diagnostics.push(
+            RuneDiagnostic::error(format!("Unclosed object block '{}'; expected 'end'", name))
+                .with_range(line_no, column, column + name.len())
+                .with_hint(format!("Add 'end' to close the '{}' block", name)),
+        );
+    }
+
+    diagnostics
+}
+
+fn dedupe_diagnostics(diagnostics: &mut Vec<RuneDiagnostic>) {
+    let mut seen = Vec::new();
+    diagnostics.retain(|diagnostic| {
+        let key = diagnostic.message.clone();
+        if seen.contains(&key) {
+            false
+        } else {
+            seen.push(key);
+            true
+        }
+    });
+}
+
+fn text_edit_action(
+    uri: Url,
+    title: impl Into<String>,
+    edit: TextEdit,
+    diagnostic: tower_lsp::lsp_types::Diagnostic,
+    is_preferred: bool,
+) -> CodeActionOrCommand {
+    let mut changes = HashMap::new();
+    changes.insert(uri, vec![edit]);
+
+    CodeActionOrCommand::CodeAction(CodeAction {
+        title: title.into(),
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diagnostic]),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }),
+        command: None,
+        is_preferred: Some(is_preferred),
+        disabled: None,
+        data: None,
+    })
+}
+
+fn enum_values_from_message(message: &str) -> Option<(Vec<String>, Vec<String>)> {
+    let path_start = message.find('\'')? + 1;
+    let path_end = message[path_start..].find('\'')? + path_start;
+    let path = split_path(&message[path_start..path_end]);
+    let values = message
+        .split_once("must be one of:")?
+        .1
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split(',')
+        .map(|value| value.trim().trim_matches('"').to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+
+    (!path.is_empty() && !values.is_empty()).then_some((path, values))
+}
+
+fn missing_required_field_from_message(message: &str) -> Option<(String, String)> {
+    let field_start = message.find('\'')? + 1;
+    let field_end = message[field_start..].find('\'')? + field_start;
+    let after_field = &message[(field_end + 1)..];
+    let parent_marker = "inside '";
+    let parent_start = after_field.find(parent_marker)? + parent_marker.len();
+    let parent_end = after_field[parent_start..].find('\'')? + parent_start;
+
+    Some((
+        after_field[parent_start..parent_end].to_string(),
+        message[field_start..field_end].to_string(),
+    ))
+}
+
+fn missing_schema_from_message(message: &str) -> Option<String> {
+    let rest = message.strip_prefix("Schema '")?;
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+fn split_path(path: &str) -> Vec<String> {
+    path.split('.')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct InsertPosition {
+    position: Position,
+    indent: String,
+}
+
+fn insert_position_for_object(text: &str, path: &[String]) -> Option<InsertPosition> {
+    let mut stack = Vec::<String>::new();
+
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = code_part(line).trim();
+        if trimmed == "end" || trimmed == "endif" {
+            stack.pop();
+            continue;
+        }
+
+        if let Some(name) = block_name(trimmed) {
+            stack.push(name);
+            if stack == path {
+                let indent = line
+                    .chars()
+                    .take_while(|ch| ch.is_whitespace())
+                    .collect::<String>()
+                    + "  ";
+                return Some(InsertPosition {
+                    position: Position::new((index + 1) as u32, 0),
+                    indent,
+                });
+            }
+        }
+    }
+
+    None
+}
+
+fn value_range_for_path(text: &str, path: &[String]) -> Option<Range> {
+    let field = path.last()?;
+
+    for (index, line) in text.lines().enumerate() {
+        let line_path = path_at_position(text, Position::new(index as u32, 0))?;
+        if line_path != path {
+            continue;
+        }
+
+        let key_start = line.find(field)?;
+        let after_key = key_start + field.len();
+        let value_start = line[after_key..]
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+            .map(|(idx, _)| after_key + idx)?;
+        let value_end = line[value_start..]
+            .find('#')
+            .map(|idx| value_start + idx)
+            .unwrap_or(line.len());
+
+        return Some(Range {
+            start: Position::new(index as u32, value_start as u32),
+            end: Position::new(index as u32, value_end as u32),
+        });
+    }
+
+    None
+}
+
+fn sample_value_for_field(field: &SchemaField) -> String {
+    if let Some(default) = &field.default {
+        return value_literal(default);
+    }
+
+    match &field.kind {
+        SchemaType::String => "\"\"".into(),
+        SchemaType::Int | SchemaType::Float | SchemaType::Number => "0".into(),
+        SchemaType::Bool => "false".into(),
+        SchemaType::Regex => "r\"\"".into(),
+        SchemaType::Null => "null".into(),
+        SchemaType::Any => "null".into(),
+        SchemaType::Array(_) => "[]".into(),
+        SchemaType::Enum(values) => values
+            .first()
+            .map(|value| format!("\"{}\"", value))
+            .unwrap_or_else(|| "\"\"".into()),
+        SchemaType::Object => "".into(),
+    }
+}
+
+fn value_literal(value: &crate::Value) -> String {
+    match value {
+        crate::Value::String(value) => format!("\"{}\"", value),
+        crate::Value::Number(value) => value.to_string(),
+        crate::Value::Bool(value) => value.to_string(),
+        crate::Value::Null => "null".into(),
+        crate::Value::Array(_) => "[]".into(),
+        crate::Value::Object(_) => "".into(),
+        crate::Value::Regex(pattern) => format!("r\"{}\"", pattern.as_str()),
+        crate::Value::Reference(reference) => reference.join("."),
+        crate::Value::Interpolated(_) => "\"\"".into(),
+        crate::Value::Conditional(_) => "null".into(),
+    }
 }
 
 fn diagnostic_from_error(error: RuneError) -> RuneDiagnostic {
@@ -725,8 +1053,9 @@ fn config_completion_items(
         }
     }
 
+    let used = used_keys_in_current_object(text, position.line as usize, &stack);
     let mut items = if let Some(schema) = schema {
-        schema_field_completion_items(schema, &stack)
+        schema_field_completion_items(schema, &stack, &used)
     } else {
         Vec::new()
     };
@@ -740,7 +1069,11 @@ fn config_completion_items(
     items
 }
 
-fn schema_field_completion_items(schema: &SchemaDocument, stack: &[String]) -> Vec<CompletionItem> {
+fn schema_field_completion_items(
+    schema: &SchemaDocument,
+    stack: &[String],
+    used: &[String],
+) -> Vec<CompletionItem> {
     if stack.is_empty() {
         return schema
             .blocks
@@ -759,6 +1092,7 @@ fn schema_field_completion_items(schema: &SchemaDocument, stack: &[String]) -> V
     fields_for_stack(schema, stack)
         .unwrap_or(&[])
         .iter()
+        .filter(|field| !used.contains(&field.name))
         .map(field_completion_item)
         .collect()
 }
@@ -781,10 +1115,33 @@ fn field_completion_item(field: &SchemaField) -> CompletionItem {
         insert_text: Some(if is_object {
             format!("{}:\n  $0\nend", field.name)
         } else {
-            format!("{} ", field.name)
+            field_snippet(field)
         }),
-        insert_text_format: is_object.then_some(InsertTextFormat::SNIPPET),
+        insert_text_format: Some(InsertTextFormat::SNIPPET),
         ..CompletionItem::default()
+    }
+}
+
+fn field_snippet(field: &SchemaField) -> String {
+    match &field.kind {
+        SchemaType::String => format!("{} \"$1\"", field.name),
+        SchemaType::Int | SchemaType::Float | SchemaType::Number => format!("{} $1", field.name),
+        SchemaType::Bool => format!("{} ${{1|true,false|}}", field.name),
+        SchemaType::Regex => format!("{} r\"$1\"", field.name),
+        SchemaType::Null => format!("{} null", field.name),
+        SchemaType::Any => format!("{} $1", field.name),
+        SchemaType::Array(_) => format!("{} [$1]", field.name),
+        SchemaType::Enum(values) if values.is_empty() => format!("{} \"$1\"", field.name),
+        SchemaType::Enum(values) => format!(
+            "{} ${{1|{}|}}",
+            field.name,
+            values
+                .iter()
+                .map(|value| format!("\"{}\"", value))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        SchemaType::Object => format!("{}:\n  $0\nend", field.name),
     }
 }
 
@@ -823,6 +1180,11 @@ fn field_hover(path: &[String], field: &SchemaField) -> String {
         path.join("."),
         schema_type_label(&field.kind)
     )];
+
+    if let Some(description) = &field.description {
+        lines.push(String::new());
+        lines.push(description.clone());
+    }
 
     if field.required {
         lines.push("required".into());
@@ -919,6 +1281,41 @@ fn object_stack_before_line(text: &str, line_index: usize) -> Vec<String> {
     }
 
     stack
+}
+
+fn used_keys_in_current_object(
+    text: &str,
+    line_index: usize,
+    target_stack: &[String],
+) -> Vec<String> {
+    let mut stack = Vec::new();
+    let mut used = Vec::new();
+
+    for line in text.lines().take(line_index) {
+        let trimmed = code_part(line).trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed == "end" || trimmed == "endif" {
+            stack.pop();
+            continue;
+        }
+
+        if stack.as_slice() == target_stack {
+            if let Some(key) = assignment_key(trimmed).or_else(|| block_name(trimmed)) {
+                if !used.contains(&key) {
+                    used.push(key);
+                }
+            }
+        }
+
+        if let Some(name) = block_name(trimmed) {
+            stack.push(name);
+        }
+    }
+
+    used
 }
 
 fn line_before_cursor(text: &str, position: Position) -> String {
@@ -1101,5 +1498,68 @@ end
             candidates,
             vec![PathBuf::from("/tmp/rune-project/stasis.rune")]
         );
+    }
+
+    #[test]
+    fn recovery_diagnostics_find_missing_values_and_unclosed_blocks() {
+        let diagnostics = recovery_diagnostics(
+            r#"
+app:
+  name
+  server:
+    host "localhost"
+"#,
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "Missing value for 'name'")
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Unclosed object block 'app'"))
+        );
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Unclosed object block 'server'")
+        }));
+    }
+
+    #[test]
+    fn completion_filters_fields_already_used_in_current_object() {
+        let schema = SchemaDocument::from_str(
+            r#"
+schema app:
+  name string required
+  debug bool
+end
+"#,
+        )
+        .unwrap();
+        let completions = config_completion_items(
+            Some(&schema),
+            "app:\n  name \"RuneApp\"\n  ",
+            Position::new(2, 2),
+        );
+
+        assert!(!completions.iter().any(|item| item.label == "name"));
+        assert!(completions.iter().any(|item| item.label == "debug"));
+    }
+
+    #[test]
+    fn enum_and_missing_required_messages_are_parsed_for_actions() {
+        let (path, values) =
+            enum_values_from_message("'app.environment' must be one of: dev, staging, production")
+                .unwrap();
+        assert_eq!(path, vec!["app", "environment"]);
+        assert_eq!(values, vec!["dev", "staging", "production"]);
+
+        let missing =
+            missing_required_field_from_message("Missing required field 'version' inside 'app'")
+                .unwrap();
+        assert_eq!(missing, ("app".into(), "version".into()));
     }
 }
