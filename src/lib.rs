@@ -148,13 +148,17 @@
 
 pub mod ast;
 pub mod config;
+pub mod diagnostic;
 pub mod error;
 pub mod export;
 pub mod lexer;
 pub mod parser;
 pub mod resolver;
+pub mod schema;
 pub mod utils;
 
 pub use ast::{Document, Value};
 pub use config::RuneConfig;
+pub use diagnostic::{DiagnosticSeverity, RuneDiagnostic, SourcePosition, SourceRange};
 pub use error::RuneError;
+pub use schema::{SchemaBlock, SchemaDocument, SchemaField, SchemaType};

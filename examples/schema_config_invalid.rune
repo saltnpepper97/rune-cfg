@@ -1,0 +1,11 @@
+app:
+  name "RuneApp"
+  environment "prod"
+
+  server:
+    host "localhost"
+    port "8080"
+  end
+
+  plugins ["auth", 42]
+end

@@ -1,0 +1,13 @@
+app:
+  name "RuneApp"
+  version "1.0.0"
+  debug true
+  environment "production"
+
+  server:
+    host "localhost"
+    port 8080
+  end
+
+  plugins ["auth", "logger"]
+end

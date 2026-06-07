@@ -23,6 +23,7 @@ RUNE is a configuration language designed to combine **readability, simplicity, 
 - **System integration** - Access environment variables with `$env` and system info with `$sys`
 - **Flexible keys** - Automatic `snake_case` and `kebab-case` handling
 - **Import system** - Modular configs with `gather "file.rune" as alias`
+- **Schemas** - Validate configs with required fields, types, enums, ranges, and arrays
 - **Type safety** - Strong typing with comprehensive error messages
 
 ## Installation
@@ -31,7 +32,7 @@ Add `rune-cfg` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rune-cfg = "0.4.4"
+rune-cfg = "0.4.6"
 ```
 
 ## Quick Example
@@ -273,6 +274,63 @@ server:
 end
 ```
 
+### Schemas
+
+Schemas describe the expected shape of a RUNE config. They are parsed separately from runtime config files and return structured diagnostics that can be shown in CLIs, tests, or a future language server.
+
+```rune
+schema app:
+  name string required
+  version string required
+  debug bool default false
+  environment enum ["dev", "staging", "production"] required
+
+  server:
+    host string required
+    port int range 1..65535 default 8080
+  end
+
+  plugins [string]
+end
+```
+
+Supported schema types:
+- `string`
+- `int`
+- `float`
+- `number`
+- `bool`
+- `regex`
+- `null`
+- `any`
+- `enum ["a", "b"]`
+- `[type]` arrays, such as `[string]`
+- nested object blocks
+
+Supported constraints:
+- `required` requires a config path to exist
+- `default <value>` documents the fallback value expected by callers
+- `range min..max` validates numeric values
+- `enum [...]` validates string values against an allowed set
+
+Example invalid config:
+
+```rune
+app:
+  name "RuneApp"
+  environment "prod"
+
+  server:
+    host "localhost"
+    port "8080"
+  end
+
+  plugins ["auth", 42]
+end
+```
+
+The schema validator reports diagnostics for the missing `app.version`, invalid enum value, wrong `app.server.port` type, and wrong `app.plugins[1]` array item type.
+
 ## Real-World Example
 
 Here's a configuration from [Stasis](https://github.com/your-username/stasis), a Wayland idle manager:
@@ -359,6 +417,24 @@ if patterns.matches(app_id) {
     println!("{} matches!", app_id);
 }
 ```
+
+### Schema Validation
+
+```rust
+use rune_cfg::{RuneConfig, SchemaDocument};
+
+let config = RuneConfig::from_file("examples/schema_config_invalid.rune")?;
+let schema = SchemaDocument::from_file("examples/schema.rune")?;
+
+for diagnostic in config.validate_schema(&schema) {
+    println!("{}", diagnostic.message);
+    if let Some(hint) = diagnostic.hint {
+        println!("Hint: {}", hint);
+    }
+}
+```
+
+`validate_schema` returns `Vec<RuneDiagnostic>` instead of failing fast. This is intentional: callers can show every schema issue at once, and the same diagnostic shape can be reused by an LSP implementation.
 
 ### Export to JSON
 

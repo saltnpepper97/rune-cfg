@@ -5,6 +5,7 @@
 use super::*;
 use std::collections::HashMap;
 
+use crate::SchemaDocument;
 use crate::ast::ObjectItem;
 
 #[test]
@@ -644,4 +645,131 @@ end
     // debug isn't set, so Condition::Exists("debug") is false → else branch → flag false
     let flag: bool = config.get("app.flag").expect("Failed to get app.flag");
     assert_eq!(flag, false);
+}
+
+#[test]
+fn test_schema_validation_success() {
+    let schema = SchemaDocument::from_str(
+        r#"
+schema app:
+  name string required
+  version string required
+  debug bool default false
+  environment enum ["dev", "staging", "production"] required
+  server:
+    host string required
+    port int range 1..65535 default 8080
+  end
+  plugins [string]
+end
+"#,
+    )
+    .expect("schema should parse");
+
+    let config = RuneConfig::from_str(
+        r#"
+app:
+  name "RuneApp"
+  version "1.0.0"
+  debug true
+  environment "production"
+  server:
+    host "localhost"
+    port 8080
+  end
+  plugins ["auth", "logger"]
+end
+"#,
+    )
+    .expect("config should parse");
+
+    let diagnostics = config.validate_schema(&schema);
+    assert_eq!(diagnostics, vec![]);
+}
+
+#[test]
+fn test_schema_validation_reports_errors() {
+    let schema = SchemaDocument::from_str(
+        r#"
+schema app:
+  name string required
+  version string required
+  environment enum ["dev", "staging", "production"] required
+  server:
+    host string required
+    port int range 1..65535 default 8080
+  end
+  plugins [string]
+end
+"#,
+    )
+    .expect("schema should parse");
+
+    let config = RuneConfig::from_str(
+        r#"
+app:
+  name "RuneApp"
+  environment "prod"
+  server:
+    host "localhost"
+    port "8080"
+  end
+  plugins ["auth", 42]
+end
+"#,
+    )
+    .expect("config should parse");
+
+    let diagnostics = config.validate_schema(&schema);
+    let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("app.version") && message.contains("missing"))
+    );
+    assert!(
+        messages.iter().any(
+            |message| message.contains("app.environment") && message.contains("must be one of")
+        )
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("app.server.port") && message.contains("expected int"))
+    );
+    assert!(
+        messages.iter().any(
+            |message| message.contains("app.plugins[1]") && message.contains("expected string")
+        )
+    );
+}
+
+#[test]
+fn test_schema_validation_reports_range_error() {
+    let schema = SchemaDocument::from_str(
+        r#"
+schema app:
+  server:
+    port int range 1..65535 required
+  end
+end
+"#,
+    )
+    .expect("schema should parse");
+
+    let config = RuneConfig::from_str(
+        r#"
+app:
+  server:
+    port 70000
+  end
+end
+"#,
+    )
+    .expect("config should parse");
+
+    let diagnostics = config.validate_schema(&schema);
+    assert_eq!(diagnostics.len(), 1);
+    assert!(diagnostics[0].message.contains("between 1 and 65535"));
 }

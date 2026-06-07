@@ -1,0 +1,13 @@
+schema app:
+  name string required
+  version string required
+  debug bool default false
+  environment enum ["dev", "staging", "production"] required
+
+  server:
+    host string required
+    port int range 1..65535 default 8080
+  end
+
+  plugins [string]
+end
