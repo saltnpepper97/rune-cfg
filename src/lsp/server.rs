@@ -7,14 +7,19 @@ use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::{
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    InitializeParams, InitializeResult, InitializedParams, MessageType, Position, Range,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
+    CodeActionProviderCapability, CodeActionResponse, CompletionItem, CompletionItemKind,
+    CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbol, DocumentSymbolParams,
+    DocumentSymbolResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, InsertTextFormat, MarkedString,
+    MessageType, OneOf, Position, Range, ServerCapabilities, SymbolKind,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url, WorkspaceEdit,
 };
 use tower_lsp::{Client, LanguageServer};
 
 use crate::diagnostic::{DiagnosticSeverity, RuneDiagnostic};
-use crate::{RuneConfig, RuneError, SchemaDocument};
+use crate::{RuneConfig, RuneError, SchemaDocument, SchemaField, SchemaType};
 
 #[derive(Debug, Clone)]
 struct OpenDocument {
@@ -101,6 +106,20 @@ impl RuneLanguageServer {
         std::fs::read_to_string(path).ok()
     }
 
+    async fn schema_for(&self, uri: &Url) -> Option<SchemaDocument> {
+        let schema_text = self.schema_text_for(uri).await?;
+        SchemaDocument::from_str(&schema_text).ok()
+    }
+
+    async fn document_text_for(&self, uri: &Url) -> Option<String> {
+        if let Some(document) = self.documents.read().await.get(uri) {
+            return Some(document.text.clone());
+        }
+
+        let path = uri.to_file_path().ok()?;
+        std::fs::read_to_string(path).ok()
+    }
+
     async fn schema_uri_for(&self, uri: &Url) -> Option<Url> {
         let path = uri.to_file_path().ok()?;
         let mut directory = path.parent()?.to_path_buf();
@@ -152,6 +171,14 @@ impl LanguageServer for RuneLanguageServer {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                completion_provider: Some(CompletionOptions {
+                    resolve_provider: Some(false),
+                    trigger_characters: Some(vec!["$".into(), ".".into(), "\"".into()]),
+                    ..CompletionOptions::default()
+                }),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                document_symbol_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(tower_lsp::lsp_types::ServerInfo {
@@ -169,6 +196,100 @@ impl LanguageServer for RuneLanguageServer {
 
     async fn shutdown(&self) -> LspResult<()> {
         Ok(())
+    }
+
+    async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let Some(text) = self.document_text_for(&uri).await else {
+            return Ok(None);
+        };
+
+        let items = if is_schema_file(&uri) {
+            schema_completion_items()
+        } else {
+            let schema = self.schema_for(&uri).await;
+            config_completion_items(schema.as_ref(), &text, position)
+        };
+
+        Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        if is_schema_file(&uri) {
+            return Ok(None);
+        }
+
+        let position = params.text_document_position_params.position;
+        let Some(text) = self.document_text_for(&uri).await else {
+            return Ok(None);
+        };
+        let Some(schema) = self.schema_for(&uri).await else {
+            return Ok(None);
+        };
+        let Some(path) = path_at_position(&text, position) else {
+            return Ok(None);
+        };
+        let Some(field) = find_field_by_path(&schema, &path) else {
+            return Ok(None);
+        };
+
+        Ok(Some(Hover {
+            contents: HoverContents::Scalar(MarkedString::String(field_hover(&path, field))),
+            range: None,
+        }))
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> LspResult<Option<DocumentSymbolResponse>> {
+        let uri = params.text_document.uri;
+        let Some(text) = self.document_text_for(&uri).await else {
+            return Ok(None);
+        };
+
+        Ok(Some(DocumentSymbolResponse::Nested(document_symbols(
+            &text,
+        ))))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> LspResult<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let mut actions = Vec::new();
+
+        for diagnostic in params.context.diagnostics {
+            if diagnostic.message.contains("Unclosed object block") {
+                let edit = TextEdit {
+                    range: Range {
+                        start: diagnostic.range.start,
+                        end: diagnostic.range.start,
+                    },
+                    new_text: "end\n".into(),
+                };
+
+                let mut changes = HashMap::new();
+                changes.insert(uri.clone(), vec![edit]);
+
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: "Insert missing end".into(),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![diagnostic]),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
+                        document_changes: None,
+                        change_annotations: None,
+                    }),
+                    command: None,
+                    is_preferred: Some(true),
+                    disabled: None,
+                    data: None,
+                }));
+            }
+        }
+
+        Ok(Some(actions))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -378,4 +499,371 @@ fn lsp_position(line: usize, column: usize) -> Position {
         line.saturating_sub(1) as u32,
         column.saturating_sub(1) as u32,
     )
+}
+
+fn schema_completion_items() -> Vec<CompletionItem> {
+    [
+        ("schema", CompletionItemKind::KEYWORD),
+        ("string", CompletionItemKind::TYPE_PARAMETER),
+        ("int", CompletionItemKind::TYPE_PARAMETER),
+        ("float", CompletionItemKind::TYPE_PARAMETER),
+        ("number", CompletionItemKind::TYPE_PARAMETER),
+        ("bool", CompletionItemKind::TYPE_PARAMETER),
+        ("regex", CompletionItemKind::TYPE_PARAMETER),
+        ("any", CompletionItemKind::TYPE_PARAMETER),
+        ("object", CompletionItemKind::TYPE_PARAMETER),
+        ("required", CompletionItemKind::KEYWORD),
+        ("default", CompletionItemKind::KEYWORD),
+        ("range", CompletionItemKind::KEYWORD),
+        ("end", CompletionItemKind::KEYWORD),
+    ]
+    .into_iter()
+    .map(|(label, kind)| keyword_completion(label, kind))
+    .collect()
+}
+
+fn config_completion_items(
+    schema: Option<&SchemaDocument>,
+    text: &str,
+    position: Position,
+) -> Vec<CompletionItem> {
+    let before_cursor = line_before_cursor(text, position);
+    if before_cursor.contains('$') {
+        return dollar_reference_completion_items();
+    }
+
+    let stack = object_stack_before_line(text, position.line as usize);
+
+    if let (Some(schema), Some(key)) = (schema, current_key_before_cursor(&before_cursor)) {
+        let mut path = stack.clone();
+        path.push(key);
+
+        if let Some(field) = find_field_by_path(schema, &path) {
+            if let SchemaType::Enum(values) = &field.kind {
+                return values
+                    .iter()
+                    .map(|value| CompletionItem {
+                        label: format!("\"{}\"", value),
+                        kind: Some(CompletionItemKind::ENUM_MEMBER),
+                        detail: Some("enum value".into()),
+                        insert_text: Some(format!("\"{}\"", value)),
+                        ..CompletionItem::default()
+                    })
+                    .collect();
+            }
+        }
+    }
+
+    let mut items = if let Some(schema) = schema {
+        schema_field_completion_items(schema, &stack)
+    } else {
+        Vec::new()
+    };
+
+    items.extend(
+        ["end", "if", "else", "endif", "gather"]
+            .into_iter()
+            .map(|label| keyword_completion(label, CompletionItemKind::KEYWORD)),
+    );
+
+    items
+}
+
+fn schema_field_completion_items(schema: &SchemaDocument, stack: &[String]) -> Vec<CompletionItem> {
+    if stack.is_empty() {
+        return schema
+            .blocks
+            .iter()
+            .map(|block| CompletionItem {
+                label: block.root.clone(),
+                kind: Some(CompletionItemKind::STRUCT),
+                detail: Some("schema root".into()),
+                insert_text: Some(format!("{}:\n  $0\nend", block.root)),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                ..CompletionItem::default()
+            })
+            .collect();
+    }
+
+    fields_for_stack(schema, stack)
+        .unwrap_or(&[])
+        .iter()
+        .map(field_completion_item)
+        .collect()
+}
+
+fn field_completion_item(field: &SchemaField) -> CompletionItem {
+    let is_object = matches!(field.kind, SchemaType::Object) || !field.fields.is_empty();
+
+    CompletionItem {
+        label: field.name.clone(),
+        kind: Some(if is_object {
+            CompletionItemKind::STRUCT
+        } else {
+            CompletionItemKind::FIELD
+        }),
+        detail: Some(schema_type_label(&field.kind)),
+        documentation: Some(tower_lsp::lsp_types::Documentation::String(field_hover(
+            &[field.name.clone()],
+            field,
+        ))),
+        insert_text: Some(if is_object {
+            format!("{}:\n  $0\nend", field.name)
+        } else {
+            format!("{} ", field.name)
+        }),
+        insert_text_format: is_object.then_some(InsertTextFormat::SNIPPET),
+        ..CompletionItem::default()
+    }
+}
+
+fn keyword_completion(label: &str, kind: CompletionItemKind) -> CompletionItem {
+    CompletionItem {
+        label: label.into(),
+        kind: Some(kind),
+        ..CompletionItem::default()
+    }
+}
+
+fn dollar_reference_completion_items() -> Vec<CompletionItem> {
+    [
+        "$env.",
+        "$sys.hostname",
+        "$sys.os",
+        "$sys.arch",
+        "$sys.cpu_count",
+        "$sys.memory_total",
+        "$runtime.",
+        "$var.",
+    ]
+    .into_iter()
+    .map(|label| CompletionItem {
+        label: label.into(),
+        kind: Some(CompletionItemKind::VARIABLE),
+        detail: Some("RUNE reference".into()),
+        ..CompletionItem::default()
+    })
+    .collect()
+}
+
+fn field_hover(path: &[String], field: &SchemaField) -> String {
+    let mut lines = vec![format!(
+        "{}: {}",
+        path.join("."),
+        schema_type_label(&field.kind)
+    )];
+
+    if field.required {
+        lines.push("required".into());
+    }
+    if let Some((min, max)) = field.range {
+        lines.push(format!("range: {}..{}", min, max));
+    }
+    if let Some(default) = &field.default {
+        lines.push(format!("default: {:?}", default));
+    }
+    if let SchemaType::Enum(values) = &field.kind {
+        lines.push(format!("values: {}", values.join(", ")));
+    }
+
+    lines.join("\n")
+}
+
+fn schema_type_label(kind: &SchemaType) -> String {
+    match kind {
+        SchemaType::String => "string".into(),
+        SchemaType::Int => "int".into(),
+        SchemaType::Float => "float".into(),
+        SchemaType::Number => "number".into(),
+        SchemaType::Bool => "bool".into(),
+        SchemaType::Regex => "regex".into(),
+        SchemaType::Null => "null".into(),
+        SchemaType::Any => "any".into(),
+        SchemaType::Array(inner) => format!("[{}]", schema_type_label(inner)),
+        SchemaType::Enum(values) => format!("enum [{}]", values.join(", ")),
+        SchemaType::Object => "object".into(),
+    }
+}
+
+fn find_field_by_path<'a>(schema: &'a SchemaDocument, path: &[String]) -> Option<&'a SchemaField> {
+    let (root, rest) = path.split_first()?;
+    let block = schema.blocks.iter().find(|block| block.root == *root)?;
+    find_nested_field(&block.fields, rest)
+}
+
+fn find_nested_field<'a>(fields: &'a [SchemaField], path: &[String]) -> Option<&'a SchemaField> {
+    let (name, rest) = path.split_first()?;
+    let field = fields.iter().find(|field| field.name == *name)?;
+
+    if rest.is_empty() {
+        Some(field)
+    } else {
+        find_nested_field(&field.fields, rest)
+    }
+}
+
+fn fields_for_stack<'a>(schema: &'a SchemaDocument, stack: &[String]) -> Option<&'a [SchemaField]> {
+    let (root, rest) = stack.split_first()?;
+    let block = schema.blocks.iter().find(|block| block.root == *root)?;
+
+    let mut fields = block.fields.as_slice();
+    for segment in rest {
+        let field = fields.iter().find(|field| field.name == *segment)?;
+        fields = field.fields.as_slice();
+    }
+
+    Some(fields)
+}
+
+fn path_at_position(text: &str, position: Position) -> Option<Vec<String>> {
+    let line = text.lines().nth(position.line as usize)?;
+    let trimmed = code_part(line).trim();
+    if trimmed.is_empty() || trimmed == "end" || trimmed == "endif" {
+        return None;
+    }
+
+    let mut path = object_stack_before_line(text, position.line as usize);
+    let key = block_name(trimmed).or_else(|| assignment_key(trimmed))?;
+    path.push(key);
+    Some(path)
+}
+
+fn object_stack_before_line(text: &str, line_index: usize) -> Vec<String> {
+    let mut stack = Vec::new();
+
+    for line in text.lines().take(line_index) {
+        let trimmed = code_part(line).trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed == "end" || trimmed == "endif" {
+            stack.pop();
+            continue;
+        }
+
+        if let Some(name) = block_name(trimmed) {
+            stack.push(name);
+        }
+    }
+
+    stack
+}
+
+fn line_before_cursor(text: &str, position: Position) -> String {
+    text.lines()
+        .nth(position.line as usize)
+        .map(|line| line.chars().take(position.character as usize).collect())
+        .unwrap_or_default()
+}
+
+fn current_key_before_cursor(before_cursor: &str) -> Option<String> {
+    let trimmed = code_part(before_cursor).trim_start();
+    let key = assignment_key(trimmed)?;
+
+    let after_key = trimmed.get(key.len()..)?.trim_start();
+    (!after_key.is_empty()).then_some(key)
+}
+
+fn block_name(trimmed: &str) -> Option<String> {
+    let name = trimmed.strip_suffix(':')?.trim();
+    if name.starts_with("schema ") || !is_identifier(name) {
+        return None;
+    }
+
+    Some(name.into())
+}
+
+fn assignment_key(trimmed: &str) -> Option<String> {
+    let key = trimmed.split_whitespace().next()?;
+    if is_identifier(key) {
+        Some(key.into())
+    } else {
+        None
+    }
+}
+
+fn is_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+fn code_part(line: &str) -> &str {
+    line.split_once('#').map(|(code, _)| code).unwrap_or(line)
+}
+
+fn document_symbols(text: &str) -> Vec<DocumentSymbol> {
+    let mut stack: Vec<String> = Vec::new();
+    let mut symbols = Vec::new();
+
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = code_part(line).trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed == "end" || trimmed == "endif" {
+            stack.pop();
+            continue;
+        }
+
+        if let Some(name) = block_name(trimmed) {
+            let mut path = stack.clone();
+            path.push(name.clone());
+            symbols.push(line_symbol(
+                path.join("."),
+                SymbolKind::OBJECT,
+                index,
+                line,
+                &name,
+            ));
+            stack.push(name);
+            continue;
+        }
+
+        if let Some(key) = assignment_key(trimmed) {
+            let mut path = stack.clone();
+            path.push(key.clone());
+            symbols.push(line_symbol(
+                path.join("."),
+                SymbolKind::FIELD,
+                index,
+                line,
+                &key,
+            ));
+        }
+    }
+
+    symbols
+}
+
+fn line_symbol(
+    name: String,
+    kind: SymbolKind,
+    index: usize,
+    line: &str,
+    selection: &str,
+) -> DocumentSymbol {
+    let start = line.find(selection).unwrap_or(0) as u32;
+    let end = start + selection.len() as u32;
+    let line = index as u32;
+
+    #[allow(deprecated)]
+    DocumentSymbol {
+        name,
+        detail: None,
+        kind,
+        tags: None,
+        deprecated: None,
+        range: Range {
+            start: Position::new(line, 0),
+            end: Position::new(line, end),
+        },
+        selection_range: Range {
+            start: Position::new(line, start),
+            end: Position::new(line, end),
+        },
+        children: None,
+    }
 }

@@ -456,6 +456,10 @@ Current capabilities:
 - syntax diagnostics for opened `.rune` files
 - schema parsing diagnostics for `schema.rune`
 - schema validation diagnostics for config files
+- schema-aware key and enum-value completion
+- hover text for schema-backed fields
+- document symbols for object blocks and keys
+- a quickfix code action for missing `end` diagnostics
 - automatic `schema.rune` discovery from the config file directory upward to the workspace root
 
 Run the server directly with:
