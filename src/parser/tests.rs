@@ -335,3 +335,53 @@ end
         panic!("Expected 'app' to be an Object");
     }
 }
+
+#[test]
+fn test_unclosed_top_level_object_reports_eof() {
+    let input = r#"
+app:
+  name "RuneApp"
+"#;
+
+    let mut parser = Parser::new(input).expect("Failed to create parser");
+    let error = parser
+        .parse_document()
+        .expect_err("missing end should fail");
+
+    match error {
+        RuneError::UnexpectedEof { message, hint, .. } => {
+            assert!(message.contains("Unclosed object block 'app'"));
+            assert_eq!(
+                hint.as_deref(),
+                Some("Add another 'end' to close the 'app' block")
+            );
+        }
+        other => panic!("Expected UnexpectedEof, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_unclosed_nested_object_reports_eof() {
+    let input = r#"
+app:
+  server:
+    host "localhost"
+  end
+"#;
+
+    let mut parser = Parser::new(input).expect("Failed to create parser");
+    let error = parser
+        .parse_document()
+        .expect_err("missing outer end should fail");
+
+    match error {
+        RuneError::UnexpectedEof { message, hint, .. } => {
+            assert!(message.contains("Unclosed object block 'app'"));
+            assert_eq!(
+                hint.as_deref(),
+                Some("Add another 'end' to close the 'app' block")
+            );
+        }
+        other => panic!("Expected UnexpectedEof, got {:?}", other),
+    }
+}

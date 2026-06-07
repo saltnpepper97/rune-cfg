@@ -23,6 +23,7 @@ pub(super) fn parse_assignment(parser: &mut Parser) -> Result<(String, Value), R
         Some(Token::Colon) => {
             parser.bump()?;
             let mut items: Vec<ObjectItem> = Vec::new();
+            let mut closed = false;
 
             while let Some(tok) = parser.peek() {
                 match tok {
@@ -36,8 +37,10 @@ pub(super) fn parse_assignment(parser: &mut Parser) -> Result<(String, Value), R
                     }
                     Token::End => {
                         parser.bump()?;
+                        closed = true;
                         break;
                     }
+                    Token::Eof => break,
                     Token::Newline => {
                         parser.bump()?;
                     }
@@ -51,6 +54,16 @@ pub(super) fn parse_assignment(parser: &mut Parser) -> Result<(String, Value), R
                         });
                     }
                 }
+            }
+
+            if !closed {
+                return Err(RuneError::UnexpectedEof {
+                    message: format!("Unclosed object block '{}'; expected 'end'", key),
+                    line: parser.line(),
+                    column: parser.column(),
+                    hint: Some(format!("Add another 'end' to close the '{}' block", key)),
+                    code: Some(215),
+                });
             }
 
             return Ok((key, Value::Object(items)));

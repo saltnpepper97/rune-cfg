@@ -102,6 +102,7 @@ fn parse_top_level_item(
         Some(Token::Colon) => {
             parser.bump()?;
             let mut object_items: Vec<crate::ast::ObjectItem> = Vec::new();
+            let mut closed = false;
 
             while let Some(tok) = parser.peek() {
                 match tok {
@@ -115,8 +116,10 @@ fn parse_top_level_item(
                     }
                     Token::End => {
                         parser.bump()?;
+                        closed = true;
                         break;
                     }
+                    Token::Eof => break,
                     Token::Newline => {
                         parser.bump()?;
                     }
@@ -130,6 +133,16 @@ fn parse_top_level_item(
                         });
                     }
                 }
+            }
+
+            if !closed {
+                return Err(RuneError::UnexpectedEof {
+                    message: format!("Unclosed object block '{}'; expected 'end'", key),
+                    line: parser.line(),
+                    column: parser.column(),
+                    hint: Some(format!("Add another 'end' to close the '{}' block", key)),
+                    code: Some(215),
+                });
             }
 
             items.push((key, Value::Object(object_items)));

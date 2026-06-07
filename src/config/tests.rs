@@ -726,7 +726,7 @@ end
     assert!(
         messages
             .iter()
-            .any(|message| message.contains("app.version") && message.contains("missing"))
+            .any(|message| message.contains("version") && message.contains("Missing required"))
     );
     assert!(
         messages.iter().any(
@@ -743,6 +743,71 @@ end
             |message| message.contains("app.plugins[1]") && message.contains("expected string")
         )
     );
+}
+
+#[test]
+fn test_schema_missing_field_points_to_parent_object() {
+    let schema = SchemaDocument::from_str(
+        r#"
+schema app:
+  version string required
+end
+"#,
+    )
+    .expect("schema should parse");
+
+    let config = RuneConfig::from_str(
+        r#"
+app:
+  name "RuneApp"
+end
+"#,
+    )
+    .expect("config should parse");
+
+    let diagnostics = config.validate_schema(&schema);
+    assert_eq!(diagnostics.len(), 1);
+    assert!(
+        diagnostics[0]
+            .message
+            .contains("Missing required field 'version' inside 'app'")
+    );
+    let range = diagnostics[0].range.unwrap();
+    assert_eq!(range.start.line, 2);
+    assert_eq!(range.start.column, 1);
+    assert_eq!(range.end.column, 4);
+}
+
+#[test]
+fn test_schema_type_error_points_to_key_column() {
+    let schema = SchemaDocument::from_str(
+        r#"
+schema app:
+  server:
+    port int required
+  end
+end
+"#,
+    )
+    .expect("schema should parse");
+
+    let config = RuneConfig::from_str(
+        r#"
+app:
+  server:
+    port "8080"
+  end
+end
+"#,
+    )
+    .expect("config should parse");
+
+    let diagnostics = config.validate_schema(&schema);
+    assert_eq!(diagnostics.len(), 1);
+    let range = diagnostics[0].range.unwrap();
+    assert_eq!(range.start.line, 4);
+    assert_eq!(range.start.column, 5);
+    assert_eq!(range.end.column, 9);
 }
 
 #[test]

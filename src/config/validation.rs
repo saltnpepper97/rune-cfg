@@ -236,13 +236,48 @@ fn has_required_descendant(field: &SchemaField) -> bool {
 }
 
 fn missing_diagnostic(path: &str, raw_content: &str) -> RuneDiagnostic {
-    line_diagnostic(
-        path,
-        format!("Required config path '{}' is missing", path),
-        raw_content,
-    )
+    let (line, column, snippet) = nearest_existing_parent_location(path, raw_content);
+    let (parent, field) = path.rsplit_once('.').unwrap_or(("", path));
+
+    let mut diagnostic = RuneDiagnostic::error(if parent.is_empty() {
+        format!("Missing required config path '{}'", path)
+    } else {
+        format!("Missing required field '{}' inside '{}'", field, parent)
+    })
     .with_code(651)
-    .with_hint(format!("Add '{}' to satisfy the schema", path))
+    .with_hint(if parent.is_empty() {
+        format!("Add '{}' to satisfy the schema", path)
+    } else {
+        format!("Add '{}' inside '{}' to satisfy the schema", field, parent)
+    });
+
+    if line > 0 {
+        let parent_key = parent.rsplit('.').next().unwrap_or(parent);
+        diagnostic = diagnostic
+            .with_range(line, column, column + parent_key.len())
+            .with_hint(format!(
+                "Add '{}' near: {}",
+                field,
+                if snippet.is_empty() { parent } else { &snippet }
+            ));
+    }
+
+    diagnostic
+}
+
+fn nearest_existing_parent_location(path: &str, raw_content: &str) -> (usize, usize, String) {
+    let mut parts: Vec<&str> = path.split('.').collect();
+
+    while parts.len() > 1 {
+        parts.pop();
+        let parent = parts.join(".");
+        let (line, column, snippet) = helpers::find_config_location(&parent, raw_content);
+        if line > 0 {
+            return (line, column, snippet);
+        }
+    }
+
+    (0, 0, String::new())
 }
 
 fn type_diagnostic(path: &str, expected: &str, actual: &str, raw_content: &str) -> RuneDiagnostic {
@@ -255,11 +290,12 @@ fn type_diagnostic(path: &str, expected: &str, actual: &str, raw_content: &str) 
 }
 
 fn line_diagnostic(path: &str, message: String, raw_content: &str) -> RuneDiagnostic {
-    let (line, snippet) = helpers::find_config_line(path, raw_content);
+    let (line, column, snippet) = helpers::find_config_location(path, raw_content);
     let diagnostic = RuneDiagnostic::error(message);
     if line > 0 {
+        let key = path.rsplit('.').next().unwrap_or(path);
         diagnostic
-            .with_line(line, 0)
+            .with_range(line, column, column + key.len())
             .with_hint(format!("Check around: {}", snippet))
     } else {
         diagnostic

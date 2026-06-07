@@ -152,6 +152,7 @@ pub mod diagnostic;
 pub mod error;
 pub mod export;
 pub mod lexer;
+pub mod lsp;
 pub mod parser;
 pub mod resolver;
 pub mod schema;

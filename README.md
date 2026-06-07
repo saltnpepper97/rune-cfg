@@ -445,6 +445,78 @@ let json = export_rune_file("config.rune")?;
 println!("{}", json);
 ```
 
+## Language Server
+
+RUNE includes an experimental diagnostics-only language server binary named `rune-lsp`.
+
+Neovim runtime files are included under `editors/nvim/`. These provide highlighting, filetype detection, and 2-space indentation. The language server provides diagnostics. They are separate pieces and can be used together.
+
+Current capabilities:
+- full-document sync
+- syntax diagnostics for opened `.rune` files
+- schema parsing diagnostics for `schema.rune`
+- schema validation diagnostics for config files
+- automatic `schema.rune` discovery from the config file directory upward to the workspace root
+
+Run the server directly with:
+
+```sh
+cargo run --bin rune-lsp
+```
+
+Build a reusable local binary with:
+
+```sh
+cargo build --bin rune-lsp
+```
+
+The binary will be available at:
+
+```text
+target/debug/rune-lsp
+```
+
+Check the installed binary with:
+
+```sh
+target/debug/rune-lsp --version
+target/debug/rune-lsp --help
+```
+
+Example Neovim setup:
+
+Install the optional syntax files:
+
+```sh
+cp -r editors/nvim/ftdetect ~/.config/nvim/
+cp -r editors/nvim/syntax ~/.config/nvim/
+cp -r editors/nvim/ftplugin ~/.config/nvim/
+```
+
+Then configure the LSP in Neovim 0.11+:
+
+```lua
+vim.lsp.config("rune_lsp", {
+  cmd = { "/path/to/rune-cfg/target/debug/rune-lsp" },
+  filetypes = { "rune" },
+  root_markers = { "schema.rune", ".git" },
+})
+
+vim.lsp.enable("rune_lsp")
+```
+
+For one-off testing without a named config:
+
+```lua
+vim.lsp.start({
+  name = "rune_lsp",
+  cmd = { "/path/to/rune-cfg/target/debug/rune-lsp" },
+  root_dir = vim.fs.root(0, { "schema.rune", ".git" }),
+})
+```
+
+Place a `schema.rune` next to your config file or in a parent directory. When the config is opened, `rune-lsp` validates it against that schema and publishes diagnostics to the editor.
+
 ## Error Messages
 
 RUNE provides clear, helpful error messages with line numbers:

@@ -129,6 +129,11 @@ fn extract_quoted_string(input: &str) -> Option<String> {
 }
 
 pub(super) fn find_config_line(key: &str, raw_content: &str) -> (usize, String) {
+    let (line, _, snippet) = find_config_location(key, raw_content);
+    (line, snippet)
+}
+
+pub(super) fn find_config_location(key: &str, raw_content: &str) -> (usize, usize, String) {
     let key_parts: Vec<&str> = key.split('.').collect();
     let mut scope_stack: Vec<String> = Vec::new();
 
@@ -142,6 +147,20 @@ pub(super) fn find_config_line(key: &str, raw_content: &str) -> (usize, String) 
         // scope open: foo:
         if trimmed.ends_with(':') && !trimmed.starts_with('@') {
             let scope_name = trimmed.trim_end_matches(':').trim().to_string();
+            let full_path = {
+                let mut path = scope_stack.clone();
+                path.push(scope_name.clone());
+                path.join(".")
+            };
+
+            if full_path == key {
+                return (
+                    idx + 1,
+                    column_for_token(line, &scope_name),
+                    trimmed.to_string(),
+                );
+            }
+
             scope_stack.push(scope_name);
             continue;
         }
@@ -177,16 +196,28 @@ pub(super) fn find_config_line(key: &str, raw_content: &str) -> (usize, String) 
         };
 
         if full_path == key {
-            return (idx + 1, trimmed.to_string());
+            return (
+                idx + 1,
+                column_for_token(line, line_key),
+                trimmed.to_string(),
+            );
         }
 
         let simple_key = key_parts.last().unwrap_or(&key);
         if line_key == *simple_key {
-            return (idx + 1, trimmed.to_string());
+            return (
+                idx + 1,
+                column_for_token(line, line_key),
+                trimmed.to_string(),
+            );
         }
     }
 
-    (0, "<key not found>".into())
+    (0, 0, "<key not found>".into())
+}
+
+fn column_for_token(line: &str, token: &str) -> usize {
+    line.find(token).map(|column| column + 1).unwrap_or(1)
 }
 
 /// Shared condition evaluation for both inline conditionals and block if/endif.

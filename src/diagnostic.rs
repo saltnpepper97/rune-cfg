@@ -45,11 +45,21 @@ impl RuneDiagnostic {
 
     pub fn with_line(mut self, line: usize, column: usize) -> Self {
         if line > 0 {
+            self = self.with_range(line, column, column.saturating_add(1));
+        }
+        self
+    }
+
+    pub fn with_range(mut self, line: usize, start_column: usize, end_column: usize) -> Self {
+        if line > 0 {
             self.range = Some(SourceRange {
-                start: SourcePosition { line, column },
+                start: SourcePosition {
+                    line,
+                    column: start_column,
+                },
                 end: SourcePosition {
                     line,
-                    column: column.saturating_add(1),
+                    column: end_column.max(start_column.saturating_add(1)),
                 },
             });
         }
