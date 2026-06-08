@@ -128,7 +128,7 @@ impl RuneLanguageServer {
                 .schema_text_for_uri(&schema_uri)
                 .await
                 .map(Some)
-                .ok_or_else(|| schema_reference_diagnostic(&directive));
+                .ok_or_else(|| schema_reference_diagnostic(&directive, &[]));
         }
 
         let Some(schema_uri) = self.schema_uri_for(uri).await else {
@@ -154,20 +154,21 @@ impl RuneLanguageServer {
     ) -> Result<Url, RuneDiagnostic> {
         let path = uri
             .to_file_path()
-            .map_err(|_| schema_reference_diagnostic(directive))?;
+            .map_err(|_| schema_reference_diagnostic(directive, &[]))?;
         let config_dir = path
             .parent()
-            .ok_or_else(|| schema_reference_diagnostic(directive))?;
+            .ok_or_else(|| schema_reference_diagnostic(directive, &[]))?;
 
-        for candidate in schema_candidates(&directive.reference, config_dir) {
+        let candidates = schema_candidates(&directive.reference, config_dir);
+        for candidate in &candidates {
             if candidate.exists() || self.is_open_uri_for_path(&candidate).await {
-                if let Ok(uri) = Url::from_file_path(candidate) {
+                if let Ok(uri) = Url::from_file_path(candidate.clone()) {
                     return Ok(uri);
                 }
             }
         }
 
-        Err(schema_reference_diagnostic(directive))
+        Err(schema_reference_diagnostic(directive, &candidates))
     }
 
     async fn schema_for(&self, uri: &Url) -> Option<SchemaDocument> {
@@ -223,6 +224,18 @@ impl RuneLanguageServer {
         };
         self.documents.read().await.contains_key(&uri)
     }
+
+    async fn schema_source_label_for_document(&self, uri: &Url, text: &str) -> Option<String> {
+        if let Some(directive) = schema_directive(text) {
+            return Some(format!("@schema \"{}\"", directive.reference));
+        }
+
+        let schema_uri = self.schema_uri_for(uri).await?;
+        schema_uri
+            .to_file_path()
+            .ok()
+            .map(|path| path.display().to_string())
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -273,7 +286,11 @@ impl LanguageServer for RuneLanguageServer {
             schema_completion_items()
         } else {
             let schema = self.schema_for(&uri).await;
-            config_completion_items(schema.as_ref(), &text, position)
+            let config_dir = uri
+                .to_file_path()
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_path_buf));
+            config_completion_items(schema.as_ref(), &text, position, config_dir.as_deref())
         };
 
         Ok(Some(CompletionResponse::Array(items)))
@@ -298,9 +315,14 @@ impl LanguageServer for RuneLanguageServer {
         let Some(field) = find_field_by_path(&schema, &path) else {
             return Ok(None);
         };
+        let schema_source = self.schema_source_label_for_document(&uri, &text).await;
 
         Ok(Some(Hover {
-            contents: HoverContents::Scalar(MarkedString::String(field_hover(&path, field))),
+            contents: HoverContents::Scalar(MarkedString::String(field_hover(
+                &path,
+                field,
+                schema_source.as_deref(),
+            ))),
             range: None,
         }))
     }
@@ -357,6 +379,22 @@ impl LanguageServer for RuneLanguageServer {
                             index == 0,
                         ));
                     }
+                }
+                continue;
+            }
+
+            if let Some((path, replacement)) = type_fix_from_message(&text, &diagnostic.message) {
+                if let Some(range) = value_range_for_path(&text, &path) {
+                    actions.push(text_edit_action(
+                        uri.clone(),
+                        replacement.title,
+                        TextEdit {
+                            range,
+                            new_text: replacement.new_text,
+                        },
+                        diagnostic.clone(),
+                        true,
+                    ));
                 }
                 continue;
             }
@@ -572,6 +610,73 @@ fn schema_candidates(reference: &str, config_dir: &Path) -> Vec<PathBuf> {
     candidates
 }
 
+fn schema_reference_completion_items(config_dir: Option<&Path>) -> Vec<CompletionItem> {
+    let mut directories = Vec::new();
+    if let Some(config_dir) = config_dir {
+        directories.push(config_dir.join("schemas"));
+        directories.push(config_dir.join(".rune").join("schemas"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        directories.push(
+            PathBuf::from(home)
+                .join(".config")
+                .join("rune")
+                .join("schemas"),
+        );
+    }
+    directories.push(PathBuf::from("/usr/local/share/rune/schemas"));
+    directories.push(PathBuf::from("/usr/share/rune/schemas"));
+
+    let mut items = Vec::new();
+    for directory in directories {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("rune") {
+                continue;
+            }
+
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if items.iter().any(|item: &CompletionItem| item.label == stem) {
+                continue;
+            }
+
+            items.push(CompletionItem {
+                label: stem.into(),
+                kind: Some(CompletionItemKind::FILE),
+                detail: Some(format!("schema: {}", path.display())),
+                insert_text: Some(stem.into()),
+                ..CompletionItem::default()
+            });
+        }
+    }
+
+    items.push(CompletionItem {
+        label: "./schema.rune".into(),
+        kind: Some(CompletionItemKind::FILE),
+        detail: Some("relative schema path".into()),
+        ..CompletionItem::default()
+    });
+    items.push(CompletionItem {
+        label: "./schemas/".into(),
+        kind: Some(CompletionItemKind::FOLDER),
+        detail: Some("relative schema directory".into()),
+        ..CompletionItem::default()
+    });
+
+    items
+}
+
+fn is_schema_directive_context(before_cursor: &str) -> bool {
+    let trimmed = before_cursor.trim_start();
+    trimmed.starts_with("@schema") && trimmed.contains('"')
+}
+
 fn is_schema_path_reference(reference: &str) -> bool {
     reference.starts_with('.')
         || reference.starts_with('/')
@@ -596,14 +701,30 @@ fn expand_schema_path(reference: &str, config_dir: &Path) -> PathBuf {
     }
 }
 
-fn schema_reference_diagnostic(directive: &SchemaDirective) -> RuneDiagnostic {
+fn schema_reference_diagnostic(
+    directive: &SchemaDirective,
+    candidates: &[PathBuf],
+) -> RuneDiagnostic {
+    let hint = if candidates.is_empty() {
+        "Check the @schema path or install the named schema".to_string()
+    } else {
+        format!(
+            "Checked: {}",
+            candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
     RuneDiagnostic::error(format!("Schema '{}' was not found", directive.reference))
         .with_range(
             directive.line,
             directive.column,
             directive.column + directive.reference.len() + 2,
         )
-        .with_hint("Check the @schema path or install the named schema")
+        .with_hint(hint)
         .with_code(701)
 }
 
@@ -615,12 +736,33 @@ fn recovery_diagnostics(text: &str) -> Vec<RuneDiagnostic> {
         let line_no = index + 1;
         let code = code_part(line);
         let trimmed = code.trim();
-        if trimmed.is_empty() || trimmed.starts_with('@') || trimmed.starts_with("gather ") {
+        if trimmed.is_empty() || trimmed.starts_with("gather ") {
+            continue;
+        }
+
+        if trimmed.starts_with("@schema") && schema_directive(line).is_none() {
+            let column = line.find("@schema").unwrap_or(0) + 1;
+            diagnostics.push(
+                RuneDiagnostic::error("Malformed @schema directive")
+                    .with_range(line_no, column, column + "@schema".len())
+                    .with_hint("Use: @schema \"name\" or @schema \"./schema.rune\""),
+            );
+            continue;
+        }
+
+        if trimmed.starts_with('@') {
             continue;
         }
 
         if trimmed == "end" || trimmed == "endif" {
-            stack.pop();
+            if stack.pop().is_none() {
+                let column = line.find(trimmed).unwrap_or(0) + 1;
+                diagnostics.push(
+                    RuneDiagnostic::error(format!("Unexpected '{}' without open block", trimmed))
+                        .with_range(line_no, column, column + trimmed.len())
+                        .with_hint("Remove this closing keyword or add a matching block above"),
+                );
+            }
             continue;
         }
 
@@ -731,6 +873,52 @@ fn missing_schema_from_message(message: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+#[derive(Debug, Clone)]
+struct TypeReplacement {
+    title: String,
+    new_text: String,
+}
+
+fn type_fix_from_message(text: &str, message: &str) -> Option<(Vec<String>, TypeReplacement)> {
+    let path_start = message.find('\'')? + 1;
+    let path_end = message[path_start..].find('\'')? + path_start;
+    let path = split_path(&message[path_start..path_end]);
+    let expected = message
+        .split_once(" expected ")?
+        .1
+        .split(',')
+        .next()?
+        .trim();
+    let got = message.split_once(" got ")?.1.lines().next()?.trim();
+    let range = value_range_for_path(text, &path)?;
+    let value = value_text_for_range(text, range)?.trim().to_string();
+
+    if matches!(expected, "int" | "float" | "number" | "bool") && got == "string" {
+        let unquoted = value.trim_matches('"').trim_matches('\'').to_string();
+        if !unquoted.is_empty() {
+            return Some((
+                path,
+                TypeReplacement {
+                    title: format!("Remove quotes to make {}", expected),
+                    new_text: unquoted,
+                },
+            ));
+        }
+    }
+
+    if expected == "string" && got != "string" {
+        return Some((
+            path,
+            TypeReplacement {
+                title: "Add quotes to make string".into(),
+                new_text: format!("\"{}\"", value.trim_matches('"').trim_matches('\'')),
+            },
+        ));
+    }
+
+    None
+}
+
 fn split_path(path: &str) -> Vec<String> {
     path.split('.')
         .map(str::trim)
@@ -778,7 +966,9 @@ fn value_range_for_path(text: &str, path: &[String]) -> Option<Range> {
     let field = path.last()?;
 
     for (index, line) in text.lines().enumerate() {
-        let line_path = path_at_position(text, Position::new(index as u32, 0))?;
+        let Some(line_path) = path_at_position(text, Position::new(index as u32, 0)) else {
+            continue;
+        };
         if line_path != path {
             continue;
         }
@@ -801,6 +991,15 @@ fn value_range_for_path(text: &str, path: &[String]) -> Option<Range> {
     }
 
     None
+}
+
+fn value_text_for_range(text: &str, range: Range) -> Option<&str> {
+    if range.start.line != range.end.line {
+        return None;
+    }
+
+    let line = text.lines().nth(range.start.line as usize)?;
+    line.get(range.start.character as usize..range.end.character as usize)
 }
 
 fn sample_value_for_field(field: &SchemaField) -> String {
@@ -1025,8 +1224,13 @@ fn config_completion_items(
     schema: Option<&SchemaDocument>,
     text: &str,
     position: Position,
+    config_dir: Option<&Path>,
 ) -> Vec<CompletionItem> {
     let before_cursor = line_before_cursor(text, position);
+    if is_schema_directive_context(&before_cursor) {
+        return schema_reference_completion_items(config_dir);
+    }
+
     if before_cursor.contains('$') {
         return dollar_reference_completion_items();
     }
@@ -1111,6 +1315,7 @@ fn field_completion_item(field: &SchemaField) -> CompletionItem {
         documentation: Some(tower_lsp::lsp_types::Documentation::String(field_hover(
             &[field.name.clone()],
             field,
+            None,
         ))),
         insert_text: Some(if is_object {
             format!("{}:\n  $0\nend", field.name)
@@ -1174,7 +1379,7 @@ fn dollar_reference_completion_items() -> Vec<CompletionItem> {
     .collect()
 }
 
-fn field_hover(path: &[String], field: &SchemaField) -> String {
+fn field_hover(path: &[String], field: &SchemaField, schema_source: Option<&str>) -> String {
     let mut lines = vec![format!(
         "{}: {}",
         path.join("."),
@@ -1197,6 +1402,9 @@ fn field_hover(path: &[String], field: &SchemaField) -> String {
     }
     if let SchemaType::Enum(values) = &field.kind {
         lines.push(format!("values: {}", values.join(", ")));
+    }
+    if let Some(schema_source) = schema_source {
+        lines.push(format!("schema: {}", schema_source));
     }
 
     lines.join("\n")
@@ -1543,6 +1751,7 @@ end
             Some(&schema),
             "app:\n  name \"RuneApp\"\n  ",
             Position::new(2, 2),
+            None,
         );
 
         assert!(!completions.iter().any(|item| item.label == "name"));
@@ -1561,5 +1770,46 @@ end
             missing_required_field_from_message("Missing required field 'version' inside 'app'")
                 .unwrap();
         assert_eq!(missing, ("app".into(), "version".into()));
+    }
+
+    #[test]
+    fn schema_directive_completion_suggests_relative_paths() {
+        let completions = config_completion_items(None, "@schema \"", Position::new(0, 9), None);
+
+        assert!(completions.iter().any(|item| item.label == "./schema.rune"));
+        assert!(completions.iter().any(|item| item.label == "./schemas/"));
+    }
+
+    #[test]
+    fn type_fix_removes_quotes_for_numeric_values() {
+        let text = "app:\n  port \"8080\"\nend\n";
+        let (path, replacement) =
+            type_fix_from_message(text, "'app.port' expected int, got string").unwrap();
+
+        assert_eq!(path, vec!["app", "port"]);
+        assert_eq!(replacement.new_text, "8080");
+    }
+
+    #[test]
+    fn type_fix_handles_nested_numeric_values() {
+        let text = "app:\n  server:\n    port \"8080\"\n  end\nend\n";
+        let (path, replacement) =
+            type_fix_from_message(text, "'app.server.port' expected int, got string").unwrap();
+
+        assert_eq!(path, vec!["app", "server", "port"]);
+        assert_eq!(replacement.new_text, "8080");
+    }
+
+    #[test]
+    fn type_fix_handles_lsp_diagnostic_hint_text() {
+        let text = "app:\n  name \"RuneApp\"\n  environment \"prod\"\n\n  server:\n    host \"localhost\"\n    port \"8080\"\n  end\n\n  plugins [\"auth\", 42]\nend\n";
+        let (_, replacement) = type_fix_from_message(
+            text,
+            "'app.server.port' expected int, got string\nHint: Check around: port \"8080\"",
+        )
+        .unwrap();
+
+        assert_eq!(replacement.title, "Remove quotes to make int");
+        assert_eq!(replacement.new_text, "8080");
     }
 }

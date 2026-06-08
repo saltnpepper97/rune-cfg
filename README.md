@@ -461,7 +461,9 @@ Current capabilities:
 - document symbols for object blocks and keys
 - a quickfix code action for missing `end` diagnostics
 - quickfix code actions for invalid enum values and missing required fields
+- quickfix code actions for simple schema type mismatches, such as quoted numbers
 - schema field descriptions from leading comments in `schema.rune`
+- `@schema` name/path completion from project, user, and system schema directories
 - optional `@schema` references for app-provided schemas
 - automatic `schema.rune` discovery from the config file directory upward to the workspace root
 
@@ -495,6 +497,8 @@ For example:
 @schema "stasis"
 ```
 
+If an explicit schema reference cannot be resolved, diagnostics include the locations that were searched. Completion inside `@schema "..."` suggests discovered schema names plus common relative paths such as `./schema.rune` and `./schemas/`.
+
 Schema comments immediately before fields become editor hover/completion documentation:
 
 ```rune
@@ -511,7 +515,7 @@ schema app:
 end
 ```
 
-Completion uses the active schema to suggest only fields that belong in the current object, filters fields already present in that object, and uses snippets for common value shapes such as booleans, arrays, enums, and object blocks.
+Completion uses the active schema to suggest only fields that belong in the current object, filters fields already present in that object, and uses snippets for common value shapes such as booleans, arrays, enums, and object blocks. Hover text includes the schema source so app-provided schemas are visible from the editor.
 
 Run the server directly with:
 
