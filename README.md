@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/rune.png" width="550" />
+  <img src="./assets/rune.png" alt="RUNE" width="550" />
 </p>
 <h1 align="center">RUNE</h1>
 <p align="center">
@@ -24,6 +24,7 @@ RUNE is a configuration language designed to combine **readability, simplicity, 
 - **Flexible keys** - Automatic `snake_case` and `kebab-case` handling
 - **Import system** - Modular configs with `gather "file.rune" as alias`
 - **Schemas** - Validate configs with required fields, types, enums, ranges, and arrays
+- **LSP support** - Editor diagnostics, completions, formatting, and navigation through `rune-lsp`
 - **Type safety** - Strong typing with comprehensive error messages
 
 ## Installation
