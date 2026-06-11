@@ -7,16 +7,20 @@ use crate::resolver::{expand_dollar_string, parse_dollar_reference};
 use regex::Regex;
 
 pub(super) fn parse_assignment(parser: &mut Parser) -> Result<(String, Value), RuneError> {
-    let key = if let Token::Ident(k) = parser.bump()? {
-        k
-    } else {
-        return Err(RuneError::SyntaxError {
-            message: "Expected identifier for assignment".into(),
-            line: parser.line(),
-            column: parser.column(),
-            hint: None,
-            code: Some(208),
-        });
+    let key = match parser.bump()? {
+        // Bare identifier keys (`name "value"`) and quoted-string keys
+        // (`"$var.mod+r" "reload"`) are both accepted; string keys are stored
+        // literally with no interpolation.
+        Token::Ident(k) | Token::String(k) => k,
+        _ => {
+            return Err(RuneError::SyntaxError {
+                message: "Expected identifier or string for assignment".into(),
+                line: parser.line(),
+                column: parser.column(),
+                hint: None,
+                code: Some(208),
+            });
+        }
     };
 
     match parser.peek() {
@@ -27,7 +31,7 @@ pub(super) fn parse_assignment(parser: &mut Parser) -> Result<(String, Value), R
 
             while let Some(tok) = parser.peek() {
                 match tok {
-                    Token::Ident(_) => {
+                    Token::Ident(_) | Token::String(_) => {
                         let (k, v) = parse_assignment(parser)?;
                         items.push(ObjectItem::Assign(k, v));
                     }
@@ -46,7 +50,7 @@ pub(super) fn parse_assignment(parser: &mut Parser) -> Result<(String, Value), R
                     }
                     _ => {
                         return Err(RuneError::InvalidToken {
-                            token: format!("{:?}", tok),
+                            token: tok.describe(),
                             line: parser.line(),
                             column: parser.column(),
                             hint: Some("Expected key, 'if', or 'end'".into()),
@@ -99,7 +103,7 @@ pub(super) fn parse_value(parser: &mut Parser) -> Result<Value, RuneError> {
         _ => {
             let token = parser.bump()?;
             Err(RuneError::InvalidToken {
-                token: format!("{:?}", token),
+                token: token.describe(),
                 line: parser.line(),
                 column: parser.column(),
                 hint: Some("Unexpected token in value position".into()),

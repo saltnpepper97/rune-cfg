@@ -126,7 +126,7 @@ fn parse_object_items_until(
                 parser.bump()?;
             }
 
-            Token::Ident(_) => {
+            Token::Ident(_) | Token::String(_) => {
                 let (k, v) = value::parse_assignment(parser)?;
                 items.push(ObjectItem::Assign(k, v));
             }
@@ -141,7 +141,7 @@ fn parse_object_items_until(
                     break;
                 }
                 return Err(RuneError::InvalidToken {
-                    token: format!("{:?}", tok),
+                    token: tok.describe(),
                     line: parser.line(),
                     column: parser.column(),
                     hint: Some("Unexpected 'else' (no matching 'if'?)".into()),
@@ -165,7 +165,7 @@ fn parse_object_items_until(
 
             _ => {
                 return Err(RuneError::InvalidToken {
-                    token: format!("{:?}", tok),
+                    token: tok.describe(),
                     line: parser.line(),
                     column: parser.column(),
                     hint: Some("Expected assignment, nested block, 'else', or 'endif'".into()),

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/rune.png" width="350" />
+  <img src="./assets/rune.png" width="550" />
 </p>
 <h1 align="center">RUNE</h1>
 <p align="center">
@@ -276,7 +276,7 @@ end
 
 ### Schemas
 
-Schemas describe the expected shape of a RUNE config. They are parsed separately from runtime config files and return structured diagnostics that can be shown in CLIs, tests, or a future language server.
+Schemas describe the expected shape of a RUNE config. They are parsed separately from runtime config files and return structured diagnostics that can be shown in CLIs, tests, and `rune-lsp`.
 
 ```rune
 schema app:
@@ -434,7 +434,7 @@ for diagnostic in config.validate_schema(&schema) {
 }
 ```
 
-`validate_schema` returns `Vec<RuneDiagnostic>` instead of failing fast. This is intentional: callers can show every schema issue at once, and the same diagnostic shape can be reused by an LSP implementation.
+`validate_schema` returns `Vec<RuneDiagnostic>` instead of failing fast. This is intentional: callers can show every schema issue at once, and `rune-lsp` maps the same diagnostic shape into editor diagnostics.
 
 ### Export to JSON
 
@@ -447,22 +447,28 @@ println!("{}", json);
 
 ## Language Server
 
-RUNE includes an experimental language server binary named `rune-lsp`.
+RUNE includes an experimental language server binary named `rune-lsp`. It speaks LSP over stdio and can be launched by any editor client that supports custom language servers.
 
-Neovim runtime files are included under `editors/nvim/`. These provide highlighting, filetype detection, and 2-space indentation. The language server provides diagnostics. They are separate pieces and can be used together.
+Editor runtime files are included under `editors/nvim/` (Neovim) and `editors/vim/` (classic Vim). These provide highlighting, filetype detection, and 2-space indentation. The language server provides editor intelligence such as diagnostics, completion, hover, navigation, rename, and formatting. They are separate pieces and can be used together.
+
+An experimental Tree-sitter grammar is included under `editors/tree-sitter-rune/` for higher quality highlighting, indentation, and folding. The Vim syntax files remain the stable fallback while the grammar matures.
 
 Current capabilities:
 - full-document sync
 - syntax diagnostics for opened `.rune` files
-- schema parsing diagnostics for `schema.rune`
+- schema parsing diagnostics for schema files
 - schema validation diagnostics for config files
 - schema-aware key and enum-value completion
 - hover text for schema-backed fields
 - document symbols for object blocks and keys
+- go-to-definition from a config key to its schema field, and from `@schema` to the schema file
+- find-references for a key within a document or across schema-bound configs
+- rename of a key within a document or across schema-bound configs
+- document formatting (2-space block indentation)
 - a quickfix code action for missing `end` diagnostics
 - quickfix code actions for invalid enum values and missing required fields
 - quickfix code actions for simple schema type mismatches, such as quoted numbers
-- schema field descriptions from leading comments in `schema.rune`
+- schema field descriptions from leading comments in schema files
 - `@schema` name/path completion from project, user, and system schema directories
 - optional `@schema` references for app-provided schemas
 - automatic `schema.rune` discovery from the config file directory upward to the workspace root
@@ -517,13 +523,19 @@ end
 
 Completion uses the active schema to suggest only fields that belong in the current object, filters fields already present in that object, and uses snippets for common value shapes such as booleans, arrays, enums, and object blocks. Hover text includes the schema source so app-provided schemas are visible from the editor.
 
-Run the server directly with:
+Install the released server binary with:
+
+```sh
+cargo install rune-cfg --version 0.4.6
+```
+
+Or run the server directly from this repository with:
 
 ```sh
 cargo run --bin rune-lsp
 ```
 
-Build a reusable local binary with:
+Build a reusable local development binary with:
 
 ```sh
 cargo build --bin rune-lsp
@@ -535,12 +547,14 @@ The binary will be available at:
 target/debug/rune-lsp
 ```
 
-Check the installed binary with:
+Check the binary with:
 
 ```sh
-target/debug/rune-lsp --version
-target/debug/rune-lsp --help
+rune-lsp --version
+rune-lsp --help
 ```
+
+Use `target/debug/rune-lsp --version` when checking a local development build.
 
 Example Neovim setup:
 
@@ -552,13 +566,22 @@ cp -r editors/nvim/syntax ~/.config/nvim/
 cp -r editors/nvim/ftplugin ~/.config/nvim/
 ```
 
+Optional Tree-sitter grammar development:
+
+```sh
+cd editors/tree-sitter-rune
+npm install
+npm run generate
+npm test
+```
+
 Then configure the LSP in Neovim 0.11+:
 
 ```lua
 vim.lsp.config("rune_lsp", {
-  cmd = { "/path/to/rune-cfg/target/debug/rune-lsp" },
+  cmd = { "rune-lsp" },
   filetypes = { "rune" },
-  root_markers = { "schema.rune", ".git" },
+  root_markers = { "schema.rune", ".rune", ".git" },
 })
 
 vim.lsp.enable("rune_lsp")
@@ -570,9 +593,21 @@ For one-off testing without a named config:
 vim.lsp.start({
   name = "rune_lsp",
   cmd = { "/path/to/rune-cfg/target/debug/rune-lsp" },
-  root_dir = vim.fs.root(0, { "schema.rune", ".git" }),
+  root_dir = vim.fs.root(0, { "schema.rune", ".rune", ".git" }),
 })
 ```
+
+Example classic Vim setup:
+
+Install the optional syntax files:
+
+```sh
+cp -r editors/vim/ftdetect ~/.vim/
+cp -r editors/vim/syntax ~/.vim/
+cp -r editors/vim/ftplugin ~/.vim/
+```
+
+Then wire up the LSP through a client such as [vim-lsp](https://github.com/prabirshrestha/vim-lsp) or [ALE](https://github.com/dense-analysis/ale). See `editors/vim/README.md` for a vim-lsp example.
 
 Place a `schema.rune` next to your config file or in a parent directory, or use `@schema` to point at an app-provided schema. When a schema is available, `rune-lsp` validates the config and uses the schema for completion and hover. Without a schema, `rune-lsp` stays in plain RUNE mode and only reports syntax-level diagnostics.
 

@@ -43,6 +43,37 @@ pub enum Token {
     Eof,
 }
 
+impl Token {
+    /// Human-readable label for diagnostics, avoiding `Debug` output like
+    /// `String("..")` leaking into user-facing error messages.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Token::Ident(name) => format!("identifier '{}'", name),
+            Token::String(value) => format!("string \"{}\"", value),
+            Token::Regex(value) => format!("regex r\"{}\"", value),
+            Token::Number(number) => format!("number {}", number),
+            Token::Bool(value) => format!("boolean {}", value),
+            Token::Null => "null".into(),
+            Token::Colon => "':'".into(),
+            Token::Equals => "'='".into(),
+            Token::LBracket => "'['".into(),
+            Token::RBracket => "']'".into(),
+            Token::End => "'end'".into(),
+            Token::EndIf => "'endif'".into(),
+            Token::Dollar => "'$'".into(),
+            Token::Dot => "'.'".into(),
+            Token::At => "'@'".into(),
+            Token::Gather => "'gather'".into(),
+            Token::As => "'as'".into(),
+            Token::If => "'if'".into(),
+            Token::Else => "'else'".into(),
+            Token::ElseIf => "'elseif'".into(),
+            Token::Newline => "newline".into(),
+            Token::Eof => "end of input".into(),
+        }
+    }
+}
+
 pub struct Lexer<'a> {
     input: Chars<'a>,
     peek: Option<char>,

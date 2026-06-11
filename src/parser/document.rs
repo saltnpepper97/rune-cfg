@@ -27,7 +27,7 @@ pub(super) fn parse_document(parser: &mut Parser) -> Result<Document, RuneError>
             Token::At => {
                 parse_metadata(parser, &mut metadata)?;
             }
-            Token::Ident(_) => {
+            Token::Ident(_) | Token::String(_) => {
                 parse_top_level_item(parser, &mut globals, &mut items)?;
             }
             Token::Gather => {
@@ -49,7 +49,7 @@ pub(super) fn parse_document(parser: &mut Parser) -> Result<Document, RuneError>
             }
             _ => {
                 return Err(RuneError::InvalidToken {
-                    token: format!("{:?}", tok),
+                    token: tok.describe(),
                     line: parser.line(),
                     column: parser.column(),
                     hint: Some("Unexpected token at top-level".into()),
@@ -92,10 +92,9 @@ fn parse_top_level_item(
     globals: &mut Vec<(String, Value)>,
     items: &mut Vec<(String, Value)>,
 ) -> Result<(), RuneError> {
-    let key = if let Token::Ident(k) = parser.bump()? {
-        k
-    } else {
-        unreachable!()
+    let key = match parser.bump()? {
+        Token::Ident(k) | Token::String(k) => k,
+        _ => unreachable!("parse_top_level_item is only entered on an identifier or string key"),
     };
 
     match parser.peek() {
@@ -106,7 +105,7 @@ fn parse_top_level_item(
 
             while let Some(tok) = parser.peek() {
                 match tok {
-                    Token::Ident(_) => {
+                    Token::Ident(_) | Token::String(_) => {
                         let (k, v) = value::parse_assignment(parser)?;
                         object_items.push(crate::ast::ObjectItem::Assign(k, v));
                     }
@@ -125,7 +124,7 @@ fn parse_top_level_item(
                     }
                     _ => {
                         return Err(RuneError::InvalidToken {
-                            token: format!("{:?}", tok),
+                            token: tok.describe(),
                             line: parser.line(),
                             column: parser.column(),
                             hint: Some("Expected key, 'if', or 'end'".into()),

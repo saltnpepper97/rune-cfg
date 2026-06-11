@@ -1,0 +1,41 @@
+==================
+schema config
+==================
+
+schema app:
+  # Application name.
+  name string required
+  version string required
+  debug bool default false
+  environment enum ["dev", "staging", "production"] required
+
+  server:
+    host string required
+    port int range 1..65535 default 8080
+  end
+
+  plugins [string]
+end
+
+---
+
+(source_file
+  (schema_block
+    name: (identifier)
+    (comment)
+    (schema_field name: (identifier) type: (schema_primitive) (schema_modifier))
+    (schema_field name: (identifier) type: (schema_primitive) (schema_modifier))
+    (schema_field name: (identifier) type: (schema_primitive) (schema_modifier (boolean)))
+    (schema_field
+      name: (identifier)
+      type: (schema_enum (array (string) (string) (string)))
+      (schema_modifier))
+    (schema_object
+      name: (identifier)
+      (schema_field name: (identifier) type: (schema_primitive) (schema_modifier))
+      (schema_field
+        name: (identifier)
+        type: (schema_primitive)
+        (schema_modifier (range))
+        (schema_modifier (number))))
+    (schema_field name: (identifier) type: (schema_array_type (schema_primitive)))))

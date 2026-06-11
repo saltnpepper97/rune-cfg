@@ -1,0 +1,51 @@
+==================
+basic config
+==================
+
+# This is a comment
+gather "defaults.rune" as defaults
+@description "Simple app using RUNE config"
+
+name "RuneApp"
+path = $env.PATH
+
+app:
+  name name
+  version "1.0.0"
+  debug true
+
+  server:
+    host = defaults.server.host
+    port 8080
+    timeout "30s"
+  end
+
+  plugins [
+    "auth",
+    "logger"
+  ]
+end
+
+---
+
+(source_file
+  (comment)
+  (gather_statement path: (string) alias: (identifier))
+  (metadata name: (identifier) value: (string))
+  (assignment key: (identifier) value: (string))
+  (assignment key: (identifier) value: (reference))
+  (object_block
+    name: (identifier)
+    (assignment key: (identifier) value: (reference))
+    (assignment key: (identifier) value: (string))
+    (assignment key: (identifier) value: (boolean))
+    (object_block
+      name: (identifier)
+      (assignment key: (identifier) value: (reference))
+      (assignment key: (identifier) value: (number))
+      (assignment key: (identifier) value: (string)))
+    (assignment
+      key: (identifier)
+      value: (array
+        (string)
+        (string)))))

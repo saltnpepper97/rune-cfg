@@ -2,6 +2,8 @@
 
 This directory contains lightweight Neovim runtime files for RUNE.
 
+An experimental Tree-sitter grammar also exists at `editors/tree-sitter-rune/`. Use these Vim runtime files as the stable fallback while the Tree-sitter grammar matures.
+
 They provide:
 
 - `*.rune` filetype detection
@@ -24,7 +26,13 @@ The syntax file distinguishes:
 - closing block keywords, such as `end` and `endif`
 - strings, regex literals, numbers, booleans, nulls, metadata, schema keywords, and `$env`/`$sys` references
 
-For LSP diagnostics, build `rune-lsp` and configure your editor to launch it:
+For LSP diagnostics, completion, hover, navigation, rename, and formatting, install `rune-lsp` and configure Neovim to launch it:
+
+```sh
+cargo install rune-cfg --version 0.4.6
+```
+
+For local development, build the binary from this repository:
 
 ```sh
 cargo build --bin rune-lsp
@@ -34,4 +42,16 @@ The resulting binary is:
 
 ```text
 target/debug/rune-lsp
+```
+
+Neovim 0.11+ can launch the installed binary directly:
+
+```lua
+vim.lsp.config("rune_lsp", {
+  cmd = { "rune-lsp" },
+  filetypes = { "rune" },
+  root_markers = { "schema.rune", ".rune", ".git" },
+})
+
+vim.lsp.enable("rune_lsp")
 ```

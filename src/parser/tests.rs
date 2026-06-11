@@ -385,3 +385,74 @@ app:
         other => panic!("Expected UnexpectedEof, got {:?}", other),
     }
 }
+
+#[test]
+fn test_quoted_string_keys_in_object_block() {
+    let input = r#"
+keybinds:
+  mod "super"
+  "$var.mod+shift+r" "reload"
+end
+"#;
+
+    let mut parser = Parser::new(input).expect("Failed to create parser");
+    let doc = parser.parse_document().expect("string keys should parse");
+
+    let Value::Object(items) = &doc.items[0].1 else {
+        panic!("Expected 'keybinds' to be an object");
+    };
+
+    // The quoted key is stored literally, with no interpolation.
+    let entry = items.iter().find_map(|it| match it {
+        ObjectItem::Assign(k, v) if k == "$var.mod+shift+r" => Some(v),
+        _ => None,
+    });
+    assert!(
+        matches!(entry, Some(Value::String(value)) if value == "reload"),
+        "expected the string key to map to \"reload\""
+    );
+}
+
+#[test]
+fn test_quoted_string_key_can_open_nested_block() {
+    let input = r#"
+sections:
+  "weird.name":
+    enabled true
+  end
+end
+"#;
+
+    let mut parser = Parser::new(input).expect("Failed to create parser");
+    let doc = parser
+        .parse_document()
+        .expect("string-keyed block should parse");
+
+    let Value::Object(items) = &doc.items[0].1 else {
+        panic!("Expected 'sections' to be an object");
+    };
+    assert!(
+        items
+            .iter()
+            .any(|it| matches!(it, ObjectItem::Assign(k, Value::Object(_)) if k == "weird.name")),
+        "expected a nested object under the string key"
+    );
+}
+
+#[test]
+fn test_invalid_key_reports_readable_token() {
+    let input = "app:\n  123 \"x\"\nend\n";
+
+    let mut parser = Parser::new(input).expect("Failed to create parser");
+    let error = parser
+        .parse_document()
+        .expect_err("a numeric key should fail");
+
+    match error {
+        RuneError::InvalidToken { token, .. } => {
+            // Readable label, not the `Number(123.0)` Debug form.
+            assert_eq!(token, "number 123");
+        }
+        other => panic!("Expected InvalidToken, got {:?}", other),
+    }
+}

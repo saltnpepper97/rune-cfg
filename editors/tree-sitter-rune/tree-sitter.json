@@ -1,0 +1,22 @@
+{
+  "grammars": [
+    {
+      "name": "rune",
+      "camelcase": "Rune",
+      "scope": "source.rune",
+      "path": ".",
+      "file-types": [
+        "rune"
+      ],
+      "highlights": "queries/highlights.scm",
+      "injections": "queries/injections.scm",
+      "folds": "queries/folds.scm",
+      "indents": "queries/indents.scm"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "Tree-sitter grammar for RUNE configuration files"
+  }
+}
