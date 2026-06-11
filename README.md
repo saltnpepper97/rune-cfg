@@ -32,7 +32,7 @@ Add `rune-cfg` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rune-cfg = "0.4.6"
+rune-cfg = "0.5.0"
 ```
 
 ## Quick Example
@@ -526,7 +526,7 @@ Completion uses the active schema to suggest only fields that belong in the curr
 Install the released server binary with:
 
 ```sh
-cargo install rune-cfg --version 0.4.6
+cargo install rune-cfg --version 0.5.0
 ```
 
 Or run the server directly from this repository with:

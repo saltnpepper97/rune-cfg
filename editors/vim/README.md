@@ -29,7 +29,7 @@ The syntax file distinguishes:
 For LSP diagnostics, completion, hover, navigation, rename, and formatting, install `rune-lsp` and configure your editor to launch it:
 
 ```sh
-cargo install rune-cfg --version 0.4.6
+cargo install rune-cfg --version 0.5.0
 ```
 
 For local development, build the binary from this repository:
