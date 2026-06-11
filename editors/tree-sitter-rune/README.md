@@ -23,3 +23,5 @@ npm test
 ```
 
 Neovim users can keep using the Vim syntax files under `editors/nvim/` as a fallback. Once this grammar is generated and installed locally, it can provide higher quality highlighting, indentation, and folding.
+
+For broader editor and LSP setup, see [Language Server](../../docs/language-server.md).

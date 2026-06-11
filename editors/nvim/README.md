@@ -28,6 +28,8 @@ The syntax file distinguishes:
 
 For LSP diagnostics, completion, hover, navigation, rename, and formatting, install `rune-lsp` and configure Neovim to launch it:
 
+See [Language Server](../../docs/language-server.md) for the full capability list and schema-aware behavior.
+
 ```sh
 cargo install rune-cfg --version 0.5.0
 ```

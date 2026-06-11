@@ -34,3 +34,5 @@ By default, the extension launches `rune-lsp` from `PATH`. To test a local devel
 ```
 
 The server speaks LSP over stdio and provides diagnostics, completion, hover, document symbols, code actions, go-to-definition, references, rename, and formatting.
+
+See [Language Server](../../docs/language-server.md) for the full capability list and schema-aware behavior.
