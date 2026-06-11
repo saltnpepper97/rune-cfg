@@ -1,0 +1,89 @@
+{
+  "name": "rune-cfg",
+  "displayName": "RUNE",
+  "description": "Language support for RUNE configuration files.",
+  "version": "0.5.0",
+  "publisher": "saltnpepper97",
+  "license": "GPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/saltnpepper97/rune-cfg.git"
+  },
+  "categories": [
+    "Programming Languages",
+    "Formatters"
+  ],
+  "keywords": [
+    "rune",
+    "configuration",
+    "config",
+    "language-server",
+    "lsp"
+  ],
+  "activationEvents": [
+    "onLanguage:rune"
+  ],
+  "engines": {
+    "vscode": "^1.89.0"
+  },
+  "main": "./out/extension.js",
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.89.0",
+    "typescript": "^5.5.4"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "rune",
+        "aliases": [
+          "RUNE",
+          "rune"
+        ],
+        "extensions": [
+          ".rune"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./images/rune-icon.svg",
+          "dark": "./images/rune-icon.svg"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "rune",
+        "scopeName": "source.rune",
+        "path": "./syntaxes/rune.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "RUNE",
+      "properties": {
+        "rune.server.path": {
+          "type": "string",
+          "default": "rune-lsp",
+          "scope": "machine-overridable",
+          "description": "Path to the rune-lsp executable. Use an absolute path for a local development build."
+        },
+        "rune.server.args": {
+          "type": "array",
+          "default": [],
+          "scope": "machine-overridable",
+          "items": {
+            "type": "string"
+          },
+          "description": "Extra arguments passed to rune-lsp. The server speaks LSP over stdio without arguments by default."
+        }
+      }
+    }
+  }
+}

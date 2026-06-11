@@ -449,7 +449,7 @@ println!("{}", json);
 
 RUNE includes an experimental language server binary named `rune-lsp`. It speaks LSP over stdio and can be launched by any editor client that supports custom language servers.
 
-Editor runtime files are included under `editors/nvim/` (Neovim) and `editors/vim/` (classic Vim). These provide highlighting, filetype detection, and 2-space indentation. The language server provides editor intelligence such as diagnostics, completion, hover, navigation, rename, and formatting. They are separate pieces and can be used together.
+Editor integrations are included under `editors/nvim/` (Neovim), `editors/vim/` (classic Vim), and `editors/vscode/` (VS Code). The Vim and Neovim runtime files provide highlighting, filetype detection, and 2-space indentation. The VS Code extension provides language registration, basic TextMate highlighting, language configuration, and a client that launches `rune-lsp`. The language server provides editor intelligence such as diagnostics, completion, hover, navigation, rename, and formatting. These pieces are separate and can be used together.
 
 An experimental Tree-sitter grammar is included under `editors/tree-sitter-rune/` for higher quality highlighting, indentation, and folding. The Vim syntax files remain the stable fallback while the grammar matures.
 
@@ -608,6 +608,16 @@ cp -r editors/vim/ftplugin ~/.vim/
 ```
 
 Then wire up the LSP through a client such as [vim-lsp](https://github.com/prabirshrestha/vim-lsp) or [ALE](https://github.com/dense-analysis/ale). See `editors/vim/README.md` for a vim-lsp example.
+
+Example VS Code setup:
+
+```sh
+cd editors/vscode
+npm install
+npm run compile
+```
+
+Run the extension from VS Code's Extension Development Host. By default it launches `rune-lsp` from `PATH`; set `rune.server.path` to an absolute binary path when testing a local development build. See `editors/vscode/README.md` for details.
 
 Place a `schema.rune` next to your config file or in a parent directory, or use `@schema` to point at an app-provided schema. When a schema is available, `rune-lsp` validates the config and uses the schema for completion and hover. Without a schema, `rune-lsp` stays in plain RUNE mode and only reports syntax-level diagnostics.
 

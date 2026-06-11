@@ -1,0 +1,152 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "RUNE",
+  "scopeName": "source.rune",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#metadata" },
+    { "include": "#keywords" },
+    { "include": "#schema-types" },
+    { "include": "#block-keys" },
+    { "include": "#assignment-keys" },
+    { "include": "#references" },
+    { "include": "#regex" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#constants" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.number-sign.rune",
+          "match": "#.*$"
+        }
+      ]
+    },
+    "metadata": {
+      "patterns": [
+        {
+          "name": "meta.annotation.rune",
+          "match": "@[A-Za-z_][A-Za-z0-9_-]*",
+          "captures": {
+            "0": { "name": "keyword.control.directive.rune" }
+          }
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.rune",
+          "match": "\\b(?:gather|as|if|else|elseif|else-if|end|endif|schema)\\b"
+        },
+        {
+          "name": "storage.modifier.rune",
+          "match": "\\b(?:required|default|range|enum)\\b"
+        }
+      ]
+    },
+    "schema-types": {
+      "patterns": [
+        {
+          "name": "support.type.rune",
+          "match": "\\b(?:string|int|float|number|bool|regex|null|any|array|object)\\b"
+        }
+      ]
+    },
+    "block-keys": {
+      "patterns": [
+        {
+          "name": "meta.block.rune",
+          "match": "^\\s*(?:schema\\s+)?([A-Za-z_][A-Za-z0-9_-]*|\"(?:\\\\.|[^\"\\\\])*\")\\s*:",
+          "captures": {
+            "1": { "name": "entity.name.section.rune" }
+          }
+        }
+      ]
+    },
+    "assignment-keys": {
+      "patterns": [
+        {
+          "name": "meta.assignment.rune",
+          "match": "^\\s*([A-Za-z_][A-Za-z0-9_-]*|\"(?:\\\\.|[^\"\\\\])*\")(?=\\s+(?:=\\s*)?[^#\\s])",
+          "captures": {
+            "1": { "name": "variable.other.member.rune" }
+          }
+        }
+      ]
+    },
+    "references": {
+      "patterns": [
+        {
+          "name": "variable.other.rune",
+          "match": "\\$[A-Za-z_][A-Za-z0-9_-]*(?:\\.[A-Za-z_][A-Za-z0-9_-]*)*"
+        }
+      ]
+    },
+    "regex": {
+      "patterns": [
+        {
+          "name": "string.regexp.rune",
+          "match": "r\"(?:\\\\.|[^\"\\\\])*\""
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.rune",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.rune",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.rune",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.rune",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.rune",
+          "match": "\\b-?\\d+(?:\\.\\d+)?\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.rune",
+          "match": "\\b(?:true|false|null)\\b"
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.separator.rune",
+          "match": "[:=,]"
+        },
+        {
+          "name": "punctuation.definition.array.rune",
+          "match": "[\\[\\]]"
+        }
+      ]
+    }
+  }
+}

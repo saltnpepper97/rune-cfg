@@ -1,2 +1,4 @@
 /target
 /editors/tree-sitter-rune/node_modules
+/editors/vscode/node_modules
+/editors/vscode/out
