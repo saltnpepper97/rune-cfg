@@ -15,7 +15,7 @@
 
 RUNE is a configuration language designed to combine **readability, simplicity, and power**. Inspired by the best parts of TOML and YAML, RUNE makes writing and reading config files intuitive while supporting advanced features like native regex patterns, conditionals, and system/environment variable interpolation.
 
-> Note: `rune-cfg` is not affiliated with the separate [`rune` embeddable language project](https://github.com/rune-rs/rune).
+> Note: `rune-cfg` (RUNE) is not affiliated with the separate [`rune` embeddable language project](https://github.com/rune-rs/rune).
 
 **Key Features:**
 - **Clean syntax** - Minimal and readable, no complex indentation rules
