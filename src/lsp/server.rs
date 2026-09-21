@@ -159,7 +159,7 @@ impl RuneLanguageServer {
     }
 
     async fn schema_text_for_uri(&self, schema_uri: &Url) -> Option<String> {
-        if let Some(document) = self.documents.read().await.get(&schema_uri) {
+        if let Some(document) = self.documents.read().await.get(schema_uri) {
             return Some(document.source.text().to_string());
         }
 
@@ -181,10 +181,10 @@ impl RuneLanguageServer {
 
         let candidates = schema_candidates(&directive.reference, config_dir);
         for candidate in &candidates {
-            if candidate.exists() || self.is_open_uri_for_path(&candidate).await {
-                if let Ok(uri) = Url::from_file_path(candidate.clone()) {
-                    return Ok(uri);
-                }
+            if (candidate.exists() || self.is_open_uri_for_path(candidate.as_path()).await)
+                && let Ok(uri) = Url::from_file_path(candidate.clone())
+            {
+                return Ok(uri);
             }
         }
 
@@ -324,10 +324,10 @@ impl RuneLanguageServer {
 
         loop {
             let candidate = directory.join("schema.rune");
-            if candidate.exists() || self.is_open_uri_for_path(&candidate).await {
-                if let Ok(uri) = Url::from_file_path(candidate) {
-                    return Some(uri);
-                }
+            if (candidate.exists() || self.is_open_uri_for_path(candidate.as_path()).await)
+                && let Ok(uri) = Url::from_file_path(candidate)
+            {
+                return Some(uri);
             }
 
             if root_path.as_ref().is_some_and(|root| directory == *root) {
@@ -1049,10 +1049,10 @@ fn is_schema_path_reference(reference: &str) -> bool {
 }
 
 fn expand_schema_path(reference: &str, config_dir: &Path) -> PathBuf {
-    if let Some(rest) = reference.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = reference.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
     }
 
     let path = PathBuf::from(reference);
@@ -1629,7 +1629,7 @@ fn field_completion_item(field: &SchemaField) -> CompletionItem {
         }),
         detail: Some(schema_type_label(&field.kind)),
         documentation: Some(tower_lsp::lsp_types::Documentation::String(field_hover(
-            &[field.name.clone()],
+            std::slice::from_ref(&field.name),
             field,
             None,
         ))),

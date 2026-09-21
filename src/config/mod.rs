@@ -130,10 +130,10 @@ impl RuneConfig {
             if !spec.explicit_alias {
                 // Clone after load to avoid borrow issues (and keep ordering predictable)
                 let imported = documents.get(&spec.alias).cloned();
-                if let Some(import_doc) = imported {
-                    if let Some(main_doc_mut) = documents.get_mut(&main_key) {
-                        merge_overrides_into_document(main_doc_mut, &import_doc);
-                    }
+                if let Some(import_doc) = imported
+                    && let Some(main_doc_mut) = documents.get_mut(&main_key)
+                {
+                    merge_overrides_into_document(main_doc_mut, &import_doc);
                 }
             }
         }
@@ -147,6 +147,10 @@ impl RuneConfig {
     }
 
     /// Parse a RUNE config from a string (no file I/O, no import resolution)
+    ///
+    /// The inherent name is retained for compatibility; FromStr is also
+    /// implemented below for callers that prefer the standard trait.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(content: &str) -> Result<Self, RuneError> {
         let mut parser = parser::Parser::new(content)?;
         let main_doc = parser.parse_document()?;
@@ -263,20 +267,28 @@ fn resolve_gather_path(raw_path: &str, base_dir: &Path) -> Result<PathBuf, RuneE
     Ok(p)
 }
 
+impl std::str::FromStr for RuneConfig {
+    type Err = RuneError;
+
+    fn from_str(content: &str) -> Result<Self, Self::Err> {
+        RuneConfig::from_str(content)
+    }
+}
+
 /// Best-effort home directory lookup without external crates.
 fn home_dir_fallback() -> Option<PathBuf> {
     // Unix-like: HOME
-    if let Some(home) = std::env::var_os("HOME") {
-        if !home.is_empty() {
-            return Some(PathBuf::from(home));
-        }
+    if let Some(home) = std::env::var_os("HOME")
+        && !home.is_empty()
+    {
+        return Some(PathBuf::from(home));
     }
 
     // Windows: USERPROFILE, or HOMEDRIVE + HOMEPATH
-    if let Some(up) = std::env::var_os("USERPROFILE") {
-        if !up.is_empty() {
-            return Some(PathBuf::from(up));
-        }
+    if let Some(up) = std::env::var_os("USERPROFILE")
+        && !up.is_empty()
+    {
+        return Some(PathBuf::from(up));
     }
 
     let drive = std::env::var_os("HOMEDRIVE");

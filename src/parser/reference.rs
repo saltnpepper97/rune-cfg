@@ -55,14 +55,11 @@ pub(super) fn resolve_reference<'b>(
                 // The config layer resolves/flatten objects before typical access.
                 //
                 // For references, we only traverse explicit assignments present in the AST.
-                if let Some(v) = items.iter().find_map(|item| match item {
+                let v = items.iter().find_map(|item| match item {
                     crate::ast::ObjectItem::Assign(k, v) if k == seg => Some(v),
                     _ => None,
-                }) {
-                    current = v;
-                } else {
-                    return None;
-                }
+                })?;
+                current = v;
             }
             Value::Annotated(value) => {
                 current = value

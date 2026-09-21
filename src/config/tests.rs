@@ -41,7 +41,7 @@ end
     assert_eq!(port, 8080);
 
     let debug: bool = config.get("app.debug").expect("Failed to get debug");
-    assert_eq!(debug, true);
+    assert!(debug);
 
     let features: Vec<String> = config.get("app.features").expect("Failed to get features");
     assert_eq!(features, vec!["auth", "logging"]);
@@ -257,10 +257,10 @@ fn test_string_conversion_error() {
 
 #[test]
 fn test_f64_conversion() {
-    let value = Value::Number(3.14);
+    let value = Value::Number(3.25);
     let result: Result<f64, RuneError> = value.try_into();
     assert!(result.is_ok());
-    assert_eq!(result.unwrap(), 3.14);
+    assert_eq!(result.unwrap(), 3.25);
 }
 
 #[test]
@@ -352,12 +352,12 @@ fn test_bool_conversion() {
     let value = Value::Bool(true);
     let result: Result<bool, RuneError> = value.try_into();
     assert!(result.is_ok());
-    assert_eq!(result.unwrap(), true);
+    assert!(result.unwrap());
 
     let value = Value::Bool(false);
     let result: Result<bool, RuneError> = value.try_into();
     assert!(result.is_ok());
-    assert_eq!(result.unwrap(), false);
+    assert!(!result.unwrap());
 }
 
 #[test]
@@ -583,7 +583,7 @@ fn test_config_with_all_types() {
 types:
     string_val "hello"
     int_val 42
-    float_val 3.14
+    float_val 3.25
     bool_val true
     null_val null
     array_val [1, 2, 3]
@@ -601,10 +601,10 @@ end
     assert_eq!(i, 42);
 
     let f: f64 = config.get("types.float_val").unwrap();
-    assert!((f - 3.14).abs() < 0.001);
+    assert!((f - 3.25).abs() < 0.001);
 
     let b: bool = config.get("types.bool_val").unwrap();
-    assert_eq!(b, true);
+    assert!(b);
 
     let opt: Option<String> = config.get("types.null_val").unwrap();
     assert_eq!(opt, None);
@@ -664,7 +664,7 @@ end
 
     // debug isn't set, so Condition::Exists("debug") is false → else branch → flag false
     let flag: bool = config.get("app.flag").expect("Failed to get app.flag");
-    assert_eq!(flag, false);
+    assert!(!flag);
 }
 
 #[test]

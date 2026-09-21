@@ -202,16 +202,11 @@ fn parse_gather_statement(parser: &mut Parser) -> Result<(), RuneError> {
     // IMPORTANT:
     // Insert a placeholder import so reference resolution can treat the first segment as an alias.
     // The loader (RuneConfig::from_file_with_base) will overwrite this with the real document.
-    if !parser.imports.contains_key(&alias) {
-        parser.imports.insert(
-            alias,
-            Document {
-                metadata: vec![],
-                globals: vec![],
-                items: vec![],
-            },
-        );
-    }
+    parser.imports.entry(alias).or_insert_with(|| Document {
+        metadata: vec![],
+        globals: vec![],
+        items: vec![],
+    });
 
     Ok(())
 }

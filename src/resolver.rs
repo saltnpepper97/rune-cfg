@@ -303,7 +303,8 @@ mod tests {
 
         for &key in &keys {
             let input = format!("$sys.{}", key);
-            let result = expand_dollar_string(&input).expect(&format!("Failed on key: {}", key));
+            let result =
+                expand_dollar_string(&input).unwrap_or_else(|_| panic!("Failed on key: {}", key));
 
             match result {
                 Value::String(s) => {

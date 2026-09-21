@@ -155,18 +155,18 @@ fn validate_value(
         return;
     }
 
-    if let (Some((min, max)), Value::Number(number)) = (field.range, value) {
-        if *number < min || *number > max {
-            diagnostics.push(
-                line_diagnostic(
-                    path,
-                    format!("'{}' must be between {} and {}", path, min, max),
-                    &config.raw_content,
-                )
-                .with_code(653)
-                .with_hint(format!("Use a value in the range {}..{}", min, max)),
-            );
-        }
+    if let (Some((min, max)), Value::Number(number)) = (field.range, value)
+        && (*number < min || *number > max)
+    {
+        diagnostics.push(
+            line_diagnostic(
+                path,
+                format!("'{}' must be between {} and {}", path, min, max),
+                &config.raw_content,
+            )
+            .with_code(653)
+            .with_hint(format!("Use a value in the range {}..{}", min, max)),
+        );
     }
 
     match (&field.kind, value) {

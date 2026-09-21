@@ -54,6 +54,8 @@ impl SchemaDocument {
         Self::from_str(&content)
     }
 
+    // Retain the established inherent API alongside the FromStr impl below.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(content: &str) -> Result<Self, RuneError> {
         let lines: Vec<(usize, String)> = content
             .lines()
@@ -106,6 +108,14 @@ impl SchemaDocument {
         }
 
         Ok(Self { blocks })
+    }
+}
+
+impl std::str::FromStr for SchemaDocument {
+    type Err = RuneError;
+
+    fn from_str(content: &str) -> Result<Self, Self::Err> {
+        SchemaDocument::from_str(content)
     }
 }
 

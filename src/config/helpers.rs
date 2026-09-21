@@ -113,16 +113,16 @@ pub(super) fn parse_gather_specs(content: &str) -> Vec<GatherSpec> {
 fn extract_quoted_string(input: &str) -> Option<String> {
     let trimmed = input.trim();
 
-    if trimmed.starts_with('"') {
-        if let Some(end_quote) = trimmed[1..].find('"') {
-            return Some(trimmed[1..end_quote + 1].to_string());
-        }
+    if let Some(rest) = trimmed.strip_prefix('"')
+        && let Some(end_quote) = rest.find('"')
+    {
+        return Some(rest[..end_quote].to_string());
     }
 
-    if trimmed.starts_with('\'') {
-        if let Some(end_quote) = trimmed[1..].find('\'') {
-            return Some(trimmed[1..end_quote + 1].to_string());
-        }
+    if let Some(rest) = trimmed.strip_prefix('\'')
+        && let Some(end_quote) = rest.find('\'')
+    {
+        return Some(rest[..end_quote].to_string());
     }
 
     None
@@ -401,7 +401,7 @@ pub(super) fn resolve_value_recursively(
         }
 
         Value::Reference(path) => {
-            if path.get(0).map(|s| s.as_str()) == Some("env") && path.len() == 2 {
+            if path.first().map(|s| s.as_str()) == Some("env") && path.len() == 2 {
                 let var_name = &path[1];
                 std::env::var(var_name)
                     .map(Value::String)
@@ -410,17 +410,17 @@ pub(super) fn resolve_value_recursively(
                         hint: Some("Make sure the environment variable is defined".into()),
                         code: Some(308),
                     })
-            } else if path.get(0).map(|s| s.as_str()) == Some("sys") {
+            } else if path.first().map(|s| s.as_str()) == Some("sys") {
                 Ok(Value::String(format!(
                     "sys_placeholder:{}",
                     path[1..].join(".")
                 )))
-            } else if path.get(0).map(|s| s.as_str()) == Some("runtime") {
+            } else if path.first().map(|s| s.as_str()) == Some("runtime") {
                 Ok(Value::String(format!(
                     "runtime_placeholder:{}",
                     path[1..].join(".")
                 )))
-            } else if path.get(0).map(|s| s.as_str()) == Some("var") {
+            } else if path.first().map(|s| s.as_str()) == Some("var") {
                 resolve_var_reference(path, parser, main_doc)
             } else if let Some(resolved) = parser.resolve_reference(path, main_doc) {
                 resolve_value_recursively(resolved, parser, main_doc)

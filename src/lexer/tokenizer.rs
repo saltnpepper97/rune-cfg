@@ -29,7 +29,7 @@ pub(super) fn next_token_with_flag(
         Some('@') => tokenize_symbol(lexer, Token::At),
         Some('r') => tokenize_regex_or_ident(lexer),
         Some('"') | Some('\'') => tokenize_string(lexer),
-        Some(c) if c.is_digit(10) => tokenize_number(lexer),
+        Some(c) if c.is_ascii_digit() => tokenize_number(lexer),
         Some(c) if c.is_alphabetic() => tokenize_identifier_or_keyword(lexer),
         Some(ch) => tokenize_unexpected_char(lexer, ch),
         None => Ok(Token::Eof),
@@ -174,7 +174,7 @@ fn tokenize_number(lexer: &mut Lexer) -> Result<Token, RuneError> {
     let mut num = String::new();
 
     while let Some(ch) = lexer.peek {
-        if ch.is_digit(10) || ch == '.' {
+        if ch.is_ascii_digit() || ch == '.' {
             num.push(ch);
             bump(lexer);
         } else {
