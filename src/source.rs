@@ -410,15 +410,37 @@ impl SourceIndex {
 
     /// The assignment on the cursor's line once its key is complete and the
     /// cursor has reached the value, which is when a value can be completed.
+    ///
+    /// A started but still unlexable value (an unclosed string, for example)
+    /// counts: the indexer stops at the first lexical error, so there is no
+    /// value token yet, but the cursor is already in value position.
     pub(crate) fn assignment_before_cursor(&self, position: Position) -> Option<&SourceEntry> {
         let offset = self.offset_at(position)?;
         let entry = self.field_on_line(position.line)?;
-        if entry.kind != SourceEntryKind::Assignment || offset < entry.key_span.end {
+        if entry.kind != SourceEntryKind::Assignment || offset <= entry.key_span.end {
             return None;
         }
 
-        entry.value_span.filter(|value| value.start <= offset)?;
-        Some(entry)
+        if entry.value_span.is_some() || self.attempted_value_after_key(entry) {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    /// True when the assignment's line has non-comment content after the key
+    /// even though no value token was produced, which is what an incomplete
+    /// buffer looks like while a value is being typed.
+    fn attempted_value_after_key(&self, entry: &SourceEntry) -> bool {
+        let line = self.lines.line_of(entry.key_span.start);
+        let Some(span) = self.lines.line_span(line) else {
+            return false;
+        };
+        let Some(rest) = self.text().get(entry.key_span.end..span.end) else {
+            return false;
+        };
+        let rest = rest.trim_start();
+        !rest.is_empty() && !rest.starts_with('#')
     }
 
     /// Object path of the innermost block open at `position`.
@@ -506,11 +528,15 @@ impl SourceIndex {
             .collect()
     }
 
-    /// Assignments whose key has no value.
+    /// Assignments whose key has no value and no started-but-incomplete value.
     pub(crate) fn missing_value_entries(&self) -> Vec<&SourceEntry> {
         self.entries
             .iter()
-            .filter(|entry| entry.kind == SourceEntryKind::Assignment && entry.value_span.is_none())
+            .filter(|entry| {
+                entry.kind == SourceEntryKind::Assignment
+                    && entry.value_span.is_none()
+                    && !self.attempted_value_after_key(entry)
+            })
             .collect()
     }
 
@@ -1133,6 +1159,27 @@ mod tests {
                 .iter()
                 .all(|entry| entry.kind != SourceEntryKind::ConditionalHeader),
             "an inline conditional is not a block"
+        );
+    }
+
+    #[test]
+    fn unclosed_value_is_value_context_not_a_missing_value() {
+        let index = SourceIndex::new("app:\n  environment \"dev\nend\n");
+
+        assert!(
+            index.missing_value_entries().is_empty(),
+            "an unclosed string is an incomplete value, not a missing one"
+        );
+        assert_eq!(
+            index
+                .assignment_before_cursor(position(1, 16))
+                .and_then(|entry| entry.name.clone()),
+            Some("environment".into()),
+            "a cursor inside the unclosed value must still see the assignment"
+        );
+        assert!(
+            index.assignment_before_cursor(position(1, 12)).is_none(),
+            "a cursor still on the key is not value context"
         );
     }
 

@@ -2187,6 +2187,34 @@ end
         assert!(completions.iter().any(|item| item.label == "./schemas/"));
     }
 
+    /// A started but unclosed value still offers enum members. The indexer
+    /// stops at the unterminated string, so this cannot wait for a value token.
+    #[test]
+    fn enum_completion_is_offered_for_an_unclosed_value() {
+        let schema = SchemaDocument::from_str(
+            r#"
+schema app:
+  environment enum ["dev", "prod"]
+end
+"#,
+        )
+        .unwrap();
+        let source = SourceIndex::new("app:\n  environment \"dev");
+        let completions =
+            config_completion_items(Some(&schema), &source, Position::new(1, 16), None);
+
+        assert!(
+            completions
+                .iter()
+                .any(|item| item.label == "\"dev\"" || item.label.contains("dev")),
+            "typing an unclosed enum value must still offer enum members: {:?}",
+            completions
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// A field completion after `endif` still knows it is inside the object the
     /// conditional was nested in.
     #[test]
