@@ -249,3 +249,81 @@ endif
         assert_eq!(tok, Ok(expected));
     }
 }
+
+#[test]
+fn test_token_spans_cover_lexemes() {
+    let input = "app:\n  name \"Rune\" # comment\n";
+    let mut lexer = Lexer::new(input);
+
+    let mut spanned = Vec::new();
+    loop {
+        let token = lexer.next_token_spanned().expect("token");
+        let done = token.token == Token::Eof;
+        spanned.push(token);
+        if done {
+            break;
+        }
+    }
+
+    let spans: Vec<(Token, Span)> = spanned
+        .into_iter()
+        .map(|token| (token.token, token.span))
+        .collect();
+
+    assert_eq!(spans[0], (Token::Ident("app".into()), Span::new(0, 3)));
+    assert_eq!(spans[1], (Token::Colon, Span::new(3, 4)));
+    assert_eq!(spans[2], (Token::Newline, Span::new(4, 5)));
+    // Whitespace and comments are not part of the lexeme that follows them.
+    assert_eq!(spans[3], (Token::Ident("name".into()), Span::new(7, 11)));
+    assert_eq!(spans[4], (Token::String("Rune".into()), Span::new(12, 18)));
+    assert_eq!(spans[5], (Token::Newline, Span::new(28, 29)));
+    assert_eq!(
+        spans[6],
+        (Token::Eof, Span::new(input.len(), input.len())),
+        "end of input is an empty span at the end of the buffer"
+    );
+}
+
+#[test]
+fn test_regex_and_quoted_key_spans() {
+    let input = "\"$var.mod+r\" r\"a#b\"";
+    let mut lexer = Lexer::new(input);
+
+    let key = lexer.next_token_spanned().expect("key");
+    assert_eq!(key.token, Token::String("$var.mod+r".into()));
+    assert_eq!(&input[key.span.start..key.span.end], "\"$var.mod+r\"");
+
+    let regex = lexer.next_token_spanned().expect("regex");
+    assert_eq!(regex.token, Token::Regex("a#b".into()));
+    assert_eq!(&input[regex.span.start..regex.span.end], "r\"a#b\"");
+}
+
+/// A string closed by a quote right at the end of the buffer is closed: the
+/// final line of an editor buffer often has no trailing newline.
+#[test]
+fn test_string_closed_at_end_of_input() {
+    let mut lexer = Lexer::new("name \"x\"");
+
+    assert_eq!(
+        lexer.next_token_spanned().map(|token| token.token),
+        Ok(Token::Ident("name".into()))
+    );
+    let value = lexer.next_token_spanned().expect("a closed string");
+    assert_eq!(value.token, Token::String("x".into()));
+    assert_eq!(value.span, Span::new(5, 8));
+    assert_eq!(
+        lexer.next_token_spanned().map(|token| token.token),
+        Ok(Token::Eof)
+    );
+}
+
+#[test]
+fn test_unterminated_string_is_still_an_error() {
+    let mut lexer = Lexer::new("name \"x");
+
+    assert_eq!(lexer.next_token(), Ok(Token::Ident("name".into())));
+    match lexer.next_token() {
+        Err(RuneError::UnclosedString { .. }) => {}
+        other => panic!("expected an unclosed string, got {other:?}"),
+    }
+}

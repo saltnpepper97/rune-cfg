@@ -3,12 +3,16 @@
 
 use super::scanner::{bump, skip_whitespace_and_comments};
 use super::*;
+use crate::source::Span;
 
+/// Tokenize one token, keeping the byte span of its lexeme.
 pub(super) fn next_token_with_flag(
     lexer: &mut Lexer,
     skip_newlines: bool,
-) -> Result<Token, RuneError> {
+) -> Result<SpannedToken, RuneError> {
     skip_whitespace_and_comments(lexer, skip_newlines);
+    // A token starts after the whitespace and comments skipped above.
+    let start = lexer.offset();
 
     let token = match lexer.peek {
         Some('\n') => tokenize_newline(lexer),
@@ -31,7 +35,10 @@ pub(super) fn next_token_with_flag(
         None => Ok(Token::Eof),
     };
 
-    token
+    token.map(|token| SpannedToken {
+        token,
+        span: Span::new(start, lexer.offset()),
+    })
 }
 
 fn tokenize_newline(lexer: &mut Lexer) -> Result<Token, RuneError> {
@@ -107,10 +114,12 @@ fn tokenize_identifier_starting_with_r(lexer: &mut Lexer) -> Result<Token, RuneE
 fn tokenize_string(lexer: &mut Lexer) -> Result<Token, RuneError> {
     let quote = bump(lexer).unwrap();
     let mut content = String::new();
+    let mut closed = false;
 
     while let Some(ch) = lexer.peek {
         if ch == quote {
             bump(lexer); // consume the closing quote
+            closed = true;
             break;
         }
 
@@ -145,8 +154,10 @@ fn tokenize_string(lexer: &mut Lexer) -> Result<Token, RuneError> {
         }
     }
 
-    // Check if string was properly closed
-    if lexer.peek.is_none() && !content.ends_with(quote) {
+    // A string is closed exactly when its closing quote was consumed. Reading
+    // a quote at the very end of the input still closes it, which is what an
+    // editor buffer whose last line has no trailing newline looks like.
+    if !closed {
         return Err(RuneError::UnclosedString {
             quote,
             line: lexer.line,

@@ -157,6 +157,7 @@ pub mod lsp;
 pub mod parser;
 pub mod resolver;
 pub mod schema;
+mod source;
 pub mod utils;
 
 pub use ast::{Document, Value};

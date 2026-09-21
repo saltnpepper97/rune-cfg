@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result as LspResult;
@@ -22,12 +23,18 @@ use tower_lsp::lsp_types::{
 use tower_lsp::{Client, LanguageServer};
 
 use crate::diagnostic::{DiagnosticSeverity, RuneDiagnostic};
+use crate::source::{
+    LineIndex, SourceEntry, SourceEntryKind, SourceIndex, Span, starts_with_schema_block,
+};
 use crate::{RuneConfig, RuneError, SchemaDocument, SchemaField, SchemaType};
 
+/// An open buffer together with the structural index built from its latest
+/// text, so each request re-uses one tokenization instead of re-deriving the
+/// document layout from raw lines.
 #[derive(Debug, Clone)]
 struct OpenDocument {
-    text: String,
     version: i32,
+    source: Arc<SourceIndex>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +75,7 @@ impl RuneLanguageServer {
                 continue;
             }
 
-            let diagnostics = self.diagnostics_for_document(&uri, &document.text).await;
+            let diagnostics = self.diagnostics_for_document(&uri, &document.source).await;
             self.client
                 .publish_diagnostics(uri, diagnostics, Some(document.version))
                 .await;
@@ -78,15 +85,16 @@ impl RuneLanguageServer {
     async fn diagnostics_for_document(
         &self,
         uri: &Url,
-        text: &str,
+        source: &SourceIndex,
     ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+        let text = source.text();
         let rune_diagnostics = if is_schema_document(uri, text) {
             match SchemaDocument::from_str(text) {
                 Ok(_) => Vec::new(),
-                Err(error) => vec![diagnostic_from_error(error)],
+                Err(error) => vec![diagnostic_from_error(error, source.lines())],
             }
         } else {
-            self.config_diagnostics(uri, text).await
+            self.config_diagnostics(uri, source).await
         };
 
         rune_diagnostics
@@ -95,18 +103,19 @@ impl RuneLanguageServer {
             .collect()
     }
 
-    async fn config_diagnostics(&self, uri: &Url, text: &str) -> Vec<RuneDiagnostic> {
+    async fn config_diagnostics(&self, uri: &Url, source: &SourceIndex) -> Vec<RuneDiagnostic> {
+        let text = source.text();
         let config = match RuneConfig::from_str(text) {
             Ok(config) => config,
             Err(error) => {
-                let mut diagnostics = vec![diagnostic_from_error(error)];
-                diagnostics.extend(recovery_diagnostics(text));
+                let mut diagnostics = vec![diagnostic_from_error(error, source.lines())];
+                diagnostics.extend(recovery_diagnostics(source));
                 dedupe_diagnostics(&mut diagnostics);
                 return diagnostics;
             }
         };
 
-        let schema_text = match self.schema_text_for_document(uri, text).await {
+        let schema_text = match self.schema_text_for_document(uri, source).await {
             Ok(Some(schema_text)) => schema_text,
             Ok(None) => return Vec::new(),
             Err(diagnostic) => return vec![diagnostic],
@@ -114,15 +123,15 @@ impl RuneLanguageServer {
 
         let schema = match SchemaDocument::from_str(&schema_text) {
             Ok(schema) => schema,
-            Err(error) => return vec![diagnostic_from_error(error)],
+            Err(error) => return vec![diagnostic_from_error(error, source.lines())],
         };
 
         config.validate_schema(&schema)
     }
 
     async fn schema_text_for(&self, uri: &Url) -> Option<String> {
-        let text = self.document_text_for(uri).await?;
-        self.schema_text_for_document(uri, &text)
+        let source = self.document_source_for(uri).await?;
+        self.schema_text_for_document(uri, &source)
             .await
             .ok()
             .flatten()
@@ -131,9 +140,9 @@ impl RuneLanguageServer {
     async fn schema_text_for_document(
         &self,
         uri: &Url,
-        text: &str,
+        source: &SourceIndex,
     ) -> Result<Option<String>, RuneDiagnostic> {
-        if let Some(directive) = schema_directive(text) {
+        if let Some(directive) = schema_directive(source) {
             let schema_uri = self.resolve_schema_directive_uri(uri, &directive).await?;
             return self
                 .schema_text_for_uri(&schema_uri)
@@ -151,7 +160,7 @@ impl RuneLanguageServer {
 
     async fn schema_text_for_uri(&self, schema_uri: &Url) -> Option<String> {
         if let Some(document) = self.documents.read().await.get(&schema_uri) {
-            return Some(document.text.clone());
+            return Some(document.source.text().to_string());
         }
 
         let path = schema_uri.to_file_path().ok()?;
@@ -190,8 +199,8 @@ impl RuneLanguageServer {
     /// Resolve the schema file URI backing a config document, following an
     /// explicit `@schema` directive when present and otherwise discovering
     /// `schema.rune` upward from the config directory.
-    async fn schema_uri_for_document(&self, uri: &Url, text: &str) -> Option<Url> {
-        if let Some(directive) = schema_directive(text) {
+    async fn schema_uri_for_document(&self, uri: &Url, source: &SourceIndex) -> Option<Url> {
+        if let Some(directive) = schema_directive(source) {
             return self
                 .resolve_schema_directive_uri(uri, &directive)
                 .await
@@ -207,17 +216,17 @@ impl RuneLanguageServer {
     async fn rename_target(
         &self,
         uri: &Url,
-        text: &str,
+        source: &SourceIndex,
         position: Position,
     ) -> Option<(Vec<String>, Option<Url>)> {
-        if is_schema_document(uri, text) {
-            let schema = SchemaDocument::from_str(text).ok()?;
+        if is_schema_document(uri, source.text()) {
+            let schema = SchemaDocument::from_str(source.text()).ok()?;
             let path = schema_path_at_position(&schema, position)?;
             return Some((path, Some(uri.clone())));
         }
 
-        let path = path_at_position(text, position)?;
-        let schema_uri = self.schema_uri_for_document(uri, text).await;
+        let path = source.field_on_line(position.line)?.path.clone();
+        let schema_uri = self.schema_uri_for_document(uri, source).await;
         Some((path, schema_uri))
     }
 
@@ -245,13 +254,13 @@ impl RuneLanguageServer {
             if uri == *schema_uri || is_schema_file(&uri) || !is_rune_file(&uri) {
                 continue;
             }
-            let Some(text) = self.document_text_for(&uri).await else {
+            let Some(source) = self.document_source_for(&uri).await else {
                 continue;
             };
-            if looks_like_schema_text(&text) {
+            if looks_like_schema_text(source.text()) {
                 continue;
             }
-            if self.schema_uri_for_document(&uri, &text).await.as_ref() == Some(schema_uri) {
+            if self.schema_uri_for_document(&uri, &source).await.as_ref() == Some(schema_uri) {
                 result.push(uri);
             }
         }
@@ -271,14 +280,14 @@ impl RuneLanguageServer {
             let name = path.last().map(String::as_str).unwrap_or_default();
             occurrences.push(Occurrence {
                 uri: schema_uri.clone(),
-                range: identifier_range(&schema_text, line, name),
+                range: identifier_range(&LineIndex::new(&schema_text), line, name),
                 is_declaration: true,
             });
         }
 
         for config_uri in self.related_config_uris(schema_uri).await {
-            if let Some(text) = self.document_text_for(&config_uri).await {
-                for range in references_in_document(&text, path) {
+            if let Some(source) = self.document_source_for(&config_uri).await {
+                for range in references_in_document(&source, path) {
                     occurrences.push(Occurrence {
                         uri: config_uri.clone(),
                         range,
@@ -291,13 +300,21 @@ impl RuneLanguageServer {
         occurrences
     }
 
-    async fn document_text_for(&self, uri: &Url) -> Option<String> {
+    async fn document_source_for(&self, uri: &Url) -> Option<Arc<SourceIndex>> {
         if let Some(document) = self.documents.read().await.get(uri) {
-            return Some(document.text.clone());
+            return Some(Arc::clone(&document.source));
         }
 
         let path = uri.to_file_path().ok()?;
-        std::fs::read_to_string(path).ok()
+        let text = std::fs::read_to_string(path).ok()?;
+        Some(Arc::new(SourceIndex::new(&text)))
+    }
+
+    /// Text of a document, whether or not it is open in the editor.
+    async fn document_text_for(&self, uri: &Url) -> Option<String> {
+        self.document_source_for(uri)
+            .await
+            .map(|source| source.text().to_string())
     }
 
     async fn schema_uri_for(&self, uri: &Url) -> Option<Url> {
@@ -340,8 +357,12 @@ impl RuneLanguageServer {
         self.documents.read().await.contains_key(&uri)
     }
 
-    async fn schema_source_label_for_document(&self, uri: &Url, text: &str) -> Option<String> {
-        if let Some(directive) = schema_directive(text) {
+    async fn schema_source_label_for_document(
+        &self,
+        uri: &Url,
+        source: &SourceIndex,
+    ) -> Option<String> {
+        if let Some(directive) = schema_directive(source) {
             return Some(format!("@schema \"{}\"", directive.reference));
         }
 
@@ -400,11 +421,11 @@ impl LanguageServer for RuneLanguageServer {
     async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        let Some(text) = self.document_text_for(&uri).await else {
+        let Some(source) = self.document_source_for(&uri).await else {
             return Ok(None);
         };
 
-        let items = if is_schema_document(&uri, &text) {
+        let items = if is_schema_document(&uri, source.text()) {
             schema_completion_items()
         } else {
             let schema = self.schema_for(&uri).await;
@@ -412,7 +433,7 @@ impl LanguageServer for RuneLanguageServer {
                 .to_file_path()
                 .ok()
                 .and_then(|path| path.parent().map(Path::to_path_buf));
-            config_completion_items(schema.as_ref(), &text, position, config_dir.as_deref())
+            config_completion_items(schema.as_ref(), &source, position, config_dir.as_deref())
         };
 
         Ok(Some(CompletionResponse::Array(items)))
@@ -420,10 +441,10 @@ impl LanguageServer for RuneLanguageServer {
 
     async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
-        let Some(text) = self.document_text_for(&uri).await else {
+        let Some(source) = self.document_source_for(&uri).await else {
             return Ok(None);
         };
-        if is_schema_document(&uri, &text) {
+        if is_schema_document(&uri, source.text()) {
             return Ok(None);
         }
 
@@ -431,13 +452,16 @@ impl LanguageServer for RuneLanguageServer {
         let Some(schema) = self.schema_for(&uri).await else {
             return Ok(None);
         };
-        let Some(path) = path_at_position(&text, position) else {
+        let Some(path) = source
+            .field_on_line(position.line)
+            .map(|entry| entry.path.clone())
+        else {
             return Ok(None);
         };
         let Some(field) = find_field_by_path(&schema, &path) else {
             return Ok(None);
         };
-        let schema_source = self.schema_source_label_for_document(&uri, &text).await;
+        let schema_source = self.schema_source_label_for_document(&uri, &source).await;
 
         Ok(Some(Hover {
             contents: HoverContents::Scalar(MarkedString::String(field_hover(
@@ -454,19 +478,19 @@ impl LanguageServer for RuneLanguageServer {
         params: DocumentSymbolParams,
     ) -> LspResult<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
-        let Some(text) = self.document_text_for(&uri).await else {
+        let Some(source) = self.document_source_for(&uri).await else {
             return Ok(None);
         };
 
         Ok(Some(DocumentSymbolResponse::Nested(document_symbols(
-            &text,
+            &source,
         ))))
     }
 
     async fn code_action(&self, params: CodeActionParams) -> LspResult<Option<CodeActionResponse>> {
         let uri = params.text_document.uri;
         let mut actions = Vec::new();
-        let text = self.document_text_for(&uri).await.unwrap_or_default();
+        let source = self.document_source_for(&uri).await;
         let schema = self.schema_for(&uri).await;
 
         for diagnostic in params.context.diagnostics {
@@ -488,7 +512,7 @@ impl LanguageServer for RuneLanguageServer {
             }
 
             if let Some((path, values)) = enum_values_from_message(&diagnostic.message) {
-                if let Some(range) = value_range_for_path(&text, &path) {
+                if let Some(range) = value_range_for_path(source.as_deref(), &path) {
                     for (index, value) in values.iter().enumerate() {
                         actions.push(text_edit_action(
                             uri.clone(),
@@ -505,8 +529,11 @@ impl LanguageServer for RuneLanguageServer {
                 continue;
             }
 
-            if let Some((path, replacement)) = type_fix_from_message(&text, &diagnostic.message) {
-                if let Some(range) = value_range_for_path(&text, &path) {
+            if let Some((path, replacement)) = source
+                .as_deref()
+                .and_then(|source| type_fix_from_message(source, &diagnostic.message))
+            {
+                if let Some(range) = value_range_for_path(source.as_deref(), &path) {
                     actions.push(text_edit_action(
                         uri.clone(),
                         replacement.title,
@@ -527,10 +554,10 @@ impl LanguageServer for RuneLanguageServer {
             ) {
                 let mut path = split_path(&parent_path);
                 path.push(field_name.clone());
-                if let (Some(field), Some(insert)) = (
-                    find_field_by_path(schema, &path),
-                    insert_position_for_object(&text, &split_path(&parent_path)),
-                ) {
+                let insert = source.as_deref().and_then(|source| {
+                    insert_position_for_object(source, &split_path(&parent_path))
+                });
+                if let (Some(field), Some(insert)) = (find_field_by_path(schema, &path), insert) {
                     actions.push(text_edit_action(
                         uri.clone(),
                         format!("Insert missing field '{}'", field_name),
@@ -612,21 +639,22 @@ impl LanguageServer for RuneLanguageServer {
         params: GotoDefinitionParams,
     ) -> LspResult<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
-        let Some(text) = self.document_text_for(&uri).await else {
+        let Some(source) = self.document_source_for(&uri).await else {
             return Ok(None);
         };
-        if is_schema_document(&uri, &text) {
+        let text = source.text();
+        if is_schema_document(&uri, text) {
             return Ok(None);
         }
 
         let position = params.text_document_position_params.position;
 
         // A `@schema "..."` directive jumps to the top of the schema file.
-        if schema_directive(&text)
+        if schema_directive(&source)
             .is_some_and(|directive| directive.line == position.line as usize + 1)
         {
             return Ok(self
-                .schema_uri_for_document(&uri, &text)
+                .schema_uri_for_document(&uri, &source)
                 .await
                 .map(|schema_uri| {
                     GotoDefinitionResponse::Scalar(Location {
@@ -637,7 +665,10 @@ impl LanguageServer for RuneLanguageServer {
         }
 
         // Otherwise jump from a config key to its schema field/block definition.
-        let Some(path) = path_at_position(&text, position) else {
+        let Some(path) = source
+            .field_on_line(position.line)
+            .map(|entry| entry.path.clone())
+        else {
             return Ok(None);
         };
         let Some(schema_text) = self.schema_text_for(&uri).await else {
@@ -646,7 +677,7 @@ impl LanguageServer for RuneLanguageServer {
         let Ok(schema) = SchemaDocument::from_str(&schema_text) else {
             return Ok(None);
         };
-        let Some(schema_uri) = self.schema_uri_for_document(&uri, &text).await else {
+        let Some(schema_uri) = self.schema_uri_for_document(&uri, &source).await else {
             return Ok(None);
         };
         let Some(line) = definition_line_for_path(&schema, &path) else {
@@ -654,7 +685,7 @@ impl LanguageServer for RuneLanguageServer {
         };
 
         let name = path.last().map(String::as_str).unwrap_or_default();
-        let range = identifier_range(&schema_text, line, name);
+        let range = identifier_range(&LineIndex::new(&schema_text), line, name);
         Ok(Some(GotoDefinitionResponse::Scalar(Location {
             uri: schema_uri,
             range,
@@ -665,16 +696,16 @@ impl LanguageServer for RuneLanguageServer {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let include_declaration = params.context.include_declaration;
-        let Some(text) = self.document_text_for(&uri).await else {
+        let Some(source) = self.document_source_for(&uri).await else {
             return Ok(None);
         };
-        let Some((path, schema_uri)) = self.rename_target(&uri, &text, position).await else {
+        let Some((path, schema_uri)) = self.rename_target(&uri, &source, position).await else {
             return Ok(None);
         };
 
         // No schema: fall back to single-file references within this document.
         let Some(schema_uri) = schema_uri else {
-            let locations = references_in_document(&text, &path)
+            let locations = references_in_document(&source, &path)
                 .into_iter()
                 .filter(|range| include_declaration || range.start.line != position.line)
                 .map(|range| Location {
@@ -706,27 +737,21 @@ impl LanguageServer for RuneLanguageServer {
     ) -> LspResult<Option<PrepareRenameResponse>> {
         let uri = params.text_document.uri;
         let position = params.position;
-        let Some(text) = self.document_text_for(&uri).await else {
+        let Some(source) = self.document_source_for(&uri).await else {
             return Ok(None);
         };
 
-        // Inside a schema document, allow renaming a field declaration.
-        if is_schema_document(&uri, &text) {
-            let Ok(schema) = SchemaDocument::from_str(&text) else {
-                return Ok(None);
-            };
-            let Some(path) = schema_path_at_position(&schema, position) else {
-                return Ok(None);
-            };
-            let name = path.last().map(String::as_str).unwrap_or_default();
-            return Ok(Some(PrepareRenameResponse::Range(identifier_range(
-                &text,
-                position.line,
-                name,
-            ))));
+        // Inside a schema document, allow renaming a field declaration - but
+        // only when the cursor is on the exact field-name token.
+        if is_schema_document(&uri, source.text()) {
+            return Ok(
+                schema_field_name_range(source.text(), position).map(PrepareRenameResponse::Range)
+            );
         }
 
-        Ok(key_range_at_position(&text, position).map(PrepareRenameResponse::Range))
+        Ok(source
+            .field_key_at(position)
+            .map(|entry| PrepareRenameResponse::Range(source.key_range(entry))))
     }
 
     async fn rename(&self, params: RenameParams) -> LspResult<Option<WorkspaceEdit>> {
@@ -739,10 +764,10 @@ impl LanguageServer for RuneLanguageServer {
 
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        let Some(text) = self.document_text_for(&uri).await else {
+        let Some(source) = self.document_source_for(&uri).await else {
             return Ok(None);
         };
-        let Some((path, schema_uri)) = self.rename_target(&uri, &text, position).await else {
+        let Some((path, schema_uri)) = self.rename_target(&uri, &source, position).await else {
             return Ok(None);
         };
 
@@ -751,7 +776,7 @@ impl LanguageServer for RuneLanguageServer {
         match schema_uri {
             // No schema: single-file rename within this document.
             None => {
-                let edits: Vec<TextEdit> = references_in_document(&text, &path)
+                let edits: Vec<TextEdit> = references_in_document(&source, &path)
                     .into_iter()
                     .map(|range| TextEdit {
                         range,
@@ -789,15 +814,15 @@ impl LanguageServer for RuneLanguageServer {
         params: DocumentFormattingParams,
     ) -> LspResult<Option<Vec<TextEdit>>> {
         let uri = params.text_document.uri;
-        let Some(text) = self.document_text_for(&uri).await else {
+        let Some(source) = self.document_source_for(&uri).await else {
             return Ok(None);
         };
-        let Some(formatted) = format_document(&text) else {
+        let Some(formatted) = format_document(&source) else {
             return Ok(None);
         };
 
         Ok(Some(vec![TextEdit {
-            range: full_document_range(&text),
+            range: source.lines().full_range(),
             new_text: formatted,
         }]))
     }
@@ -807,8 +832,8 @@ impl LanguageServer for RuneLanguageServer {
         self.documents.write().await.insert(
             document.uri,
             OpenDocument {
-                text: document.text,
                 version: document.version,
+                source: Arc::new(SourceIndex::new(&document.text)),
             },
         );
         self.validate_all_open_documents().await;
@@ -819,8 +844,8 @@ impl LanguageServer for RuneLanguageServer {
             self.documents.write().await.insert(
                 params.text_document.uri,
                 OpenDocument {
-                    text: change.text,
                     version: params.text_document.version,
+                    source: Arc::new(SourceIndex::new(&change.text)),
                 },
             );
         }
@@ -854,35 +879,44 @@ fn is_schema_document(uri: &Url, text: &str) -> bool {
     is_schema_file(uri) || looks_like_schema_text(text)
 }
 
+/// True for `schema <name>:` documents, decided from real tokens so a
+/// commented-out or quoted `schema` never counts.
 fn looks_like_schema_text(text: &str) -> bool {
-    text.lines()
-        .map(|line| code_part(line).trim())
-        .find(|line| !line.is_empty())
-        .is_some_and(|line| line.starts_with("schema ") && line.ends_with(':'))
+    starts_with_schema_block(text)
 }
 
-fn schema_directive(text: &str) -> Option<SchemaDirective> {
-    for (index, line) in text.lines().enumerate() {
-        let code = code_part(line).trim_start();
-        let leading_whitespace = line.len().saturating_sub(line.trim_start().len());
-        let Some(after_schema) = code.strip_prefix("@schema") else {
-            continue;
-        };
+/// The first `@schema "reference"` directive: the reference plus the 1-based
+/// line and `char` column of its opening quote.
+///
+/// The directive is found through the indexed entries, so a `#` inside the
+/// quoted reference never ends the directive early.
+fn schema_directive(source: &SourceIndex) -> Option<SchemaDirective> {
+    let entry = source.entries().iter().find(|entry| {
+        entry.kind == SourceEntryKind::Metadata && entry.name.as_deref() == Some("schema")
+    })?;
 
-        let after_schema = after_schema.trim_start();
-        let quote_offset = code.find('"')?;
-        let Some(reference) = parse_quoted_string(after_schema) else {
-            continue;
-        };
+    let value_span = entry.value_span?;
+    let raw = source
+        .text()
+        .get(value_span.start..value_span.end)?
+        .trim_start();
+    let reference = parse_quoted_string(raw)?;
 
-        return Some(SchemaDirective {
-            reference,
-            line: index + 1,
-            column: leading_whitespace + quote_offset + 1,
-        });
-    }
+    let lines = source.lines();
+    let line = lines.line_of(value_span.start);
+    let line_start = lines.line_span(line)?.start;
+    let column = source
+        .text()
+        .get(line_start..value_span.start)?
+        .chars()
+        .count()
+        + 1;
 
-    None
+    Some(SchemaDirective {
+        reference,
+        line: line + 1,
+        column,
+    })
 }
 
 fn parse_quoted_string(input: &str) -> Option<String> {
@@ -1056,72 +1090,69 @@ fn schema_reference_diagnostic(
         .with_code(701)
 }
 
-fn recovery_diagnostics(text: &str) -> Vec<RuneDiagnostic> {
-    let mut diagnostics = Vec::new();
-    let mut stack: Vec<(String, usize, usize)> = Vec::new();
+/// Diagnostics for a buffer whose strict parse failed, derived from the same
+/// indexed entries the rest of the server uses.
+///
+/// The messages are the ones the server has always published: a key without a
+/// value, a closing keyword with nothing to close, and an object still open at
+/// the end of the buffer.
+fn recovery_diagnostics(source: &SourceIndex) -> Vec<RuneDiagnostic> {
+    let lines = source.lines();
+    let mut positional: Vec<(Span, RuneDiagnostic)> = Vec::new();
 
-    for (index, line) in text.lines().enumerate() {
-        let line_no = index + 1;
-        let code = code_part(line);
-        let trimmed = code.trim();
-        if trimmed.is_empty() || trimmed.starts_with("gather ") {
+    for entry in source.missing_value_entries() {
+        let name = entry.name.clone().unwrap_or_default();
+        let diagnostic = RuneDiagnostic::error(format!("Missing value for '{}'", name))
+            .with_hint("Add a value after the key");
+        positional.push((entry.key_span, diagnostic));
+    }
+
+    for closer in source.stray_closers() {
+        let keyword = closer.kind.keyword();
+        let diagnostic =
+            RuneDiagnostic::error(format!("Unexpected '{}' without open block", keyword))
+                .with_hint("Remove this closing keyword or add a matching block above");
+        positional.push((closer.span, diagnostic));
+    }
+
+    for entry in source.entries() {
+        if entry.kind != SourceEntryKind::Metadata || entry.name.as_deref() != Some("schema") {
             continue;
         }
 
-        if trimmed.starts_with("@schema") && schema_directive(line).is_none() {
-            let column = line.find("@schema").unwrap_or(0) + 1;
-            diagnostics.push(
-                RuneDiagnostic::error("Malformed @schema directive")
-                    .with_range(line_no, column, column + "@schema".len())
-                    .with_hint("Use: @schema \"name\" or @schema \"./schema.rune\""),
-            );
-            continue;
-        }
+        let reference = entry
+            .value_span
+            .and_then(|span| source.text().get(span.start..span.end))
+            .and_then(|raw| parse_quoted_string(raw.trim_start()));
 
-        if trimmed.starts_with('@') {
-            continue;
-        }
-
-        if trimmed == "end" || trimmed == "endif" {
-            if stack.pop().is_none() {
-                let column = line.find(trimmed).unwrap_or(0) + 1;
-                diagnostics.push(
-                    RuneDiagnostic::error(format!("Unexpected '{}' without open block", trimmed))
-                        .with_range(line_no, column, column + trimmed.len())
-                        .with_hint("Remove this closing keyword or add a matching block above"),
-                );
-            }
-            continue;
-        }
-
-        if let Some(name) = block_name(trimmed) {
-            let column = line.find(&name).unwrap_or(0) + 1;
-            stack.push((name, line_no, column));
-            continue;
-        }
-
-        if let Some(key) = assignment_key(trimmed) {
-            let rest = trimmed.get(key.len()..).unwrap_or_default().trim();
-            if rest.is_empty() {
-                let column = line.find(&key).unwrap_or(0) + 1;
-                diagnostics.push(
-                    RuneDiagnostic::error(format!("Missing value for '{}'", key))
-                        .with_range(line_no, column, column + key.len())
-                        .with_hint("Add a value after the key"),
-                );
-            }
+        if reference.is_none() {
+            let diagnostic = RuneDiagnostic::error("Malformed @schema directive")
+                .with_hint("Use: @schema \"name\" or @schema \"./schema.rune\"");
+            positional.push((entry.key_span, diagnostic));
         }
     }
 
-    for (name, line_no, column) in stack {
-        diagnostics.push(
+    positional.sort_by_key(|(span, _)| span.start);
+    let mut diagnostics: Vec<RuneDiagnostic> = positional
+        .into_iter()
+        .map(|(span, diagnostic)| diagnostic_at(lines, span, diagnostic))
+        .collect();
+
+    for entry in source.unclosed_objects() {
+        let name = entry.name.clone().unwrap_or_default();
+        let diagnostic =
             RuneDiagnostic::error(format!("Unclosed object block '{}'; expected 'end'", name))
-                .with_range(line_no, column, column + name.len())
-                .with_hint(format!("Add 'end' to close the '{}' block", name)),
-        );
+                .with_hint(format!("Add 'end' to close the '{}' block", name));
+        diagnostics.push(diagnostic_at(lines, entry.key_span, diagnostic));
     }
 
     diagnostics
+}
+
+/// Attach the 1-based, UTF-16 range of `span` to a diagnostic.
+fn diagnostic_at(lines: &LineIndex, span: Span, diagnostic: RuneDiagnostic) -> RuneDiagnostic {
+    let range = lines.rune_range(span);
+    diagnostic.with_range(range.start.line, range.start.column, range.end.column)
 }
 
 fn dedupe_diagnostics(diagnostics: &mut Vec<RuneDiagnostic>) {
@@ -1207,7 +1238,10 @@ struct TypeReplacement {
     new_text: String,
 }
 
-fn type_fix_from_message(text: &str, message: &str) -> Option<(Vec<String>, TypeReplacement)> {
+fn type_fix_from_message(
+    source: &SourceIndex,
+    message: &str,
+) -> Option<(Vec<String>, TypeReplacement)> {
     let path_start = message.find('\'')? + 1;
     let path_end = message[path_start..].find('\'')? + path_start;
     let path = split_path(&message[path_start..path_end]);
@@ -1218,8 +1252,8 @@ fn type_fix_from_message(text: &str, message: &str) -> Option<(Vec<String>, Type
         .next()?
         .trim();
     let got = message.split_once(" got ")?.1.lines().next()?.trim();
-    let range = value_range_for_path(text, &path)?;
-    let value = value_text_for_range(text, range)?.trim().to_string();
+    let range = value_range_for_path(Some(source), &path)?;
+    let value = source.text_in_range(range)?.trim().to_string();
 
     if matches!(expected, "int" | "float" | "number" | "bool") && got == "string" {
         let unquoted = value.trim_matches('"').trim_matches('\'').to_string();
@@ -1261,73 +1295,18 @@ struct InsertPosition {
     indent: String,
 }
 
-fn insert_position_for_object(text: &str, path: &[String]) -> Option<InsertPosition> {
-    let mut stack = Vec::<String>::new();
+fn insert_position_for_object(source: &SourceIndex, path: &[String]) -> Option<InsertPosition> {
+    let (position, indent) = source.object_body_insert(path)?;
 
-    for (index, line) in text.lines().enumerate() {
-        let trimmed = code_part(line).trim();
-        if trimmed == "end" || trimmed == "endif" {
-            stack.pop();
-            continue;
-        }
-
-        if let Some(name) = block_name(trimmed) {
-            stack.push(name);
-            if stack == path {
-                let indent = line
-                    .chars()
-                    .take_while(|ch| ch.is_whitespace())
-                    .collect::<String>()
-                    + "  ";
-                return Some(InsertPosition {
-                    position: Position::new((index + 1) as u32, 0),
-                    indent,
-                });
-            }
-        }
-    }
-
-    None
+    Some(InsertPosition { position, indent })
 }
 
-fn value_range_for_path(text: &str, path: &[String]) -> Option<Range> {
-    let field = path.last()?;
+/// Range of the value tokens of the assignment at `path`.
+fn value_range_for_path(source: Option<&SourceIndex>, path: &[String]) -> Option<Range> {
+    let source = source?;
+    let span = source.value_span_for_path(path)?;
 
-    for (index, line) in text.lines().enumerate() {
-        let Some(line_path) = path_at_position(text, Position::new(index as u32, 0)) else {
-            continue;
-        };
-        if line_path != path {
-            continue;
-        }
-
-        let key_start = line.find(field)?;
-        let after_key = key_start + field.len();
-        let value_start = line[after_key..]
-            .char_indices()
-            .find(|(_, ch)| !ch.is_whitespace())
-            .map(|(idx, _)| after_key + idx)?;
-        let value_end = line[value_start..]
-            .find('#')
-            .map(|idx| value_start + idx)
-            .unwrap_or(line.len());
-
-        return Some(Range {
-            start: Position::new(index as u32, value_start as u32),
-            end: Position::new(index as u32, value_end as u32),
-        });
-    }
-
-    None
-}
-
-fn value_text_for_range(text: &str, range: Range) -> Option<&str> {
-    if range.start.line != range.end.line {
-        return None;
-    }
-
-    let line = text.lines().nth(range.start.line as usize)?;
-    line.get(range.start.character as usize..range.end.character as usize)
+    Some(source.lines().range(span))
 }
 
 fn sample_value_for_field(field: &SchemaField) -> String {
@@ -1367,7 +1346,10 @@ fn value_literal(value: &crate::Value) -> String {
     }
 }
 
-fn diagnostic_from_error(error: RuneError) -> RuneDiagnostic {
+/// Convert a library error into a diagnostic whose columns are UTF-16 code
+/// units: the lexer and parser count columns in `char`s, so the line is needed
+/// to translate them.
+fn diagnostic_from_error(error: RuneError, lines: &LineIndex) -> RuneDiagnostic {
     match error {
         RuneError::SyntaxError {
             message,
@@ -1396,14 +1378,20 @@ fn diagnostic_from_error(error: RuneError) -> RuneDiagnostic {
             column,
             hint,
             code,
-        } => diagnostic_with_location(message, line, column, hint, code),
+        } => diagnostic_with_location(message, line, lines.utf16_column(line, column), hint, code),
         RuneError::UnclosedString {
             quote: _,
             line,
             column,
             hint,
             code,
-        } => diagnostic_with_location("Unclosed string literal", line, column, hint, code),
+        } => diagnostic_with_location(
+            "Unclosed string literal",
+            line,
+            lines.utf16_column(line, column),
+            hint,
+            code,
+        ),
         RuneError::UnexpectedCharacter {
             character,
             line,
@@ -1413,7 +1401,7 @@ fn diagnostic_from_error(error: RuneError) -> RuneDiagnostic {
         } => diagnostic_with_location(
             format!("Unexpected character '{}'", character),
             line,
-            column,
+            lines.utf16_column(line, column),
             hint,
             code,
         ),
@@ -1423,7 +1411,7 @@ fn diagnostic_from_error(error: RuneError) -> RuneDiagnostic {
             column,
             hint,
             code,
-        } => diagnostic_with_location(message, line, column, hint, code),
+        } => diagnostic_with_location(message, line, lines.utf16_column(line, column), hint, code),
         RuneError::FileError {
             message,
             path,
@@ -1551,12 +1539,12 @@ fn schema_completion_items() -> Vec<CompletionItem> {
 
 fn config_completion_items(
     schema: Option<&SchemaDocument>,
-    text: &str,
+    source: &SourceIndex,
     position: Position,
     config_dir: Option<&Path>,
 ) -> Vec<CompletionItem> {
-    let before_cursor = line_before_cursor(text, position);
-    if is_schema_directive_context(&before_cursor) {
+    let before_cursor = source.lines().text_before(position);
+    if is_schema_directive_context(before_cursor) {
         return schema_reference_completion_items(config_dir);
     }
 
@@ -1564,31 +1552,30 @@ fn config_completion_items(
         return dollar_reference_completion_items();
     }
 
-    let stack = object_stack_before_line(text, position.line as usize);
+    let scope = source.scope_at(position);
 
-    if let (Some(schema), Some(key)) = (schema, current_key_before_cursor(&before_cursor)) {
-        let mut path = stack.clone();
-        path.push(key);
-
-        if let Some(field) = find_field_by_path(schema, &path) {
-            if let SchemaType::Enum(values) = &field.kind {
-                return values
-                    .iter()
-                    .map(|value| CompletionItem {
-                        label: format!("\"{}\"", value),
-                        kind: Some(CompletionItemKind::ENUM_MEMBER),
-                        detail: Some("enum value".into()),
-                        insert_text: Some(format!("\"{}\"", value)),
-                        ..CompletionItem::default()
-                    })
-                    .collect();
-            }
-        }
+    if let Some(schema) = schema
+        && let Some(field_path) = source
+            .assignment_before_cursor(position)
+            .map(|entry| entry.path.clone())
+        && let Some(field) = find_field_by_path(schema, &field_path)
+        && let SchemaType::Enum(values) = &field.kind
+    {
+        return values
+            .iter()
+            .map(|value| CompletionItem {
+                label: format!("\"{}\"", value),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                detail: Some("enum value".into()),
+                insert_text: Some(format!("\"{}\"", value)),
+                ..CompletionItem::default()
+            })
+            .collect();
     }
 
-    let used = used_keys_in_current_object(text, position.line as usize, &stack);
+    let used = source.used_keys_in_scope(&scope, position.line);
     let mut items = if let Some(schema) = schema {
-        schema_field_completion_items(schema, &stack, &used)
+        schema_field_completion_items(schema, &scope, &used)
     } else {
         Vec::new()
     };
@@ -1785,192 +1772,82 @@ fn fields_for_stack<'a>(schema: &'a SchemaDocument, stack: &[String]) -> Option<
     Some(fields)
 }
 
-fn path_at_position(text: &str, position: Position) -> Option<Vec<String>> {
-    let line = text.lines().nth(position.line as usize)?;
-    let trimmed = code_part(line).trim();
-    if trimmed.is_empty() || trimmed == "end" || trimmed == "endif" {
-        return None;
-    }
-
-    let mut path = object_stack_before_line(text, position.line as usize);
-    let key = block_name(trimmed).or_else(|| assignment_key(trimmed))?;
-    path.push(key);
-    Some(path)
-}
-
-fn object_stack_before_line(text: &str, line_index: usize) -> Vec<String> {
-    let mut stack = Vec::new();
-
-    for line in text.lines().take(line_index) {
-        let trimmed = code_part(line).trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if trimmed == "end" || trimmed == "endif" {
-            stack.pop();
-            continue;
-        }
-
-        if let Some(name) = block_name(trimmed) {
-            stack.push(name);
-        }
-    }
-
-    stack
-}
-
-fn used_keys_in_current_object(
-    text: &str,
-    line_index: usize,
-    target_stack: &[String],
-) -> Vec<String> {
-    let mut stack = Vec::new();
-    let mut used = Vec::new();
-
-    for line in text.lines().take(line_index) {
-        let trimmed = code_part(line).trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if trimmed == "end" || trimmed == "endif" {
-            stack.pop();
-            continue;
-        }
-
-        if stack.as_slice() == target_stack {
-            if let Some(key) = assignment_key(trimmed).or_else(|| block_name(trimmed)) {
-                if !used.contains(&key) {
-                    used.push(key);
-                }
-            }
-        }
-
-        if let Some(name) = block_name(trimmed) {
-            stack.push(name);
-        }
-    }
-
-    used
-}
-
-fn line_before_cursor(text: &str, position: Position) -> String {
-    text.lines()
-        .nth(position.line as usize)
-        .map(|line| line.chars().take(position.character as usize).collect())
-        .unwrap_or_default()
-}
-
-fn current_key_before_cursor(before_cursor: &str) -> Option<String> {
-    let trimmed = code_part(before_cursor).trim_start();
-    let key = assignment_key(trimmed)?;
-
-    let after_key = trimmed.get(key.len()..)?.trim_start();
-    (!after_key.is_empty()).then_some(key)
-}
-
-fn block_name(trimmed: &str) -> Option<String> {
-    let name = trimmed.strip_suffix(':')?.trim();
-    if name.starts_with("schema ") || !is_identifier(name) {
-        return None;
-    }
-
-    Some(name.into())
-}
-
-fn assignment_key(trimmed: &str) -> Option<String> {
-    let key = trimmed.split_whitespace().next()?;
-    if is_identifier(key) {
-        Some(key.into())
-    } else {
-        None
-    }
-}
-
+/// A bare RUNE identifier, which is what a rename may introduce.
 fn is_identifier(value: &str) -> bool {
     let mut chars = value.chars();
     matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
-fn code_part(line: &str) -> &str {
-    line.split_once('#').map(|(code, _)| code).unwrap_or(line)
-}
-
-fn document_symbols(text: &str) -> Vec<DocumentSymbol> {
-    let mut stack: Vec<String> = Vec::new();
+/// Document symbols come straight from the indexed entries: objects are
+/// containers, assignments are fields, and conditional or metadata entries are
+/// layout and therefore never symbols.
+fn document_symbols(source: &SourceIndex) -> Vec<DocumentSymbol> {
     let mut symbols = Vec::new();
 
-    for (index, line) in text.lines().enumerate() {
-        let trimmed = code_part(line).trim();
-        if trimmed.is_empty() {
-            continue;
-        }
+    for entry in source.entries() {
+        let kind = match entry.kind {
+            SourceEntryKind::Object => SymbolKind::OBJECT,
+            SourceEntryKind::Assignment => SymbolKind::FIELD,
+            _ => continue,
+        };
+        let key = source.key_range(entry);
 
-        if trimmed == "end" || trimmed == "endif" {
-            stack.pop();
-            continue;
-        }
-
-        if let Some(name) = block_name(trimmed) {
-            let mut path = stack.clone();
-            path.push(name.clone());
-            symbols.push(line_symbol(
-                path.join("."),
-                SymbolKind::OBJECT,
-                index,
-                line,
-                &name,
-            ));
-            stack.push(name);
-            continue;
-        }
-
-        if let Some(key) = assignment_key(trimmed) {
-            let mut path = stack.clone();
-            path.push(key.clone());
-            symbols.push(line_symbol(
-                path.join("."),
-                SymbolKind::FIELD,
-                index,
-                line,
-                &key,
-            ));
-        }
+        #[allow(deprecated)]
+        symbols.push(DocumentSymbol {
+            name: entry.path.join("."),
+            detail: None,
+            kind,
+            tags: None,
+            deprecated: None,
+            range: Range::new(Position::new(key.start.line, 0), key.end),
+            selection_range: key,
+            children: None,
+        });
     }
 
     symbols
 }
 
-fn line_symbol(
-    name: String,
-    kind: SymbolKind,
-    index: usize,
-    line: &str,
-    selection: &str,
-) -> DocumentSymbol {
-    let start = line.find(selection).unwrap_or(0) as u32;
-    let end = start + selection.len() as u32;
-    let line = index as u32;
-
-    #[allow(deprecated)]
-    DocumentSymbol {
-        name,
-        detail: None,
-        kind,
-        tags: None,
-        deprecated: None,
-        range: Range {
-            start: Position::new(line, 0),
-            end: Position::new(line, end),
-        },
-        selection_range: Range {
-            start: Position::new(line, start),
-            end: Position::new(line, end),
-        },
-        children: None,
+/// Range of the first token on a line that reads as `name`.
+///
+/// The token span the lexer produced wins over a raw byte search, and both are
+/// reported through [`LineIndex`], so positions are UTF-16 code units.
+fn identifier_range(lines: &LineIndex, line: u32, name: &str) -> Range {
+    if let Some(span) = lines.identifier_span_on_line(line as usize, name) {
+        return lines.range(span);
     }
+
+    // Fall back to a byte search when the line's tokens cannot be lexed, for
+    // instance because a lexeme is still unterminated.
+    let start = lines
+        .line_span(line as usize)
+        .and_then(|span| {
+            let text = lines.line_text(line as usize)?;
+            let byte = text.find(name)?;
+            Some(lines.byte_to_position(span.start + byte))
+        })
+        .unwrap_or(Position::new(line, 0));
+    let width = name.encode_utf16().count() as u32;
+
+    Range::new(start, Position::new(line, start.character + width))
+}
+
+/// Range of the schema field-name token at `position`, when the cursor is on
+/// it.
+///
+/// A schema tree resolves a field from its 1-based line, and a line also holds
+/// the field's type and options; a rename may only be offered when the cursor
+/// intersects the name token itself, which is the text it would replace.
+fn schema_field_name_range(schema_text: &str, position: Position) -> Option<Range> {
+    let schema = SchemaDocument::from_str(schema_text).ok()?;
+    let path = schema_path_at_position(&schema, position)?;
+    let name = path.last()?;
+    let lines = LineIndex::new(schema_text);
+    let span = lines.identifier_span_on_line(position.line as usize, name)?;
+    let offset = lines.position_to_byte(position)?;
+
+    span.touches(offset).then(|| lines.range(span))
 }
 
 /// Resolve a config path to the 0-based line of its schema definition.
@@ -1991,70 +1868,17 @@ fn definition_line_for_path(schema: &SchemaDocument, path: &[String]) -> Option<
     Some(line.saturating_sub(1) as u32)
 }
 
-/// Char range of the first occurrence of `name` on a given 0-based line.
+/// Every occurrence of `target_path` (key ranges) in one document.
 ///
-/// Positions use the LSP default UTF-16 encoding; RUNE identifiers are ASCII,
-/// so byte offsets and UTF-16 offsets coincide here.
-fn identifier_range(text: &str, line_index: u32, name: &str) -> Range {
-    let line = text.lines().nth(line_index as usize).unwrap_or("");
-    let start = line.find(name).unwrap_or(0) as u32;
-    let end = start + name.len() as u32;
-    Range::new(
-        Position::new(line_index, start),
-        Position::new(line_index, end),
-    )
-}
-
-/// Range of the renameable key on the cursor line, when the cursor sits on it.
-fn key_range_at_position(text: &str, position: Position) -> Option<Range> {
-    let line = text.lines().nth(position.line as usize)?;
-    let trimmed = code_part(line).trim();
-    let key = block_name(trimmed).or_else(|| assignment_key(trimmed))?;
-    let range = identifier_range(text, position.line, &key);
-
-    (position.character >= range.start.character && position.character <= range.end.character)
-        .then_some(range)
-}
-
-/// Every occurrence of `target_path` (key ranges) within a single document.
-///
-/// Walks the document tracking the block stack so same-named keys in other
-/// objects are not matched.
-fn references_in_document(text: &str, target_path: &[String]) -> Vec<Range> {
-    let mut stack: Vec<String> = Vec::new();
-    let mut ranges = Vec::new();
-
-    for (index, line) in text.lines().enumerate() {
-        let trimmed = code_part(line).trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if trimmed == "end" || trimmed == "endif" {
-            stack.pop();
-            continue;
-        }
-
-        if let Some(name) = block_name(trimmed) {
-            let mut path = stack.clone();
-            path.push(name.clone());
-            if path == target_path {
-                ranges.push(identifier_range(text, index as u32, &name));
-            }
-            stack.push(name);
-            continue;
-        }
-
-        if let Some(key) = assignment_key(trimmed) {
-            let mut path = stack.clone();
-            path.push(key.clone());
-            if path == target_path {
-                ranges.push(identifier_range(text, index as u32, &key));
-            }
-        }
-    }
-
-    ranges
+/// Paths come from the structural index, so a key nested in a conditional is
+/// matched at its enclosing object path and a same-named key in another object
+/// is not matched at all.
+fn references_in_document(source: &SourceIndex, target_path: &[String]) -> Vec<Range> {
+    source
+        .entries_with_path(target_path)
+        .into_iter()
+        .map(|entry| source.key_range(entry))
+        .collect()
 }
 
 /// Recursively collect `*.rune` files under `dir`, skipping `target/`, `.git/`,
@@ -2122,24 +1946,64 @@ fn find_schema_path_by_line(
     None
 }
 
+/// How one line takes part in the document's nesting.
+enum LineRole<'a> {
+    /// The line starts this statement.
+    Entry(&'a SourceEntry),
+    /// The line holds the `end` that closes an object, or a stray closer.
+    Closer,
+}
+
 /// Re-indent a document to two spaces per nesting level.
 ///
 /// Object and conditional blocks both open with a trailing `:` and close with
 /// `end`/`endif`; `else`/`elseif` branches dedent for their own line and indent
 /// what follows. Only leading indentation changes — trailing content (including
 /// inline comments) and blank lines are preserved, as is the final-newline state.
-fn format_document(text: &str) -> Option<String> {
+///
+/// Every line is classified through the index, so a line only affects the
+/// nesting level when it really is a block keyword.
+fn format_document(source: &SourceIndex) -> Option<String> {
+    let text = source.text();
+    let lines = source.lines();
     let mut depth: usize = 0;
     let mut out = String::new();
 
-    for line in text.lines() {
+    // One role per line: the statement it starts, or the `end` closing an
+    // object on it. The first statement on a line owns that line.
+    let mut roles: HashMap<usize, LineRole> = HashMap::new();
+    for entry in source.entries() {
+        roles
+            .entry(lines.line_of(entry.header_span.start))
+            .or_insert(LineRole::Entry(entry));
+    }
+    for entry in source.entries() {
+        if let Some(close) = entry.close_span {
+            roles
+                .entry(lines.line_of(close.start))
+                .or_insert(LineRole::Closer);
+        }
+    }
+    for closer in source.stray_closers() {
+        roles
+            .entry(lines.line_of(closer.span.start))
+            .or_insert(LineRole::Closer);
+    }
+
+    for index in 0..text.lines().count() {
+        let line = lines.line_text(index).unwrap_or("");
         if line.trim().is_empty() {
             out.push('\n');
             continue;
         }
 
-        let code = code_part(line).trim();
-        if is_block_closer(code) || is_branch_continuation(code) {
+        let entry = match roles.get(&index) {
+            Some(LineRole::Entry(entry)) => Some(*entry),
+            _ => None,
+        };
+        let closes_here = matches!(roles.get(&index), Some(LineRole::Closer));
+
+        if entry.is_some_and(|entry| entry.kind.dedents()) || closes_here {
             depth = depth.saturating_sub(1);
         }
 
@@ -2147,7 +2011,10 @@ fn format_document(text: &str) -> Option<String> {
         out.push_str(line.trim_start());
         out.push('\n');
 
-        if is_block_opener(code) || is_branch_continuation(code) {
+        let opens = entry.is_some_and(|entry| {
+            entry.kind.opens_block() || entry.kind == SourceEntryKind::ConditionalBranch
+        });
+        if opens {
             depth += 1;
         }
     }
@@ -2159,50 +2026,20 @@ fn format_document(text: &str) -> Option<String> {
     (out != text).then_some(out)
 }
 
-fn is_block_closer(code: &str) -> bool {
-    code == "end" || code == "endif"
-}
-
-fn is_branch_continuation(code: &str) -> bool {
-    let head = code.strip_suffix(':').unwrap_or(code).trim();
-    matches!(
-        head.split_whitespace().next(),
-        Some("else") | Some("elseif") | Some("else-if")
-    )
-}
-
-fn is_block_opener(code: &str) -> bool {
-    code.ends_with(':') && !is_branch_continuation(code)
-}
-
-/// Range spanning the whole document, for a full-buffer replacement edit.
-fn full_document_range(text: &str) -> Range {
-    let line_count = text.lines().count() as u32;
-    let trailing_newline = text.ends_with('\n');
-    let end = if trailing_newline {
-        Position::new(line_count, 0)
-    } else {
-        let last_len = text.lines().last().map(str::len).unwrap_or(0) as u32;
-        Position::new(line_count.saturating_sub(1), last_len)
-    };
-
-    Range::new(Position::new(0, 0), end)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn parses_schema_directive() {
-        let directive = schema_directive(
+        let directive = schema_directive(&SourceIndex::new(
             r#"
 app:
   name "RuneApp"
 end
 @schema "stasis"
 "#,
-        )
+        ))
         .unwrap();
 
         assert_eq!(directive.reference, "stasis");
@@ -2212,8 +2049,20 @@ end
 
     #[test]
     fn schema_directive_allows_path_references() {
-        let directive = schema_directive(r#"@schema "./schemas/app.rune""#).unwrap();
+        let directive =
+            schema_directive(&SourceIndex::new(r#"@schema "./schemas/app.rune""#)).unwrap();
         assert_eq!(directive.reference, "./schemas/app.rune");
+    }
+
+    /// A `#` inside the quoted reference is part of the reference, not the
+    /// start of a comment.
+    #[test]
+    fn schema_directive_keeps_comment_markers_inside_the_reference() {
+        let directive =
+            schema_directive(&SourceIndex::new("@schema \"./schemas/app#1.rune\"")).unwrap();
+
+        assert_eq!(directive.reference, "./schemas/app#1.rune");
+        assert_eq!(directive.column, 9);
     }
 
     #[test]
@@ -2263,14 +2112,14 @@ end
 
     #[test]
     fn recovery_diagnostics_find_missing_values_and_unclosed_blocks() {
-        let diagnostics = recovery_diagnostics(
+        let diagnostics = recovery_diagnostics(&SourceIndex::new(
             r#"
 app:
   name
   server:
     host "localhost"
 "#,
-        );
+        ));
 
         assert!(
             diagnostics
@@ -2302,7 +2151,7 @@ end
         .unwrap();
         let completions = config_completion_items(
             Some(&schema),
-            "app:\n  name \"RuneApp\"\n  ",
+            &SourceIndex::new("app:\n  name \"RuneApp\"\n  "),
             Position::new(2, 2),
             None,
         );
@@ -2327,17 +2176,61 @@ end
 
     #[test]
     fn schema_directive_completion_suggests_relative_paths() {
-        let completions = config_completion_items(None, "@schema \"", Position::new(0, 9), None);
+        let completions = config_completion_items(
+            None,
+            &SourceIndex::new("@schema \""),
+            Position::new(0, 9),
+            None,
+        );
 
         assert!(completions.iter().any(|item| item.label == "./schema.rune"));
         assert!(completions.iter().any(|item| item.label == "./schemas/"));
     }
 
+    /// A field completion after `endif` still knows it is inside the object the
+    /// conditional was nested in.
+    #[test]
+    fn completion_after_endif_keeps_the_enclosing_object_scope() {
+        let schema = SchemaDocument::from_str(
+            r#"
+schema app:
+  name string required
+  server:
+    port int
+  end
+  debug bool
+end
+"#,
+        )
+        .unwrap();
+        let source = SourceIndex::new("app:\n  if debug:\n    port 8080\n  endif\n  ");
+
+        let completions =
+            config_completion_items(Some(&schema), &source, Position::new(4, 2), None);
+        let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+
+        // `port` was written inside the conditional, so it counts as used at
+        // the enclosing object path... but only `server.port` belongs there;
+        // the object's own fields are the ones that must be offered.
+        assert!(labels.contains(&"name"), "expected app.name: {labels:?}");
+        assert!(labels.contains(&"debug"), "expected app.debug: {labels:?}");
+        assert!(
+            labels.contains(&"server"),
+            "expected app.server: {labels:?}"
+        );
+
+        // The conditional header never became a field of `app`.
+        assert!(!labels.contains(&"debug:"), "{labels:?}");
+    }
+
     #[test]
     fn type_fix_removes_quotes_for_numeric_values() {
         let text = "app:\n  port \"8080\"\nend\n";
-        let (path, replacement) =
-            type_fix_from_message(text, "'app.port' expected int, got string").unwrap();
+        let (path, replacement) = type_fix_from_message(
+            &SourceIndex::new(text),
+            "'app.port' expected int, got string",
+        )
+        .unwrap();
 
         assert_eq!(path, vec!["app", "port"]);
         assert_eq!(replacement.new_text, "8080");
@@ -2346,8 +2239,11 @@ end
     #[test]
     fn type_fix_handles_nested_numeric_values() {
         let text = "app:\n  server:\n    port \"8080\"\n  end\nend\n";
-        let (path, replacement) =
-            type_fix_from_message(text, "'app.server.port' expected int, got string").unwrap();
+        let (path, replacement) = type_fix_from_message(
+            &SourceIndex::new(text),
+            "'app.server.port' expected int, got string",
+        )
+        .unwrap();
 
         assert_eq!(path, vec!["app", "server", "port"]);
         assert_eq!(replacement.new_text, "8080");
@@ -2357,7 +2253,7 @@ end
     fn type_fix_handles_lsp_diagnostic_hint_text() {
         let text = "app:\n  name \"RuneApp\"\n  environment \"prod\"\n\n  server:\n    host \"localhost\"\n    port \"8080\"\n  end\n\n  plugins [\"auth\", 42]\nend\n";
         let (_, replacement) = type_fix_from_message(
-            text,
+            &SourceIndex::new(text),
             "'app.server.port' expected int, got string\nHint: Check around: port \"8080\"",
         )
         .unwrap();
@@ -2369,7 +2265,10 @@ end
     #[test]
     fn references_find_all_uses_of_a_scoped_path() {
         let text = "app:\n  server:\n    port 8080\n  end\n  port 9090\nend\n";
-        let ranges = references_in_document(&text, &["app".into(), "server".into(), "port".into()]);
+        let ranges = references_in_document(
+            &SourceIndex::new(text),
+            &["app".into(), "server".into(), "port".into()],
+        );
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].start.line, 2);
@@ -2380,7 +2279,8 @@ end
     #[test]
     fn references_locate_the_key_identifier_range() {
         let text = "app:\n  name \"RuneApp\"\nend\n";
-        let ranges = references_in_document(&text, &["app".into(), "name".into()]);
+        let ranges =
+            references_in_document(&SourceIndex::new(text), &["app".into(), "name".into()]);
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].start, Position::new(1, 2));
@@ -2406,7 +2306,8 @@ end
     #[test]
     fn format_document_reindents_nested_blocks_and_conditionals() {
         let messy = "app:\nname \"RuneApp\"\nserver:\nport 8080\nif debug:\nlevel \"high\"\nelse:\nlevel \"low\"\nendif\nend\nend\n";
-        let formatted = format_document(messy).expect("formatting should change the text");
+        let formatted =
+            format_document(&SourceIndex::new(messy)).expect("formatting should change the text");
 
         let expected = "app:\n  name \"RuneApp\"\n  server:\n    port 8080\n    if debug:\n      level \"high\"\n    else:\n      level \"low\"\n    endif\n  end\nend\n";
         assert_eq!(formatted, expected);
@@ -2417,26 +2318,79 @@ end
         let source =
             "app:\n  name \"RuneApp\" # the app name\n\n  server:\n    port 8080\n  end\nend\n";
         // Already well-formed: no change.
-        assert_eq!(format_document(source), None);
+        assert_eq!(format_document(&SourceIndex::new(source)), None);
 
         let messy = "app:\nname \"RuneApp\" # the app name\n\nend\n";
-        let once = format_document(messy).unwrap();
+        let once = format_document(&SourceIndex::new(messy)).unwrap();
         // Formatting the result again is a no-op.
-        assert_eq!(format_document(&once), None);
+        assert_eq!(format_document(&SourceIndex::new(&once)), None);
         assert!(once.contains("# the app name"));
         assert!(once.contains("\n\n"));
     }
 
     #[test]
     fn key_range_only_matches_when_cursor_is_on_the_key() {
-        let text = "app:\n  name \"RuneApp\"\nend\n";
+        let source = SourceIndex::new("app:\n  name \"RuneApp\"\nend\n");
         // Cursor on the `name` key.
         assert_eq!(
-            key_range_at_position(&text, Position::new(1, 3)),
+            source
+                .field_key_at(Position::new(1, 3))
+                .map(|entry| source.key_range(entry)),
             Some(Range::new(Position::new(1, 2), Position::new(1, 6)))
         );
         // Cursor on the value: nothing renameable.
-        assert_eq!(key_range_at_position(&text, Position::new(1, 9)), None);
+        assert!(source.field_key_at(Position::new(1, 9)).is_none());
+    }
+
+    /// The schema rename range comes from the field-name token, never from the
+    /// line the cursor happens to be on.
+    #[test]
+    fn schema_rename_range_requires_the_field_name_token() {
+        let text = "schema app:\n  name string\nend\n";
+
+        // Inside the `string` type: no rename.
+        assert_eq!(schema_field_name_range(text, Position::new(1, 9)), None);
+        // On `name`: the exact identifier range.
+        assert_eq!(
+            schema_field_name_range(text, Position::new(1, 3)),
+            Some(Range::new(Position::new(1, 2), Position::new(1, 6)))
+        );
+        // On the `schema` keyword rather than the block name: no rename.
+        assert_eq!(schema_field_name_range(text, Position::new(0, 2)), None);
+        // On the block name itself: the block's declaration range.
+        assert_eq!(
+            schema_field_name_range(text, Position::new(0, 8)),
+            Some(Range::new(Position::new(0, 7), Position::new(0, 10)))
+        );
+    }
+
+    /// Quick-fix value ranges come from real value tokens, so a literal holding
+    /// a `#` keeps its whole span.
+    #[test]
+    fn value_range_covers_literals_containing_a_comment_marker() {
+        let source = SourceIndex::new("app:\n  name \"a#b\"\nend\n");
+        let range = value_range_for_path(Some(&source), &["app".into(), "name".into()]).unwrap();
+
+        assert_eq!(
+            range,
+            Range::new(Position::new(1, 7), Position::new(1, 12)),
+            "the value span must not stop at the `#` inside the string"
+        );
+        assert_eq!(source.text_in_range(range), Some("\"a#b\""));
+    }
+
+    /// Document symbols follow the object stack through conditionals.
+    #[test]
+    fn document_symbols_skip_conditionals_and_keep_scope() {
+        let source = SourceIndex::new(
+            "app:\n  if debug:\n    feature true\n  endif\n  name \"Rune\"\nend\n",
+        );
+        let names: Vec<String> = document_symbols(&source)
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect();
+
+        assert_eq!(names, vec!["app", "app.feature", "app.name"]);
     }
 
     #[test]

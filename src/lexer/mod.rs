@@ -2,6 +2,7 @@
 // License: MIT
 
 use crate::RuneError;
+use crate::source::Span;
 use std::str::Chars;
 
 mod scanner;
@@ -77,8 +78,22 @@ impl Token {
 pub struct Lexer<'a> {
     input: Chars<'a>,
     peek: Option<char>,
+    /// Byte offset of `peek` inside the original input; it reaches the input
+    /// length once the lexer is exhausted.
+    offset: usize,
     line: usize,
     column: usize,
+}
+
+/// A token together with the byte span of its own lexeme.
+///
+/// The span excludes the whitespace and comments the lexer skipped before the
+/// token, and covers exactly the bytes that produced it, so it can be handed to
+/// an editor as a rename/edit range or converted into an LSP position.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SpannedToken {
+    pub(crate) token: Token,
+    pub(crate) span: Span,
 }
 
 impl<'a> Lexer<'a> {
@@ -86,6 +101,7 @@ impl<'a> Lexer<'a> {
         let mut lexer = Lexer {
             input: input.chars(),
             peek: None,
+            offset: 0,
             line: 1,
             column: 0,
         };
@@ -101,13 +117,29 @@ impl<'a> Lexer<'a> {
         self.column
     }
 
+    /// Byte offset of the next unconsumed character within the lexer input.
+    pub(crate) fn offset(&self) -> usize {
+        self.offset
+    }
+
     /// Normal tokenization (newlines are significant)
     pub fn next_token(&mut self) -> Result<Token, RuneError> {
-        tokenizer::next_token_with_flag(self, false)
+        self.next_token_spanned().map(|spanned| spanned.token)
     }
 
     /// Tokenization inside arrays (newlines ignored)
     pub fn next_token_in_array(&mut self) -> Result<Token, RuneError> {
+        self.next_token_in_array_spanned()
+            .map(|spanned| spanned.token)
+    }
+
+    /// Like [`Lexer::next_token`], but keeps the token's byte span.
+    pub(crate) fn next_token_spanned(&mut self) -> Result<SpannedToken, RuneError> {
+        tokenizer::next_token_with_flag(self, false)
+    }
+
+    /// Like [`Lexer::next_token_in_array`], but keeps the token's byte span.
+    pub(crate) fn next_token_in_array_spanned(&mut self) -> Result<SpannedToken, RuneError> {
         tokenizer::next_token_with_flag(self, true)
     }
 }

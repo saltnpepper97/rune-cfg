@@ -3,7 +3,7 @@
 
 use super::*;
 
-/// Advance the character iterator and update line/column tracking
+/// Advance the character iterator and update byte/line/column tracking
 pub(super) fn bump(lexer: &mut Lexer) -> Option<char> {
     let curr = lexer.peek;
     if let Some(c) = curr {
@@ -13,6 +13,7 @@ pub(super) fn bump(lexer: &mut Lexer) -> Option<char> {
         } else {
             lexer.column += 1;
         }
+        lexer.offset += c.len_utf8();
     }
     lexer.peek = lexer.input.next();
     curr
