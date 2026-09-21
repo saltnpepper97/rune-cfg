@@ -23,7 +23,9 @@ pub(super) fn bump(lexer: &mut Lexer) -> Option<char> {
 pub(super) fn skip_whitespace_and_comments(lexer: &mut Lexer, skip_newlines: bool) {
     while let Some(c) = lexer.peek {
         match c {
-            ' ' | '\t' => {
+            ' ' | '\t' | '\r' => {
+                // Treat the carriage return in CRLF as layout; the following
+                // `\\n` remains the single significant line boundary.
                 bump(lexer);
             }
             '\n' if skip_newlines => {

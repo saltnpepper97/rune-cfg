@@ -430,6 +430,25 @@ async fn prepare_rename_returns_null_off_the_identifier() {
         }),
         "a cursor on `name` must report its exact range"
     );
+
+    // Clients are allowed to send rename directly without prepareRename. The
+    // server must still reject a cursor on the type token rather than using the
+    // declaration's line as a proxy for the field name.
+    let direct_rename = harness
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 1, "character": 9 },
+                "newName": "title",
+            }),
+        )
+        .await;
+    assert_eq!(
+        direct_rename,
+        Value::Null,
+        "direct rename must reject a cursor on the field type"
+    );
 }
 
 /// Document formatting reports the replaced range in UTF-16 code units, which

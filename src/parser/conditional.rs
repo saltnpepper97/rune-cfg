@@ -61,45 +61,9 @@ pub(super) fn parse_if_block(parser: &mut Parser) -> Result<ObjectItem, RuneErro
         }
     }
 
-    // Parse the then-branch items until `else` or `endif`
-    let then_items = parse_object_items_until(parser, StopAt::ElseOrEndIf)?;
-
-    // Optional else-branch
-    let else_items = if let Some(Token::Else) = parser.peek() {
-        parser.bump()?; // consume 'else'
-
-        // Require colon: else:
-        match parser.bump()? {
-            Token::Colon => {}
-            other => {
-                return Err(RuneError::SyntaxError {
-                    message: format!("Expected ':' after else, got {:?}", other),
-                    line: parser.line(),
-                    column: parser.column(),
-                    hint: Some("Use: else:".into()),
-                    code: Some(214),
-                });
-            }
-        }
-
-        Some(parse_object_items_until(parser, StopAt::EndIfOnly)?)
-    } else {
-        None
-    };
-
-    // Must close with `endif`
-    match parser.bump()? {
-        Token::EndIf => {}
-        other => {
-            return Err(RuneError::SyntaxError {
-                message: format!("Expected 'endif', got {:?}", other),
-                line: parser.line(),
-                column: parser.column(),
-                hint: Some("Close if-blocks with 'endif'".into()),
-                code: Some(214),
-            });
-        }
-    }
+    // Parse the then-branch items until `else`, `elseif`, or `endif`.
+    let then_items = parse_object_items_until(parser, StopAt::BranchOrEndIf)?;
+    let else_items = parse_conditional_tail(parser)?;
 
     Ok(ObjectItem::IfBlock(Box::new(IfBlock {
         condition,
@@ -108,9 +72,80 @@ pub(super) fn parse_if_block(parser: &mut Parser) -> Result<ObjectItem, RuneErro
     })))
 }
 
+/// Parse the optional `else`/`elseif` chain and consume its single `endif`.
+///
+/// An `elseif` is represented as an `IfBlock` nested inside the preceding
+/// block's `else_items`. This keeps the public AST stable while making chained
+/// branches evaluate in the same order as the source language.
+fn parse_conditional_tail(parser: &mut Parser) -> Result<Option<Vec<ObjectItem>>, RuneError> {
+    match parser.peek() {
+        Some(Token::Else) => {
+            parser.bump()?;
+            match parser.bump()? {
+                Token::Colon => {}
+                other => {
+                    return Err(RuneError::SyntaxError {
+                        message: format!("Expected ':' after else, got {:?}", other),
+                        line: parser.line(),
+                        column: parser.column(),
+                        hint: Some("Use: else:".into()),
+                        code: Some(214),
+                    });
+                }
+            }
+
+            let items = parse_object_items_until(parser, StopAt::EndIfOnly)?;
+            expect_endif(parser)?;
+            Ok(Some(items))
+        }
+        Some(Token::ElseIf) => {
+            parser.bump()?;
+            let condition = parse_condition(parser)?;
+            match parser.bump()? {
+                Token::Colon => {}
+                other => {
+                    return Err(RuneError::SyntaxError {
+                        message: format!("Expected ':' after elseif condition, got {:?}", other),
+                        line: parser.line(),
+                        column: parser.column(),
+                        hint: Some("Use: elseif condition:".into()),
+                        code: Some(214),
+                    });
+                }
+            }
+
+            let then_items = parse_object_items_until(parser, StopAt::BranchOrEndIf)?;
+            let else_items = parse_conditional_tail(parser)?;
+            Ok(Some(vec![ObjectItem::IfBlock(Box::new(IfBlock {
+                condition,
+                then_items,
+                else_items,
+            }))]))
+        }
+        Some(Token::EndIf) => {
+            expect_endif(parser)?;
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn expect_endif(parser: &mut Parser) -> Result<(), RuneError> {
+    match parser.bump()? {
+        Token::EndIf => Ok(()),
+        other => Err(RuneError::SyntaxError {
+            message: format!("Expected 'endif', got {:?}", other),
+            line: parser.line(),
+            column: parser.column(),
+            hint: Some("Close if-blocks with 'endif'".into()),
+            code: Some(214),
+        }),
+    }
+}
+
 #[derive(Copy, Clone)]
 enum StopAt {
-    ElseOrEndIf,
+    BranchOrEndIf,
     EndIfOnly,
 }
 
@@ -136,15 +171,15 @@ fn parse_object_items_until(
                 items.push(parse_if_block(parser)?);
             }
 
-            Token::Else => {
-                if matches!(stop, StopAt::ElseOrEndIf) {
+            Token::Else | Token::ElseIf => {
+                if matches!(stop, StopAt::BranchOrEndIf) {
                     break;
                 }
                 return Err(RuneError::InvalidToken {
                     token: tok.describe(),
                     line: parser.line(),
                     column: parser.column(),
-                    hint: Some("Unexpected 'else' (no matching 'if'?)".into()),
+                    hint: Some("Unexpected branch (no matching 'if'?)".into()),
                     code: Some(207),
                 });
             }

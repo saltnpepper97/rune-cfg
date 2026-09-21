@@ -337,6 +337,35 @@ end
 }
 
 #[test]
+fn test_parse_elseif_chain_and_crlf() {
+    let input = "app:\r\n  if first:\r\n    value \"first\"\r\n  elseif second:\r\n    value \"second\"\r\n  else:\r\n    value \"fallback\"\r\n  endif\r\nend\r\n";
+    let mut parser = Parser::new(input).expect("CRLF input should lex");
+    let doc = parser
+        .parse_document()
+        .expect("elseif should have parser parity with if/else");
+
+    let Value::Object(items) = &doc.items[0].1 else {
+        panic!("Expected an object");
+    };
+    let Some(ObjectItem::IfBlock(first)) = items
+        .iter()
+        .find(|item| matches!(item, ObjectItem::IfBlock(_)))
+    else {
+        panic!("Expected the conditional block");
+    };
+    let Some(else_items) = &first.else_items else {
+        panic!("Expected an elseif branch");
+    };
+    let Some(ObjectItem::IfBlock(second)) = else_items.first() else {
+        panic!("Expected elseif to become a nested conditional");
+    };
+    assert!(
+        second.else_items.is_some(),
+        "the final else branch is retained"
+    );
+}
+
+#[test]
 fn test_unclosed_top_level_object_reports_eof() {
     let input = r#"
 app:

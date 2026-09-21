@@ -221,11 +221,11 @@ impl RuneLanguageServer {
     ) -> Option<(Vec<String>, Option<Url>)> {
         if is_schema_document(uri, source.text()) {
             let schema = SchemaDocument::from_str(source.text()).ok()?;
-            let path = schema_path_at_position(&schema, position)?;
+            let path = schema_path_at_position(source.text(), &schema, position)?;
             return Some((path, Some(uri.clone())));
         }
 
-        let path = source.field_on_line(position.line)?.path.clone();
+        let path = source.field_key_at(position)?.path.clone();
         let schema_uri = self.schema_uri_for_document(uri, source).await;
         Some((path, schema_uri))
     }
@@ -275,12 +275,11 @@ impl RuneLanguageServer {
 
         if let Some(schema_text) = self.document_text_for(schema_uri).await
             && let Ok(schema) = SchemaDocument::from_str(&schema_text)
-            && let Some(line) = definition_line_for_path(&schema, path)
+            && let Some(range) = schema_definition_range(&schema_text, &schema, path)
         {
-            let name = path.last().map(String::as_str).unwrap_or_default();
             occurrences.push(Occurrence {
                 uri: schema_uri.clone(),
-                range: identifier_range(&LineIndex::new(&schema_text), line, name),
+                range,
                 is_declaration: true,
             });
         }
@@ -453,7 +452,7 @@ impl LanguageServer for RuneLanguageServer {
             return Ok(None);
         };
         let Some(path) = source
-            .field_on_line(position.line)
+            .field_key_at(position)
             .map(|entry| entry.path.clone())
         else {
             return Ok(None);
@@ -666,7 +665,7 @@ impl LanguageServer for RuneLanguageServer {
 
         // Otherwise jump from a config key to its schema field/block definition.
         let Some(path) = source
-            .field_on_line(position.line)
+            .field_key_at(position)
             .map(|entry| entry.path.clone())
         else {
             return Ok(None);
@@ -680,12 +679,9 @@ impl LanguageServer for RuneLanguageServer {
         let Some(schema_uri) = self.schema_uri_for_document(&uri, &source).await else {
             return Ok(None);
         };
-        let Some(line) = definition_line_for_path(&schema, &path) else {
+        let Some(range) = schema_definition_range(&schema_text, &schema, &path) else {
             return Ok(None);
         };
-
-        let name = path.last().map(String::as_str).unwrap_or_default();
-        let range = identifier_range(&LineIndex::new(&schema_text), line, name);
         Ok(Some(GotoDefinitionResponse::Scalar(Location {
             uri: schema_uri,
             range,
@@ -1809,45 +1805,43 @@ fn document_symbols(source: &SourceIndex) -> Vec<DocumentSymbol> {
     symbols
 }
 
-/// Range of the first token on a line that reads as `name`.
-///
-/// The token span the lexer produced wins over a raw byte search, and both are
-/// reported through [`LineIndex`], so positions are UTF-16 code units.
-fn identifier_range(lines: &LineIndex, line: u32, name: &str) -> Range {
-    if let Some(span) = lines.identifier_span_on_line(line as usize, name) {
-        return lines.range(span);
-    }
-
-    // Fall back to a byte search when the line's tokens cannot be lexed, for
-    // instance because a lexeme is still unterminated.
-    let start = lines
-        .line_span(line as usize)
-        .and_then(|span| {
-            let text = lines.line_text(line as usize)?;
-            let byte = text.find(name)?;
-            Some(lines.byte_to_position(span.start + byte))
-        })
-        .unwrap_or(Position::new(line, 0));
-    let width = name.encode_utf16().count() as u32;
-
-    Range::new(start, Position::new(line, start.character + width))
-}
-
 /// Range of the schema field-name token at `position`, when the cursor is on
-/// it.
-///
-/// A schema tree resolves a field from its 1-based line, and a line also holds
-/// the field's type and options; a rename may only be offered when the cursor
-/// intersects the name token itself, which is the text it would replace.
+/// it. Schema paths are selected from the parsed tree, but only after the
+/// cursor is proven to touch the declaration's actual name token.
 fn schema_field_name_range(schema_text: &str, position: Position) -> Option<Range> {
     let schema = SchemaDocument::from_str(schema_text).ok()?;
-    let path = schema_path_at_position(&schema, position)?;
+    let (_, span) = schema_field_at_position(schema_text, &schema, position)?;
+    Some(LineIndex::new(schema_text).range(span))
+}
+
+/// Resolve the schema declaration under a cursor without treating every token
+/// on the declaration's line as the field name. This is used by requests such
+/// as `rename` and `references`, which clients may send without first calling
+/// `prepareRename`.
+fn schema_field_at_position(
+    schema_text: &str,
+    schema: &SchemaDocument,
+    position: Position,
+) -> Option<(Vec<String>, Span)> {
+    let path = schema_path_at_line(schema, position.line)?;
     let name = path.last()?;
     let lines = LineIndex::new(schema_text);
     let span = lines.identifier_span_on_line(position.line as usize, name)?;
     let offset = lines.position_to_byte(position)?;
 
-    span.touches(offset).then(|| lines.range(span))
+    span.touches(offset).then_some((path, span))
+}
+
+fn schema_definition_range(
+    schema_text: &str,
+    schema: &SchemaDocument,
+    path: &[String],
+) -> Option<Range> {
+    let line = definition_line_for_path(schema, path)?;
+    let name = path.last()?;
+    let lines = LineIndex::new(schema_text);
+    let span = lines.identifier_span_on_line(line as usize, name)?;
+    Some(lines.range(span))
 }
 
 /// Resolve a config path to the 0-based line of its schema definition.
@@ -1905,10 +1899,11 @@ fn collect_rune_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The field path declared at `position` inside a schema file, walking the
-/// parsed schema tree by 1-based source line.
-fn schema_path_at_position(schema: &SchemaDocument, position: Position) -> Option<Vec<String>> {
-    let target_line = position.line as usize + 1;
+/// The field path declared on `position`'s line inside a schema file.
+/// This line-only helper is intentionally private to the exact-token resolver
+/// below; callers must not use it as a cursor hit test.
+fn schema_path_at_line(schema: &SchemaDocument, line: u32) -> Option<Vec<String>> {
+    let target_line = line as usize + 1;
 
     for block in &schema.blocks {
         if block.line == target_line {
@@ -1924,6 +1919,15 @@ fn schema_path_at_position(schema: &SchemaDocument, position: Position) -> Optio
     }
 
     None
+}
+
+/// Resolve a schema field only when the cursor intersects its name token.
+fn schema_path_at_position(
+    schema_text: &str,
+    schema: &SchemaDocument,
+    position: Position,
+) -> Option<Vec<String>> {
+    schema_field_at_position(schema_text, schema, position).map(|(path, _)| path)
 }
 
 fn find_schema_path_by_line(
@@ -2422,24 +2426,25 @@ end
     }
 
     #[test]
-    fn schema_path_resolves_block_and_nested_field_by_line() {
-        let schema = SchemaDocument::from_str(
-            "schema app:\n  name string required\n  server:\n    port int\n  end\nend\n",
-        )
-        .unwrap();
+    fn schema_path_requires_the_declaration_name_token() {
+        let text = "schema app:\n  name string required\n  server:\n    port int\n  end\nend\n";
+        let schema = SchemaDocument::from_str(text).unwrap();
 
         // Cursor on `schema app:` (0-based line 0) -> the block path.
         assert_eq!(
-            schema_path_at_position(&schema, Position::new(0, 9)),
+            schema_path_at_position(text, &schema, Position::new(0, 9)),
             Some(vec!["app".into()])
         );
         // Cursor on `port int` (0-based line 3) -> the nested field path.
         assert_eq!(
-            schema_path_at_position(&schema, Position::new(3, 4)),
+            schema_path_at_position(text, &schema, Position::new(3, 4)),
             Some(vec!["app".into(), "server".into(), "port".into()])
         );
         // A blank/unrelated line resolves to nothing.
-        assert_eq!(schema_path_at_position(&schema, Position::new(5, 0)), None);
+        assert_eq!(
+            schema_path_at_position(text, &schema, Position::new(5, 0)),
+            None
+        );
     }
 
     #[test]

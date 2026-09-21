@@ -318,6 +318,24 @@ fn test_string_closed_at_end_of_input() {
 }
 
 #[test]
+fn test_crlf_is_layout_and_preserves_line_tokens() {
+    let mut lexer = Lexer::new("app:\r\n  name \"Rune\"\r\n");
+    let expected = [
+        Token::Ident("app".into()),
+        Token::Colon,
+        Token::Newline,
+        Token::Ident("name".into()),
+        Token::String("Rune".into()),
+        Token::Newline,
+        Token::Eof,
+    ];
+
+    for expected in expected {
+        assert_eq!(lexer.next_token(), Ok(expected));
+    }
+}
+
+#[test]
 fn test_unterminated_string_is_still_an_error() {
     let mut lexer = Lexer::new("name \"x");
 

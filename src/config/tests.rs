@@ -859,6 +859,29 @@ end
     assert!(diagnostics[0].message.contains("between 1 and 65535"));
 }
 
+#[test]
+fn test_config_elseif_selects_first_matching_branch() {
+    let config = RuneConfig::from_str(
+        r#"
+first false
+second true
+app:
+  if first = true:
+    value "first"
+  elseif second = true:
+    value "second"
+  else:
+    value "fallback"
+  endif
+end
+"#,
+    )
+    .expect("elseif config should parse");
+
+    let value: String = config.get("app.value").expect("selected branch value");
+    assert_eq!(value, "second");
+}
+
 // ===== Resolution Memoization Tests =====
 
 #[test]
