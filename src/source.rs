@@ -411,6 +411,9 @@ impl SourceIndex {
 
     /// True when `offset` lies after the opening quote of a still-open string
     /// value on the directive's own line.
+    ///
+    /// A `#` starts a comment, so only a quote before any comment marker can
+    /// open the value: a quote inside a trailing comment is comment text.
     fn after_open_quote(&self, entry: &SourceEntry, offset: usize) -> bool {
         let line = self.lines.line_of(entry.key_span.start);
         let Some(span) = self.lines.line_span(line) else {
@@ -423,8 +426,14 @@ impl SourceIndex {
         let Some(rest) = self.text().get(entry.key_span.end..span.end) else {
             return false;
         };
-        rest.find('"')
-            .is_some_and(|quote| offset > entry.key_span.end + quote)
+        let Some(quote) = rest.find('"') else {
+            return false;
+        };
+        if rest.find('#').is_some_and(|comment| comment < quote) {
+            return false;
+        }
+
+        offset > entry.key_span.end + quote
     }
 
     /// True when the cursor touches a `$...` reference run: a `Dollar` token
@@ -1099,6 +1108,24 @@ mod tests {
             Range::new(position(0, 0), position(1, 8))
         );
         assert_eq!(index.indent(1), "");
+    }
+
+    /// A `#` starts a comment, so a quote inside a trailing comment is not the
+    /// opening quote of a still-open metadata value; a `#` after the opening
+    /// quote is string content and does not end the value context.
+    #[test]
+    fn metadata_string_context_only_follows_a_real_opening_quote() {
+        let index = SourceIndex::new("@schema # say \"hi\"");
+        assert!(
+            !index.metadata_string_context("schema", position(0, 15)),
+            "a quote inside a comment is not a value being typed"
+        );
+
+        let index = SourceIndex::new("@schema \"fo#o");
+        assert!(
+            index.metadata_string_context("schema", position(0, 12)),
+            "a `#` after the opening quote is string content"
+        );
     }
 
     #[test]

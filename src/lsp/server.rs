@@ -1015,20 +1015,24 @@ impl LanguageServer for RuneLanguageServer {
                 }
 
                 if let Some(candidate) = sibling_candidate(&path, &new_name) {
+                    // The schema owns the name even where the rename would not
+                    // edit its declaration, so it is always checked. Every
+                    // other document is checked only where the rename would
+                    // really edit it.
+                    if self.field_exists_in(&schema_uri, true, &candidate).await {
+                        return Err(rename_collision(&path, &candidate));
+                    }
+
                     let mut checked: Vec<Url> = Vec::new();
 
                     for occurrence in &occurrences {
-                        if checked.contains(&occurrence.uri) {
+                        if occurrence.is_declaration || checked.contains(&occurrence.uri) {
                             continue;
                         }
                         checked.push(occurrence.uri.clone());
 
-                        // Only the documents a rename would really edit are
-                        // checked, and the schema is read as a schema only
-                        // where its own declaration is one of them.
-                        let is_schema = occurrence.is_declaration;
                         if self
-                            .field_exists_in(&occurrence.uri, is_schema, &candidate)
+                            .field_exists_in(&occurrence.uri, false, &candidate)
                             .await
                         {
                             return Err(rename_collision(&path, &candidate));

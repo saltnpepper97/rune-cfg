@@ -2586,6 +2586,53 @@ async fn rename_rejects_a_sibling_declared_by_the_schema() {
     );
 }
 
+/// A schema declaring only the `app.server.host` sibling: the rename target
+/// itself is undeclared, but the schema already owns the name the rename would
+/// take.
+const SCHEMA_APP_SERVER_HOST_ONLY: &str = r#"schema app:
+  server:
+    host string
+  end
+end
+"#;
+
+/// A schema-scoped rename is rejected when the schema declares the sibling
+/// even though it does not declare the key being renamed, so the schema itself
+/// would not be edited.
+#[tokio::test]
+async fn rename_rejects_a_sibling_the_schema_declares_without_the_renamed_key() {
+    let mut harness = LspHarness::start().await;
+    let schema_uri = harness.document_uri("schema.rune");
+    let config_uri = harness.document_uri("config.rune");
+
+    harness
+        .did_open(&schema_uri, SCHEMA_APP_SERVER_HOST_ONLY)
+        .await;
+    harness.did_open(&config_uri, CONFIG_APP_SERVER_PORT).await;
+    harness.discard_server_messages().await;
+
+    let error = harness
+        .request_or_error(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 2, "character": 5 },
+                "newName": "host",
+            }),
+        )
+        .await
+        .expect_err("the schema declares app.server.host, so the rename must be rejected");
+
+    assert_eq!(error["code"], json!(-32602), "{error}");
+    assert_eq!(
+        error["message"],
+        json!(
+            "Cannot rename 'app.server.port' to 'host': sibling 'app.server.host' already exists"
+        ),
+        "{error}"
+    );
+}
+
 /// A schema-scoped rename is rejected when a bound config that would be edited
 /// already has the sibling, even though the schema itself does not declare it.
 #[tokio::test]
