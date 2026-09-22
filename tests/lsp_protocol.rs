@@ -23,6 +23,7 @@
 //! unrelated to a change is never republished.
 
 use std::path::Path;
+use std::time::Duration;
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -158,6 +159,20 @@ fn symbol_names(result: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Writes a file into a workspace root, creating any parent directories.
+///
+/// This is free-standing so a fixture can be written *before* `initialize`,
+/// from the closure that builds the `initialize` params: the server indexes
+/// the workspace once it knows the folders and the exclusions, and a file that
+/// exists at that point is a workspace member from the start.
+fn write_workspace_fixture(root: &Path, relative: &str, text: &str) {
+    let path = root.join(relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create parent directory");
+    }
+    std::fs::write(path, text).expect("write file");
+}
+
 /// A `rune-lsp` instance driven over JSON-RPC, plus a temporary workspace root.
 struct LspHarness {
     service: LspService<RuneLanguageServer>,
@@ -271,11 +286,7 @@ impl LspHarness {
 
     /// Writes a file into the temporary workspace, creating parent directories.
     fn write_file(&self, relative: &str, text: &str) {
-        let path = self.workspace.path().join(relative);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("create parent directory");
-        }
-        std::fs::write(path, text).expect("write file");
+        write_workspace_fixture(self.workspace.path(), relative, text);
     }
 
     /// Removes a file from the temporary workspace.
@@ -2032,7 +2043,24 @@ async fn removing_a_workspace_folder_extends_schema_discovery() {
 /// folder that is bound to the same schema.
 #[tokio::test]
 async fn schema_scoped_navigation_spans_every_workspace_folder() {
+    // One schema, bound from the first folder by a relative path and from the
+    // second by its absolute path, so both configs resolve to the same schema
+    // URI and both folders have to be scanned for the answer to be complete.
+    // The fixtures exist before `initialize`, because the workspace is indexed
+    // once, at startup.
     let mut harness = LspHarness::start_with_initializer(|root| {
+        let shared_schema = root.join("one/shared.rune");
+        write_workspace_fixture(root, "one/shared.rune", SCHEMA_STRING_FIELD);
+        write_workspace_fixture(root, "one/config.rune", CONFIG_BOUND_TO_SHARED_SCHEMA);
+        write_workspace_fixture(
+            root,
+            "two/config.rune",
+            &format!(
+                "@schema \"{}\"\napp:\n  name \"Rune\"\nend\n",
+                shared_schema.display()
+            ),
+        );
+
         json!({
             "processId": Value::Null,
             "rootUri": Value::Null,
@@ -2050,20 +2078,6 @@ async fn schema_scoped_navigation_spans_every_workspace_folder() {
         })
     })
     .await;
-
-    // One schema, bound from the first folder by a relative path and from the
-    // second by its absolute path, so both configs resolve to the same schema
-    // URI and both folders have to be scanned for the answer to be complete.
-    let shared_schema = harness.workspace_path().join("one/shared.rune");
-    harness.write_file("one/shared.rune", SCHEMA_STRING_FIELD);
-    harness.write_file("one/config.rune", CONFIG_BOUND_TO_SHARED_SCHEMA);
-    harness.write_file(
-        "two/config.rune",
-        &format!(
-            "@schema \"{}\"\napp:\n  name \"Rune\"\nend\n",
-            shared_schema.display()
-        ),
-    );
 
     let schema_uri = harness.file_uri("one/shared.rune");
     let first = harness.file_uri("one/config.rune");
@@ -2331,7 +2345,12 @@ end
 /// file that only exists on disk.
 #[tokio::test]
 async fn rename_with_document_changes_reports_versions_and_sorted_documents() {
+    // The unopened disk config exists before `initialize`, so it is a
+    // workspace member from the start: only a file the scan saw, or a watcher
+    // event named, is ever a rename target.
     let mut harness = LspHarness::start_with_initializer(|root| {
+        write_workspace_fixture(root, "disk/config.rune", CONFIG_STRING_VALUE);
+
         json!({
             "processId": Value::Null,
             "rootUri": Url::from_directory_path(root).expect("workspace root uri"),
@@ -2343,10 +2362,6 @@ async fn rename_with_document_changes_reports_versions_and_sorted_documents() {
     let schema_uri = harness.document_uri("schema.rune");
     let config_uri = harness.document_uri("config.rune");
     let disk_uri = harness.file_uri("disk/config.rune");
-
-    // Only the disk config is unopened. The schema is open in memory, so the
-    // disk config binds to that buffer through discovery.
-    harness.write_file("disk/config.rune", CONFIG_STRING_VALUE);
 
     harness.did_open(&schema_uri, SCHEMA_STRING_FIELD).await;
     harness
@@ -2823,4 +2838,363 @@ async fn completion_offers_schema_references_only_inside_the_directive_value() {
         "an unterminated directive value is still the directive's value: {labels:?}"
     );
     assert!(!labels.contains(&"end".to_string()), "{labels:?}");
+}
+
+/// A symlinked directory cycle and a symlinked file that points outside the
+/// workspace are both skipped, so initialization and the request that follows
+/// it finish, the real in-workspace config is reported once, and the linked
+/// config is never a part of the workspace.
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_cycles_and_links_out_of_the_workspace_are_never_followed() {
+    let outside = tempfile::tempdir().expect("outside directory");
+    std::fs::write(outside.path().join("outside.rune"), CONFIG_STRING_VALUE)
+        .expect("write the outside config");
+
+    let mut harness = LspHarness::boot().await;
+    let root = harness.workspace_path().to_path_buf();
+    write_workspace_fixture(&root, "real/schema.rune", SCHEMA_STRING_FIELD);
+    write_workspace_fixture(&root, "real/config.rune", CONFIG_STRING_VALUE);
+
+    // A link to the workspace root and a link to the directory holding it: a
+    // scan that followed either of them would walk the same tree forever.
+    std::os::unix::fs::symlink(&root, root.join("real/up")).expect("cycle link");
+    std::os::unix::fs::symlink(root.join("real"), root.join("real/self")).expect("self link");
+    // A link to the `.rune` config outside the workspace: following it would
+    // put a second copy of that config inside the workspace.
+    std::os::unix::fs::symlink(
+        outside.path().join("outside.rune"),
+        root.join("real/outside.rune"),
+    )
+    .expect("outward link");
+
+    let root_uri = Url::from_directory_path(&root).expect("workspace root uri");
+    let schema_uri = harness.file_uri("real/schema.rune");
+    let config_uri = harness.file_uri("real/config.rune");
+    let linked_uri = harness.file_uri("real/outside.rune");
+
+    // Initialization scans the workspace, so a followed cycle would hang here.
+    let references = tokio::time::timeout(Duration::from_secs(10), async {
+        harness
+            .initialize(json!({
+                "processId": Value::Null,
+                "rootUri": root_uri,
+                "capabilities": {},
+            }))
+            .await;
+
+        harness
+            .request(
+                "textDocument/references",
+                json!({
+                    "textDocument": { "uri": config_uri },
+                    "position": { "line": 1, "character": 3 },
+                    "context": { "includeDeclaration": true },
+                }),
+            )
+            .await
+    })
+    .await
+    .expect("a symlink cycle must never be followed");
+
+    let locations = references
+        .as_array()
+        .unwrap_or_else(|| panic!("references must return locations, got {references}"));
+    assert_eq!(
+        locations.len(),
+        2,
+        "the declaration and the one real config usage: {references}"
+    );
+
+    let uris: Vec<&str> = locations
+        .iter()
+        .filter_map(|location| location["uri"].as_str())
+        .collect();
+    assert_eq!(
+        uris.iter()
+            .filter(|uri| **uri == config_uri.as_str())
+            .count(),
+        1,
+        "the real config is reported exactly once: {references}"
+    );
+    assert!(uris.contains(&schema_uri.as_str()), "{references}");
+    assert!(
+        !uris.contains(&linked_uri.as_str()),
+        "a symlinked file is not a workspace member: {references}"
+    );
+    assert!(
+        !uris.iter().any(|uri| uri.contains("outside.rune")),
+        "the linked config outside the workspace never appears: {references}"
+    );
+}
+
+/// `initializationOptions.exclude` extends the always-excluded directories: a
+/// bound config under an excluded directory is not a reference or rename
+/// target, while a normal sibling config is.
+#[tokio::test]
+async fn excluded_directories_are_not_reference_or_rename_targets() {
+    let mut harness = LspHarness::start_with_initializer(|root| {
+        write_workspace_fixture(root, "schema.rune", SCHEMA_STRING_FIELD);
+        write_workspace_fixture(root, "config.rune", CONFIG_STRING_VALUE);
+        write_workspace_fixture(root, "sibling.rune", CONFIG_STRING_VALUE);
+        write_workspace_fixture(root, "vendor/vendored.rune", CONFIG_STRING_VALUE);
+        write_workspace_fixture(root, "target/built.rune", CONFIG_STRING_VALUE);
+
+        json!({
+            "processId": Value::Null,
+            "rootUri": Url::from_directory_path(root).expect("workspace root uri"),
+            "initializationOptions": { "exclude": ["vendor"] },
+            "capabilities": {},
+        })
+    })
+    .await;
+
+    let config_uri = harness.document_uri("config.rune");
+    let schema_uri = harness.document_uri("schema.rune");
+    let sibling_uri = harness.document_uri("sibling.rune");
+    let vendored_uri = harness.file_uri("vendor/vendored.rune");
+    let built_uri = harness.file_uri("target/built.rune");
+
+    let references = harness
+        .request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 1, "character": 3 },
+                "context": { "includeDeclaration": true },
+            }),
+        )
+        .await;
+
+    let uris: Vec<&str> = references
+        .as_array()
+        .unwrap_or_else(|| panic!("references must return locations, got {references}"))
+        .iter()
+        .filter_map(|location| location["uri"].as_str())
+        .collect();
+    assert_eq!(
+        uris.len(),
+        3,
+        "the schema declaration and the two indexed configs: {references}"
+    );
+    assert!(uris.contains(&schema_uri.as_str()), "{references}");
+    assert!(uris.contains(&config_uri.as_str()), "{references}");
+    assert!(
+        uris.contains(&sibling_uri.as_str()),
+        "a normal sibling config is a target: {references}"
+    );
+    assert!(
+        !uris.contains(&vendored_uri.as_str()),
+        "a config under a client-excluded directory is not indexed: {references}"
+    );
+    assert!(
+        !uris.contains(&built_uri.as_str()),
+        "a config under `target` is not indexed: {references}"
+    );
+
+    let rename = harness
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 1, "character": 3 },
+                "newName": "title",
+            }),
+        )
+        .await;
+    let changes = rename["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("rename must return a workspace edit, got {rename}"));
+    assert_eq!(
+        changes.len(),
+        3,
+        "only the indexed documents are renamed: {rename}"
+    );
+    assert!(!changes.contains_key(vendored_uri.as_str()), "{rename}");
+    assert!(!changes.contains_key(built_uri.as_str()), "{rename}");
+}
+
+/// A create event for one file makes exactly that file visible to cross-file
+/// requests: a file written to disk without an event and without being opened
+/// stays invisible, which is what proves no second walk happened.
+#[tokio::test]
+async fn watched_creates_are_indexed_and_unreported_files_stay_invisible() {
+    let mut harness = LspHarness::start_with_initializer(|root| {
+        write_workspace_fixture(root, "schema.rune", SCHEMA_STRING_FIELD);
+        write_workspace_fixture(root, "anchor.rune", CONFIG_STRING_VALUE);
+
+        json!({
+            "processId": Value::Null,
+            "rootUri": Url::from_directory_path(root).expect("workspace root uri"),
+            "capabilities": {},
+        })
+    })
+    .await;
+
+    let anchor_uri = harness.document_uri("anchor.rune");
+    let schema_uri = harness.document_uri("schema.rune");
+    let watched_uri = harness.document_uri("watched.rune");
+    let silent_uri = harness.document_uri("silent.rune");
+
+    // Both files exist on disk, but the client only reports one of them.
+    harness.write_file("watched.rune", CONFIG_STRING_VALUE);
+    harness.write_file("silent.rune", CONFIG_STRING_VALUE);
+    harness
+        .did_change_watched_files(&[(watched_uri.clone(), 1)])
+        .await;
+    harness.discard_server_messages().await;
+
+    let references = harness
+        .request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": anchor_uri },
+                "position": { "line": 1, "character": 3 },
+                "context": { "includeDeclaration": true },
+            }),
+        )
+        .await;
+
+    let uris: Vec<&str> = references
+        .as_array()
+        .unwrap_or_else(|| panic!("references must return locations, got {references}"))
+        .iter()
+        .filter_map(|location| location["uri"].as_str())
+        .collect();
+    assert_eq!(
+        uris.len(),
+        3,
+        "the schema declaration, the anchor and the watched config: {references}"
+    );
+    assert!(uris.contains(&schema_uri.as_str()), "{references}");
+    assert!(uris.contains(&anchor_uri.as_str()), "{references}");
+    assert!(
+        uris.contains(&watched_uri.as_str()),
+        "the watched create is indexed: {references}"
+    );
+    assert!(
+        !uris.contains(&silent_uri.as_str()),
+        "a file nobody reported stays invisible: {references}"
+    );
+
+    let rename = harness
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": anchor_uri },
+                "position": { "line": 1, "character": 3 },
+                "newName": "title",
+            }),
+        )
+        .await;
+    let changes = rename["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("rename must return a workspace edit, got {rename}"));
+    assert!(changes.contains_key(watched_uri.as_str()), "{rename}");
+    assert!(
+        !changes.contains_key(silent_uri.as_str()),
+        "the unreported file is not renamed: {rename}"
+    );
+}
+
+/// A buffer whose text differs from the indexed file on disk is what the
+/// cross-file requests answer from, and a versioned rename keeps that buffer's
+/// version.
+#[tokio::test]
+async fn an_open_buffer_wins_over_the_indexed_file_on_disk() {
+    let mut harness = LspHarness::start_with_initializer(|root| {
+        write_workspace_fixture(root, "schema.rune", SCHEMA_STRING_FIELD);
+        // The disk copy writes the key once; the buffer opens with it twice.
+        write_workspace_fixture(root, "config.rune", CONFIG_STRING_VALUE);
+
+        json!({
+            "processId": Value::Null,
+            "rootUri": Url::from_directory_path(root).expect("workspace root uri"),
+            "capabilities": { "workspace": { "workspaceEdit": { "documentChanges": true } } },
+        })
+    })
+    .await;
+
+    let config_uri = harness.document_uri("config.rune");
+    let schema_uri = harness.document_uri("schema.rune");
+
+    harness.did_open(&config_uri, CONFIG_TWO_USAGES).await;
+    harness
+        .replace_document(&config_uri, 7, CONFIG_TWO_USAGES)
+        .await;
+    harness.discard_server_messages().await;
+
+    let references = harness
+        .request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 1, "character": 3 },
+                "context": { "includeDeclaration": true },
+            }),
+        )
+        .await;
+
+    let locations = references
+        .as_array()
+        .unwrap_or_else(|| panic!("references must return locations, got {references}"));
+    assert_eq!(
+        locations.len(),
+        3,
+        "the declaration plus both buffer usages: {references}"
+    );
+    let config_ranges: Vec<Value> = locations
+        .iter()
+        .filter(|location| location["uri"] == json!(config_uri.as_str()))
+        .map(|location| location["range"].clone())
+        .collect();
+    assert_eq!(
+        config_ranges,
+        vec![indented_key_range(1), indented_key_range(2)],
+        "the buffer's own two usages are the ones reported: {references}"
+    );
+
+    let rename = harness
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 1, "character": 3 },
+                "newName": "title",
+            }),
+        )
+        .await;
+    let document_changes = rename["documentChanges"]
+        .as_array()
+        .unwrap_or_else(|| panic!("rename must return documentChanges, got {rename}"));
+    let opened = document_changes
+        .iter()
+        .find(|change| change["textDocument"]["uri"] == json!(config_uri.as_str()))
+        .unwrap_or_else(|| panic!("the open buffer is edited: {rename}"));
+    assert_eq!(
+        opened["textDocument"]["version"],
+        json!(7),
+        "the open buffer's version is the one kept: {rename}"
+    );
+    assert_eq!(
+        opened["edits"],
+        json!([
+            { "range": indented_key_range(1), "newText": "title" },
+            { "range": indented_key_range(2), "newText": "title" },
+        ]),
+        "the buffer's two usages are edited: {rename}"
+    );
+    assert_eq!(
+        document_changes.len(),
+        2,
+        "the schema declaration and the open config: {rename}"
+    );
+    assert_eq!(
+        document_changes
+            .iter()
+            .find(|change| change["textDocument"]["uri"] == json!(schema_uri.as_str()))
+            .map(|change| change["textDocument"]["version"].clone()),
+        Some(Value::Null),
+        "the unopened schema carries no version: {rename}"
+    );
 }
