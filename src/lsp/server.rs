@@ -986,13 +986,21 @@ impl LanguageServer for RuneLanguageServer {
 
         for diagnostic in params.context.diagnostics {
             if diagnostic.message.contains("Unclosed object block") {
+                // The fix belongs at the end of the buffer. A diagnostic may be
+                // anchored on the block's opening key, and inserting there
+                // would put `end` before the block's own fields.
+                let insert = source
+                    .as_deref()
+                    .map(|source| source.lines().full_range().end)
+                    .unwrap_or(diagnostic.range.start);
+
                 actions.push(text_edit_action(
                     uri.clone(),
                     "Insert missing end",
                     TextEdit {
                         range: Range {
-                            start: diagnostic.range.start,
-                            end: diagnostic.range.start,
+                            start: insert,
+                            end: insert,
                         },
                         new_text: "end\n".into(),
                     },

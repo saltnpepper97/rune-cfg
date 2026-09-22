@@ -159,6 +159,64 @@ fn symbol_names(result: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The code actions the server returns for one published diagnostic, sent back
+/// the way an editor sends it in `context.diagnostics`.
+async fn code_actions_for(harness: &mut LspHarness, uri: &Url, diagnostic: &Value) -> Vec<Value> {
+    let response = harness
+        .request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": uri },
+                "range": diagnostic["range"],
+                "context": { "diagnostics": [diagnostic] },
+            }),
+        )
+        .await;
+
+    response
+        .as_array()
+        .unwrap_or_else(|| panic!("codeAction must return an action array, got {response}"))
+        .clone()
+}
+
+/// The action titled `title`, asserted to be a `quickfix` with the given
+/// preference and to edit exactly one document, and the single edit it applies
+/// to `uri`.
+fn quick_fix_edit<'a>(
+    actions: &'a [Value],
+    title: &str,
+    uri: &Url,
+    is_preferred: bool,
+) -> &'a Value {
+    let action = actions
+        .iter()
+        .find(|action| action["title"] == json!(title))
+        .unwrap_or_else(|| panic!("no code action titled {title:?}: {actions:#?}"));
+
+    assert_eq!(action["kind"], json!("quickfix"), "{action:#?}");
+    assert_eq!(action["isPreferred"], json!(is_preferred), "{action:#?}");
+
+    let changes = action["edit"]["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("the action must edit a document: {action:#?}"));
+    assert_eq!(
+        changes.len(),
+        1,
+        "the action must edit exactly one document: {action:#?}"
+    );
+
+    let edits = changes[uri.as_str()]
+        .as_array()
+        .unwrap_or_else(|| panic!("the action must edit {uri}: {action:#?}"));
+    assert_eq!(
+        edits.len(),
+        1,
+        "the action must apply exactly one edit: {action:#?}"
+    );
+
+    &edits[0]
+}
+
 /// Writes a file into a workspace root, creating any parent directories.
 ///
 /// This is free-standing so a fixture can be written *before* `initialize`,
@@ -861,6 +919,57 @@ async fn schema_scoped_navigation_resolves_indexed_field_paths() {
         locations.len(),
         2,
         "one schema declaration plus one usage: {references}"
+    );
+    assert_eq!(
+        locations
+            .iter()
+            .map(|location| json!({
+                "uri": location["uri"],
+                "range": location["range"],
+            }))
+            .collect::<Vec<Value>>(),
+        vec![
+            json!({
+                "uri": schema_uri.as_str(),
+                "range": {
+                    "start": { "line": 1, "character": 2 },
+                    "end": { "line": 1, "character": 6 },
+                },
+            }),
+            json!({
+                "uri": config_uri.as_str(),
+                "range": {
+                    "start": { "line": 1, "character": 2 },
+                    "end": { "line": 1, "character": 6 },
+                },
+            }),
+        ],
+        "the schema declaration comes first, then the config usage: {references}"
+    );
+
+    // `includeDeclaration` removes the schema declaration and nothing else: the
+    // single-file fallback keeps the cursor's own usage, and a schema-scoped
+    // request must behave the same way.
+    let references = harness
+        .request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 1, "character": 3 },
+                "context": { "includeDeclaration": false },
+            }),
+        )
+        .await;
+    assert_eq!(
+        references,
+        json!([{
+            "uri": config_uri.as_str(),
+            "range": {
+                "start": { "line": 1, "character": 2 },
+                "end": { "line": 1, "character": 6 },
+            },
+        }]),
+        "only the config usage remains without the declaration: {references}"
     );
 
     let rename = harness
@@ -3388,5 +3497,421 @@ async fn a_watched_change_never_overwrites_a_concurrently_opened_buffer() {
             .count(),
         2,
         "both usages in the open buffer are reported: {references}"
+    );
+}
+
+/// The buffer the missing-`end` case is written against: `app:` is opened, one
+/// field is written, and the block is never closed.
+const UNCLOSED_BLOCK_CONFIG: &str = "app:\n  name \"Rune\"\n";
+
+/// The same unclosed `app` block, but with a bare key inside it. The strict
+/// parse fails on the key rather than on the unclosed block, so this buffer
+/// also publishes the server's indexed recovery diagnostic, underlining the
+/// `app` key itself.
+const UNCLOSED_BLOCK_KEY_CONFIG: &str = "app:\n  name\n";
+
+/// The unclosed-block diagnostic is the one the server published, and the
+/// `Insert missing end` action appends at the end of the buffer.
+///
+/// Regression guard: the action inserted `end` at `diagnostic.range.start`, so
+/// a published diagnostic anchored on the object's opening key - line 0 for the
+/// second buffer below - received `end` before the object's own fields instead
+/// of after them.
+#[tokio::test]
+async fn syntax_diagnostic_and_missing_end_quick_fix_use_exact_ranges() {
+    // First buffer: the strict parse fails on the unclosed block itself, so the
+    // published diagnostic carries the parser's end-of-buffer anchor.
+    let mut harness = LspHarness::start().await;
+    let uri = harness.document_uri("config.rune");
+
+    harness.did_open(&uri, UNCLOSED_BLOCK_CONFIG).await;
+    let published = harness.collect_diagnostics().await;
+    let published = diagnostics_for(&published, &uri, Some(1));
+    let diagnostic =
+        diagnostic_with_message(&published.diagnostics, "Unclosed object block 'app'").clone();
+
+    assert_eq!(
+        diagnostic["range"],
+        json!({
+            "start": { "line": 2, "character": 0 },
+            "end": { "line": 2, "character": 1 },
+        }),
+        "the parser anchors an unclosed block at the end of the buffer: {diagnostic:#?}"
+    );
+
+    let actions = code_actions_for(&mut harness, &uri, &diagnostic).await;
+    let edit = quick_fix_edit(&actions, "Insert missing end", &uri, true);
+    assert_eq!(
+        edit["range"],
+        json!({
+            "start": { "line": 2, "character": 0 },
+            "end": { "line": 2, "character": 0 },
+        }),
+        "the missing `end` is appended at the end of the buffer: {edit:#?}"
+    );
+    assert_eq!(edit["newText"], json!("end\n"));
+
+    // Second buffer: the bare key makes the strict parse fail earlier, so the
+    // published unclosed-block diagnostic is the indexed recovery one, which
+    // underlines the `app` key. The same action must still append at the end of
+    // the buffer rather than at the key.
+    let mut harness = LspHarness::start().await;
+    let uri = harness.document_uri("config.rune");
+
+    harness.did_open(&uri, UNCLOSED_BLOCK_KEY_CONFIG).await;
+    let published = harness.collect_diagnostics().await;
+    let published = diagnostics_for(&published, &uri, Some(1));
+    let diagnostic =
+        diagnostic_with_message(&published.diagnostics, "Unclosed object block 'app'").clone();
+
+    assert_eq!(
+        diagnostic["range"],
+        json!({
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": 0, "character": 3 },
+        }),
+        "the indexed diagnostic underlines the `app` key: {diagnostic:#?}"
+    );
+
+    let actions = code_actions_for(&mut harness, &uri, &diagnostic).await;
+    let edit = quick_fix_edit(&actions, "Insert missing end", &uri, true);
+    assert_eq!(
+        edit["range"],
+        json!({
+            "start": { "line": 2, "character": 0 },
+            "end": { "line": 2, "character": 0 },
+        }),
+        "the fix goes at the end of the buffer, not at the diagnostic's own position: {edit:#?}"
+    );
+    assert_eq!(edit["newText"], json!("end\n"));
+}
+
+/// A schema whose four declarations each need a different quick fix: an enum
+/// value, a quoted int, an unquoted string, and a required field.
+const SCHEMA_VALIDATION_FIELDS: &str = r#"schema app:
+  mode enum ["dev", "prod"] required
+  port int required
+  title string required
+  name string required
+end
+"#;
+
+/// A config that violates every one of those declarations.
+const CONFIG_SCHEMA_VIOLATIONS: &str = r#"app:
+  mode "bad"
+  port "8080"
+  title 42
+end
+"#;
+
+/// Each published schema-validation diagnostic produces a quick fix whose edit
+/// is exact, including the value range it replaces.
+#[tokio::test]
+async fn schema_validation_quick_fixes_use_exact_workspace_edits() {
+    let mut harness = LspHarness::start().await;
+    let schema_uri = harness.document_uri("schema.rune");
+    let config_uri = harness.document_uri("config.rune");
+
+    harness
+        .did_open(&schema_uri, SCHEMA_VALIDATION_FIELDS)
+        .await;
+    harness
+        .did_open(&config_uri, CONFIG_SCHEMA_VIOLATIONS)
+        .await;
+
+    let published = harness.collect_diagnostics().await;
+    let published = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(
+        published.diagnostics.len(),
+        4,
+        "one diagnostic per violated declaration: {published:#?}"
+    );
+
+    // `  mode "bad"` is line 1: the enum fix replaces the value token, quotes
+    // included.
+    let diagnostic =
+        diagnostic_with_message(&published.diagnostics, "'app.mode' must be one of").clone();
+    let actions = code_actions_for(&mut harness, &config_uri, &diagnostic).await;
+    let enum_value = json!({
+        "start": { "line": 1, "character": 7 },
+        "end": { "line": 1, "character": 12 },
+    });
+    let edit = quick_fix_edit(&actions, "Replace with \"dev\"", &config_uri, true);
+    assert_eq!(edit["range"], enum_value, "{edit:#?}");
+    assert_eq!(edit["newText"], json!("\"dev\""));
+    let edit = quick_fix_edit(&actions, "Replace with \"prod\"", &config_uri, false);
+    assert_eq!(edit["range"], enum_value, "{edit:#?}");
+    assert_eq!(edit["newText"], json!("\"prod\""));
+
+    // `  port "8080"` is line 2: the quotes are removed and nothing else.
+    let diagnostic =
+        diagnostic_with_message(&published.diagnostics, "'app.port' expected int").clone();
+    let actions = code_actions_for(&mut harness, &config_uri, &diagnostic).await;
+    let edit = quick_fix_edit(&actions, "Remove quotes to make int", &config_uri, true);
+    assert_eq!(
+        edit["range"],
+        json!({
+            "start": { "line": 2, "character": 7 },
+            "end": { "line": 2, "character": 13 },
+        }),
+        "{edit:#?}"
+    );
+    assert_eq!(edit["newText"], json!("8080"));
+
+    // `  title 42` is line 3: the value gains the quotes around it.
+    let diagnostic =
+        diagnostic_with_message(&published.diagnostics, "'app.title' expected string").clone();
+    let actions = code_actions_for(&mut harness, &config_uri, &diagnostic).await;
+    let edit = quick_fix_edit(&actions, "Add quotes to make string", &config_uri, true);
+    assert_eq!(
+        edit["range"],
+        json!({
+            "start": { "line": 3, "character": 8 },
+            "end": { "line": 3, "character": 10 },
+        }),
+        "{edit:#?}"
+    );
+    assert_eq!(edit["newText"], json!("\"42\""));
+
+    // The missing `name` is inserted as the first field of `app`, with the
+    // schema's indentation and a sample value for its type.
+    let diagnostic =
+        diagnostic_with_message(&published.diagnostics, "Missing required field 'name'").clone();
+    let actions = code_actions_for(&mut harness, &config_uri, &diagnostic).await;
+    let edit = quick_fix_edit(&actions, "Insert missing field 'name'", &config_uri, true);
+    assert_eq!(
+        edit["range"],
+        json!({
+            "start": { "line": 1, "character": 0 },
+            "end": { "line": 1, "character": 0 },
+        }),
+        "{edit:#?}"
+    );
+    assert_eq!(edit["newText"], json!("  name \"\"\n"));
+}
+
+/// A config whose `@schema` directive names a file that does not exist.
+const CONFIG_WITH_MISSING_SCHEMA_FILE: &str =
+    "@schema \"./missing.rune\"\napp:\n  name \"Rune\"\nend\n";
+
+/// The quick fix for an unresolved `@schema` reference creates the sibling file
+/// the directive names, with the schema stub every other fix uses.
+#[tokio::test]
+async fn missing_schema_quick_fix_has_the_exact_file_edit() {
+    let mut harness = LspHarness::start().await;
+    let uri = harness.document_uri("config.rune");
+    let missing_uri = harness.file_uri("missing.rune");
+
+    harness
+        .did_open(&uri, CONFIG_WITH_MISSING_SCHEMA_FILE)
+        .await;
+
+    let published = harness.collect_diagnostics().await;
+    let published = diagnostics_for(&published, &uri, Some(1));
+    assert_eq!(
+        published.diagnostics.len(),
+        1,
+        "an unresolved directive publishes one diagnostic: {published:#?}"
+    );
+    let diagnostic = published.diagnostics[0].clone();
+    assert_eq!(
+        diagnostic["code"],
+        json!(701),
+        "an unresolved `@schema` reference is reported as 701: {diagnostic:#?}"
+    );
+
+    let actions = code_actions_for(&mut harness, &uri, &diagnostic).await;
+    let edit = quick_fix_edit(
+        &actions,
+        "Create schema './missing.rune'",
+        &missing_uri,
+        false,
+    );
+    assert_eq!(
+        edit["range"],
+        json!({
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": 0, "character": 0 },
+        }),
+        "the new schema file is filled from position zero: {edit:#?}"
+    );
+    assert_eq!(
+        edit["newText"],
+        json!("schema app:\n  name string required\nend\n")
+    );
+}
+
+/// A schema document is indexed like any other buffer: its symbols are the
+/// index's, and completion offers the schema keyword and type list.
+#[tokio::test]
+async fn schema_documents_return_symbols_and_schema_completions() {
+    let mut harness = LspHarness::start().await;
+    let uri = harness.document_uri("schema.rune");
+
+    harness.did_open(&uri, SCHEMA_STRING_FIELD).await;
+    harness.discard_server_messages().await;
+
+    let symbols = harness
+        .request(
+            "textDocument/documentSymbol",
+            json!({ "textDocument": { "uri": uri } }),
+        )
+        .await;
+    assert_eq!(
+        symbol_names(&symbols),
+        vec!["schema", "name"],
+        "{symbols:#?}"
+    );
+    assert_eq!(
+        symbols,
+        json!([
+            {
+                // `SymbolKind::FIELD`: `schema app:` is an assignment in the
+                // index, so the block is a field symbol like the body's keys.
+                "name": "schema",
+                "kind": 8,
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 6 },
+                },
+                "selectionRange": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 6 },
+                },
+            },
+            {
+                "name": "name",
+                "kind": 8,
+                "range": {
+                    "start": { "line": 1, "character": 0 },
+                    "end": { "line": 1, "character": 6 },
+                },
+                "selectionRange": {
+                    "start": { "line": 1, "character": 2 },
+                    "end": { "line": 1, "character": 6 },
+                },
+            },
+        ]),
+        "a schema document's symbols are the indexed ones: {symbols:#?}"
+    );
+
+    // Completion inside a schema document is context-free: any position returns
+    // the same ordered list, which ends with the `end` keyword.
+    let completions = harness
+        .request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 1, "character": 7 },
+            }),
+        )
+        .await;
+
+    // `CompletionItemKind::KEYWORD` and `CompletionItemKind::TYPE_PARAMETER`.
+    const KEYWORD: i64 = 14;
+    const TYPE_PARAMETER: i64 = 25;
+
+    let items = completions
+        .as_array()
+        .unwrap_or_else(|| panic!("completion must return an item array, got {completions}"));
+    let labels: Vec<&str> = items
+        .iter()
+        .filter_map(|item| item["label"].as_str())
+        .collect();
+    let kinds: Vec<i64> = items
+        .iter()
+        .map(|item| {
+            item["kind"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("a completion item without a kind: {item:#?}"))
+        })
+        .collect();
+
+    assert_eq!(
+        labels,
+        vec![
+            "schema", "string", "int", "float", "number", "bool", "regex", "any", "object",
+            "required", "default", "range", "end",
+        ],
+        "the schema keyword and type list in the order the server publishes it: {completions:#?}"
+    );
+    assert_eq!(
+        kinds,
+        vec![
+            KEYWORD,
+            TYPE_PARAMETER,
+            TYPE_PARAMETER,
+            TYPE_PARAMETER,
+            TYPE_PARAMETER,
+            TYPE_PARAMETER,
+            TYPE_PARAMETER,
+            TYPE_PARAMETER,
+            TYPE_PARAMETER,
+            KEYWORD,
+            KEYWORD,
+            KEYWORD,
+            KEYWORD,
+        ],
+        "{completions:#?}"
+    );
+}
+
+/// Two objects that declare the same key name, with no schema anywhere: every
+/// schema-less request follows the object the cursor is in.
+const CONFIG_TWO_OBJECTS_WITH_SAME_KEY: &str =
+    "first:\n  name \"A\"\nend\nsecond:\n  name \"B\"\nend\n";
+
+/// A same-named key in another object is not a reference to the cursor's key.
+#[tokio::test]
+async fn same_named_keys_in_different_objects_do_not_cross_scopes() {
+    let mut harness = LspHarness::start().await;
+    let uri = harness.document_uri("config.rune");
+
+    harness
+        .did_open(&uri, CONFIG_TWO_OBJECTS_WITH_SAME_KEY)
+        .await;
+    harness.discard_server_messages().await;
+
+    // `first.name` is on line 1 and `second.name` on line 4, so the second
+    // object's key can only appear if the object scope was lost.
+    let name_range = json!({
+        "start": { "line": 1, "character": 2 },
+        "end": { "line": 1, "character": 6 },
+    });
+
+    let references = harness
+        .request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 1, "character": 3 },
+                "context": { "includeDeclaration": true },
+            }),
+        )
+        .await;
+    assert_eq!(
+        references,
+        json!([{ "uri": uri.as_str(), "range": name_range.clone() }]),
+        "only the `name` inside `first` is a reference: {references}"
+    );
+
+    let rename = harness
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 1, "character": 3 },
+                "newName": "title",
+            }),
+        )
+        .await;
+    let changes = rename["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("rename must return a workspace edit, got {rename}"));
+    assert_eq!(changes.len(), 1, "one document is renamed: {rename}");
+    assert_eq!(
+        changes[uri.as_str()],
+        json!([{ "range": name_range, "newText": "title" }]),
+        "renaming `first.name` leaves `second.name` untouched: {rename}"
     );
 }
