@@ -172,6 +172,37 @@ npm run compile
 
 Run the extension from VS Code's Extension Development Host. By default it launches `rune-lsp` from `PATH`; set `runecfg.server.path` to an absolute binary path when testing a local development build. See [`editors/vscode/README.md`](../editors/vscode/README.md) for details.
 
+## Packaging and Releases
+
+The VS Code extension does not bundle `rune-lsp`. It starts `rune-lsp` over stdio, resolving the binary from `PATH` by default, or from the `runecfg.server.path` setting when that is set.
+
+The extension and the crate are released together. Both are `0.7.0`: extension 0.7.0 is built for the `rune-lsp` from crate 0.7.0. Mismatched versions are not guaranteed to work together.
+
+Before a release, run the full checklist from the repository root, in order:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+
+npm --prefix editors/vscode ci
+npm --prefix editors/vscode run compile
+npm --prefix editors/vscode run package:vsix
+unzip -Z1 editors/vscode/rune-cfg.vsix | grep -Fx 'extension/out/extension.js'
+```
+
+The final command must print `extension/out/extension.js`, which confirms the packaged VSIX contains the extension entry point.
+
+After those checks pass, bump the versions together in a single commit:
+
+- `Cargo.toml`
+- the root package entry in `Cargo.lock`
+- `editors/vscode/package.json`
+- the root versions in `editors/vscode/package-lock.json`
+- the versioned install examples in `README.md`, `docs/language-server.md`, and the editor READMEs
+
+CI runs the Rust checks and the VS Code packaging checks on every push and pull request, but it does not publish anything. Publishing and tagging stay manual.
+
 ## Tree-sitter
 
 Optional Tree-sitter grammar development:
