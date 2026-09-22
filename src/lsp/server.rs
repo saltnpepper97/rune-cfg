@@ -12,18 +12,20 @@ use tower_lsp::lsp_types::{
     CodeActionProviderCapability, CodeActionResponse, CompletionItem, CompletionItemKind,
     CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
     DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
-    DocumentSymbolResponse, FileChangeType, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-    InitializedParams, InsertTextFormat, Location, MarkedString, MessageType, OneOf, Position,
+    DidOpenTextDocumentParams, DocumentChanges, DocumentFormattingParams, DocumentSymbol,
+    DocumentSymbolParams, DocumentSymbolResponse, FileChangeType, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, InsertTextFormat, Location,
+    MarkedString, MessageType, OneOf, OptionalVersionedTextDocumentIdentifier, Position,
     PrepareRenameResponse, Range, ReferenceParams, RenameOptions, RenameParams, ServerCapabilities,
-    SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextEdit, Url, WorkDoneProgressOptions, WorkspaceEdit, WorkspaceFoldersServerCapabilities,
-    WorkspaceServerCapabilities,
+    SymbolKind, TextDocumentEdit, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit, Url, WorkDoneProgressOptions, WorkspaceEdit,
+    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
 };
 use tower_lsp::{Client, LanguageServer};
 
 use crate::diagnostic::{DiagnosticSeverity, RuneDiagnostic};
+use crate::lexer::{Lexer, Token};
 use crate::source::{
     LineIndex, SourceEntry, SourceEntryKind, SourceIndex, Span, starts_with_schema_block,
 };
@@ -40,9 +42,12 @@ struct OpenDocument {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SchemaDirective {
+    /// The decoded reference, with the quotes and escapes removed.
     reference: String,
-    line: usize,
-    column: usize,
+    /// Byte span of the quoted token the reference was read from, quotes
+    /// included. This is what a cursor is compared against, so a cursor on the
+    /// `@schema` keyword or in a trailing comment is not on the reference.
+    reference_span: Span,
 }
 
 /// A single key occurrence for cross-file references/rename. The schema field
@@ -76,6 +81,9 @@ pub struct RuneLanguageServer {
     documents: RwLock<HashMap<Url, OpenDocument>>,
     /// Present for open config documents only, never for schema documents.
     schema_dependencies: RwLock<HashMap<Url, SchemaDependency>>,
+    /// The client's `workspace.workspaceEdit.documentChanges` capability.
+    /// Renames report versioned document changes only when it is set.
+    supports_document_changes: RwLock<bool>,
 }
 
 impl RuneLanguageServer {
@@ -85,6 +93,7 @@ impl RuneLanguageServer {
             workspace_folders: RwLock::new(Vec::new()),
             documents: RwLock::new(HashMap::new()),
             schema_dependencies: RwLock::new(HashMap::new()),
+            supports_document_changes: RwLock::new(false),
         }
     }
 
@@ -318,6 +327,7 @@ impl RuneLanguageServer {
             Some(directive) => {
                 let Some(schema_uri) = self.resolve_candidates(&candidates.candidates).await else {
                     return Err(schema_reference_diagnostic(
+                        source.lines(),
                         &directive,
                         &candidates.candidates,
                     ));
@@ -326,7 +336,7 @@ impl RuneLanguageServer {
                 self.schema_text_for_uri(&schema_uri)
                     .await
                     .map(Some)
-                    .ok_or_else(|| schema_reference_diagnostic(&directive, &[]))
+                    .ok_or_else(|| schema_reference_diagnostic(source.lines(), &directive, &[]))
             }
             None => match self.resolve_candidates(&candidates.candidates).await {
                 Some(schema_uri) => Ok(self.schema_text_for_uri(&schema_uri).await),
@@ -447,6 +457,95 @@ impl RuneLanguageServer {
         occurrences
     }
 
+    /// True when a field at `candidate` already exists in one document, which
+    /// is what turns a rename into a sibling collision.
+    ///
+    /// A schema document is read as a schema and resolved through its parsed
+    /// fields; every other document is a config, read through its index.
+    async fn field_exists_in(&self, uri: &Url, is_schema: bool, candidate: &[String]) -> bool {
+        let Some(source) = self.document_source_for(uri).await else {
+            return false;
+        };
+
+        if is_schema {
+            let Ok(schema) = SchemaDocument::from_str(source.text()) else {
+                return false;
+            };
+            return find_field_by_path(&schema, candidate).is_some();
+        }
+
+        !source.entries_with_path(candidate).is_empty()
+    }
+
+    /// The workspace edit for a set of per-document rename edits.
+    ///
+    /// A client that supports `workspace.workspaceEdit.documentChanges` gets
+    /// versioned document changes: one `TextDocumentEdit` per document, sorted
+    /// by URI string, each carrying the version of the open buffer it applies
+    /// to or `null` for a file that only exists on disk. Every other client
+    /// gets the `changes` map. The two are never filled together.
+    async fn rename_workspace_edit(
+        &self,
+        edits: Vec<(Url, Vec<Range>)>,
+        new_name: &str,
+    ) -> WorkspaceEdit {
+        if !*self.supports_document_changes.read().await {
+            let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+
+            for (uri, ranges) in edits {
+                changes
+                    .entry(uri)
+                    .or_default()
+                    .extend(ranges.into_iter().map(|range| TextEdit {
+                        range,
+                        new_text: new_name.to_string(),
+                    }));
+            }
+
+            return WorkspaceEdit {
+                changes: Some(changes),
+                document_changes: None,
+                change_annotations: None,
+            };
+        }
+
+        let versions: HashMap<Url, i32> = self
+            .documents
+            .read()
+            .await
+            .iter()
+            .map(|(uri, document)| (uri.clone(), document.version))
+            .collect();
+
+        let mut ordered = edits;
+        ordered.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+
+        let document_changes = ordered
+            .into_iter()
+            .map(|(uri, ranges)| TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    version: versions.get(&uri).copied(),
+                    uri,
+                },
+                edits: ranges
+                    .into_iter()
+                    .map(|range| {
+                        OneOf::Left(TextEdit {
+                            range,
+                            new_text: new_name.to_string(),
+                        })
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        WorkspaceEdit {
+            changes: None,
+            document_changes: Some(DocumentChanges::Edits(document_changes)),
+            change_annotations: None,
+        }
+    }
+
     async fn document_source_for(&self, uri: &Url) -> Option<Arc<SourceIndex>> {
         if let Some(document) = self.documents.read().await.get(uri) {
             return Some(Arc::clone(&document.source));
@@ -485,6 +584,7 @@ impl RuneLanguageServer {
 impl LanguageServer for RuneLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
         *self.workspace_folders.write().await = workspace_folders_from_initialize(&params);
+        *self.supports_document_changes.write().await = supports_document_changes(&params);
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -763,10 +863,14 @@ impl LanguageServer for RuneLanguageServer {
 
         let position = params.text_document_position_params.position;
 
-        // A `@schema "..."` directive jumps to the top of the schema file.
-        if schema_directive(&source)
-            .is_some_and(|directive| directive.line == position.line as usize + 1)
-        {
+        // A `@schema "..."` directive jumps to the top of the schema file, but
+        // only from the quoted reference itself: the `@schema` keyword and the
+        // rest of that line are not the link.
+        if schema_directive(&source).is_some_and(|directive| {
+            source
+                .offset_at(position)
+                .is_some_and(|offset| directive.reference_span.touches(offset))
+        }) {
             return Ok(self
                 .schema_uri_for_document(&uri, &source)
                 .await
@@ -815,10 +919,11 @@ impl LanguageServer for RuneLanguageServer {
         };
 
         // No schema: fall back to single-file references within this document.
+        // Every indexed occurrence of the path is a usage, so
+        // `includeDeclaration` removes none of them.
         let Some(schema_uri) = schema_uri else {
             let locations = references_in_document(&source, &path)
                 .into_iter()
-                .filter(|range| include_declaration || range.start.line != position.line)
                 .map(|range| Location {
                     uri: uri.clone(),
                     range,
@@ -882,42 +987,68 @@ impl LanguageServer for RuneLanguageServer {
             return Ok(None);
         };
 
-        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        // The ranges to rewrite, one group per document, in the order they are
+        // discovered. Nothing is edited when the request is rejected.
+        let mut edits: Vec<(Url, Vec<Range>)> = Vec::new();
 
         match schema_uri {
             // No schema: single-file rename within this document.
             None => {
-                let edits: Vec<TextEdit> = references_in_document(&source, &path)
-                    .into_iter()
-                    .map(|range| TextEdit {
-                        range,
-                        new_text: new_name.clone(),
-                    })
-                    .collect();
-                if edits.is_empty() {
+                let ranges = references_in_document(&source, &path);
+                if ranges.is_empty() {
                     return Ok(None);
                 }
-                changes.insert(uri, edits);
+
+                if let Some(candidate) = sibling_candidate(&path, &new_name)
+                    && !source.entries_with_path(&candidate).is_empty()
+                {
+                    return Err(rename_collision(&path, &candidate));
+                }
+
+                edits.push((uri.clone(), ranges));
             }
             // Schema-scoped: update the schema declaration and every bound config.
             Some(schema_uri) => {
-                for occurrence in self.cross_file_occurrences(&schema_uri, &path).await {
-                    changes.entry(occurrence.uri).or_default().push(TextEdit {
-                        range: occurrence.range,
-                        new_text: new_name.clone(),
-                    });
-                }
-                if changes.is_empty() {
+                let occurrences = self.cross_file_occurrences(&schema_uri, &path).await;
+                if occurrences.is_empty() {
                     return Ok(None);
+                }
+
+                if let Some(candidate) = sibling_candidate(&path, &new_name) {
+                    let mut checked: Vec<Url> = Vec::new();
+
+                    for occurrence in &occurrences {
+                        if checked.contains(&occurrence.uri) {
+                            continue;
+                        }
+                        checked.push(occurrence.uri.clone());
+
+                        // Only the documents a rename would really edit are
+                        // checked, and the schema is read as a schema only
+                        // where its own declaration is one of them.
+                        let is_schema = occurrence.is_declaration;
+                        if self
+                            .field_exists_in(&occurrence.uri, is_schema, &candidate)
+                            .await
+                        {
+                            return Err(rename_collision(&path, &candidate));
+                        }
+                    }
+                }
+
+                for occurrence in occurrences {
+                    match edits
+                        .iter_mut()
+                        .find(|(existing, _)| *existing == occurrence.uri)
+                    {
+                        Some((_, ranges)) => ranges.push(occurrence.range),
+                        None => edits.push((occurrence.uri, vec![occurrence.range])),
+                    }
                 }
             }
         }
 
-        Ok(Some(WorkspaceEdit {
-            changes: Some(changes),
-            document_changes: None,
-            change_annotations: None,
-        }))
+        Ok(Some(self.rename_workspace_edit(edits, &new_name).await))
     }
 
     async fn formatting(
@@ -1117,6 +1248,18 @@ fn workspace_folders_from_initialize(params: &InitializeParams) -> Vec<Url> {
         .collect()
 }
 
+/// True when the client declared `workspace.workspaceEdit.documentChanges`,
+/// which is what makes a versioned document-changes edit acceptable.
+fn supports_document_changes(params: &InitializeParams) -> bool {
+    params
+        .capabilities
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.workspace_edit.as_ref())
+        .and_then(|workspace_edit| workspace_edit.document_changes)
+        == Some(true)
+}
+
 /// Ancestor `schema.rune` candidates for one config file, nearest first.
 ///
 /// The walk stops at the deepest workspace folder containing the file, so a
@@ -1165,37 +1308,26 @@ fn looks_like_schema_text(text: &str) -> bool {
     starts_with_schema_block(text)
 }
 
-/// The first `@schema "reference"` directive: the reference plus the 1-based
-/// line and `char` column of its opening quote.
+/// The first `@schema "reference"` directive: the decoded reference plus the
+/// span of the quoted token it was read from.
 ///
 /// The directive is found through the indexed entries, so a `#` inside the
-/// quoted reference never ends the directive early.
+/// quoted reference never ends the directive early, and the span is the real
+/// token span rather than the rest of the line the directive sits on.
 fn schema_directive(source: &SourceIndex) -> Option<SchemaDirective> {
     let entry = source.entries().iter().find(|entry| {
         entry.kind == SourceEntryKind::Metadata && entry.name.as_deref() == Some("schema")
     })?;
 
-    let value_span = entry.value_span?;
+    let reference_span = source.quoted_value_span(entry)?;
     let raw = source
         .text()
-        .get(value_span.start..value_span.end)?
-        .trim_start();
+        .get(reference_span.start..reference_span.end)?;
     let reference = parse_quoted_string(raw)?;
-
-    let lines = source.lines();
-    let line = lines.line_of(value_span.start);
-    let line_start = lines.line_span(line)?.start;
-    let column = source
-        .text()
-        .get(line_start..value_span.start)?
-        .chars()
-        .count()
-        + 1;
 
     Some(SchemaDirective {
         reference,
-        line: line + 1,
-        column,
+        reference_span,
     })
 }
 
@@ -1314,11 +1446,6 @@ fn schema_reference_completion_items(config_dir: Option<&Path>) -> Vec<Completio
     items
 }
 
-fn is_schema_directive_context(before_cursor: &str) -> bool {
-    let trimmed = before_cursor.trim_start();
-    trimmed.starts_with("@schema") && trimmed.contains('"')
-}
-
 fn is_schema_path_reference(reference: &str) -> bool {
     reference.starts_with('.')
         || reference.starts_with('/')
@@ -1344,6 +1471,7 @@ fn expand_schema_path(reference: &str, config_dir: &Path) -> PathBuf {
 }
 
 fn schema_reference_diagnostic(
+    lines: &LineIndex,
     directive: &SchemaDirective,
     candidates: &[PathBuf],
 ) -> RuneDiagnostic {
@@ -1360,12 +1488,12 @@ fn schema_reference_diagnostic(
         )
     };
 
+    // The range is the quoted reference token itself, counted in UTF-16 code
+    // units so a non-ASCII reference is underlined exactly.
+    let range = lines.rune_range(directive.reference_span);
+
     RuneDiagnostic::error(format!("Schema '{}' was not found", directive.reference))
-        .with_range(
-            directive.line,
-            directive.column,
-            directive.column + directive.reference.len() + 2,
-        )
+        .with_range(range.start.line, range.start.column, range.end.column)
         .with_hint(hint)
         .with_code(701)
 }
@@ -1823,12 +1951,14 @@ fn config_completion_items(
     position: Position,
     config_dir: Option<&Path>,
 ) -> Vec<CompletionItem> {
-    let before_cursor = source.lines().text_before(position);
-    if is_schema_directive_context(before_cursor) {
+    // Only a positively special context replaces the normal completion: a
+    // cursor on a `$...` reference run, or inside the quoted value of the
+    // `@schema` directive. Anything else is a field, enum, or keyword.
+    if source.metadata_string_context("schema", position) {
         return schema_reference_completion_items(config_dir);
     }
 
-    if before_cursor.contains('$') {
+    if source.dollar_reference_context(position) {
         return dollar_reference_completion_items();
     }
 
@@ -2052,11 +2182,30 @@ fn fields_for_stack<'a>(schema: &'a SchemaDocument, stack: &[String]) -> Option<
     Some(fields)
 }
 
-/// A bare RUNE identifier, which is what a rename may introduce.
+/// A valid RUNE identifier: one `Ident` token that spans the whole name.
+///
+/// Lexing the name instead of testing an ASCII character class is what makes
+/// `näme` and other Unicode identifiers valid, keeps `_` and `-` valid after
+/// an alphabetic first character, and rejects an empty name, a leading digit,
+/// a leading `_`, an embedded space or quote, and a lexer keyword such as
+/// `if`, `end`, `true`, or `null`, none of which lex to `Ident`.
 fn is_identifier(value: &str) -> bool {
-    let mut chars = value.chars();
-    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    let mut lexer = Lexer::new(value);
+
+    let Ok(first) = lexer.next_token_spanned() else {
+        return false;
+    };
+    if first.span.start != 0 || first.span.end != value.len() {
+        return false;
+    }
+    let Token::Ident(name) = &first.token else {
+        return false;
+    };
+    if name != value {
+        return false;
+    }
+
+    matches!(lexer.next_token_spanned(), Ok(next) if next.token == Token::Eof)
 }
 
 /// Document symbols come straight from the indexed entries: objects are
@@ -2159,6 +2308,32 @@ fn schema_definition_range(
     };
 
     Some(LineIndex::new(schema_text).range(span))
+}
+
+/// Paths of a rename target and of the sibling a rename would create.
+///
+/// The candidate is the same parent plus the new leaf, or `None` when the leaf
+/// does not change, which cannot collide with anything.
+fn sibling_candidate(path: &[String], new_name: &str) -> Option<Vec<String>> {
+    let (leaf, parent) = path.split_last()?;
+    if leaf == new_name {
+        return None;
+    }
+
+    let mut candidate = parent.to_vec();
+    candidate.push(new_name.to_string());
+    Some(candidate)
+}
+
+/// The error a sibling collision is reported with: JSON-RPC invalid params,
+/// with the current path, the new name, and the sibling that already owns it.
+fn rename_collision(path: &[String], candidate: &[String]) -> tower_lsp::jsonrpc::Error {
+    tower_lsp::jsonrpc::Error::invalid_params(format!(
+        "Cannot rename '{}' to '{}': sibling '{}' already exists",
+        path.join("."),
+        candidate.last().cloned().unwrap_or_default(),
+        candidate.join("."),
+    ))
 }
 
 /// Every occurrence of `target_path` (key ranges) in one document.
@@ -2293,19 +2468,22 @@ mod tests {
 
     #[test]
     fn parses_schema_directive() {
-        let directive = schema_directive(&SourceIndex::new(
+        let source = SourceIndex::new(
             r#"
 app:
   name "RuneApp"
 end
 @schema "stasis"
 "#,
-        ))
-        .unwrap();
+        );
+        let directive = schema_directive(&source).unwrap();
 
         assert_eq!(directive.reference, "stasis");
-        assert_eq!(directive.line, 5);
-        assert_eq!(directive.column, 9);
+        assert_eq!(
+            &source.text()[directive.reference_span.start..directive.reference_span.end],
+            "\"stasis\"",
+            "the stored span is the quoted token itself"
+        );
     }
 
     #[test]
@@ -2319,11 +2497,14 @@ end
     /// start of a comment.
     #[test]
     fn schema_directive_keeps_comment_markers_inside_the_reference() {
-        let directive =
-            schema_directive(&SourceIndex::new("@schema \"./schemas/app#1.rune\"")).unwrap();
+        let source = SourceIndex::new("@schema \"./schemas/app#1.rune\"");
+        let directive = schema_directive(&source).unwrap();
 
         assert_eq!(directive.reference, "./schemas/app#1.rune");
-        assert_eq!(directive.column, 9);
+        assert_eq!(
+            &source.text()[directive.reference_span.start..directive.reference_span.end],
+            "\"./schemas/app#1.rune\""
+        );
     }
 
     #[test]
@@ -2714,5 +2895,42 @@ end
         assert!(!names.iter().any(|n| n == "skip.rune"));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A new name is validated by lexing it, so a Unicode identifier is valid
+    /// and a keyword - which never lexes to `Ident` - is not.
+    #[test]
+    fn identifiers_are_decided_by_the_lexer() {
+        for valid in ["name", "näme", "schema", "a-b", "name_1", "x"] {
+            assert!(is_identifier(valid), "{valid:?} must be a valid identifier");
+        }
+
+        for invalid in [
+            "", "1name", "_name", "-name", "na me", "\"name\"", "if", "end", "true", "null",
+        ] {
+            assert!(
+                !is_identifier(invalid),
+                "{invalid:?} must not be a valid identifier"
+            );
+        }
+    }
+
+    /// A rename collides with a sibling of the same parent only, never with a
+    /// leaf under another parent and never with the leaf it already has.
+    #[test]
+    fn sibling_candidates_share_the_parent_and_skip_the_current_leaf() {
+        let path = vec!["server".to_string(), "port".to_string()];
+
+        assert_eq!(
+            sibling_candidate(&path, "host"),
+            Some(vec!["server".to_string(), "host".to_string()])
+        );
+        assert_eq!(sibling_candidate(&path, "port"), None);
+
+        let candidate = sibling_candidate(&path, "host").expect("a sibling candidate");
+        assert_eq!(
+            rename_collision(&path, &candidate).message.as_ref(),
+            "Cannot rename 'server.port' to 'host': sibling 'server.host' already exists"
+        );
     }
 }

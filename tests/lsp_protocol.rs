@@ -303,6 +303,34 @@ impl LspHarness {
         result.unwrap_or_else(|error| panic!("{method} failed: {error:?}"))
     }
 
+    /// Sends a JSON-RPC request and returns either its `result` payload or the
+    /// JSON-RPC error object the server replied with.
+    ///
+    /// Requests a test expects to be rejected use this instead of
+    /// [`Self::request`], which panics on an error.
+    async fn request_or_error(
+        &mut self,
+        method: &'static str,
+        params: Value,
+    ) -> Result<Value, Value> {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+
+        let request = JsonRpcRequest::build(method).params(params).id(id).finish();
+        let response = self
+            .service
+            .ready()
+            .await
+            .expect("service accepts the request")
+            .call(request)
+            .await
+            .expect("the server handles the request")
+            .expect("a request receives a response");
+
+        let (_, result) = response.into_parts();
+        result.map_err(|error| serde_json::to_value(error).expect("a JSON-RPC error is JSON"))
+    }
+
     /// Sends a JSON-RPC notification. Notifications produce no response, but the
     /// handler still runs to completion before this returns, so server-side work
     /// such as revalidation is finished here.
@@ -2095,4 +2123,657 @@ async fn schema_scoped_navigation_spans_every_workspace_folder() {
         3,
         "the schema declaration and the config in each folder are renamed: {rename}"
     );
+}
+
+/// Completion item labels at one position, so a test can describe which kind of
+/// items a context has to offer.
+async fn completion_labels(
+    harness: &mut LspHarness,
+    uri: &Url,
+    line: u32,
+    character: u32,
+) -> Vec<String> {
+    let result = harness
+        .request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+            }),
+        )
+        .await;
+
+    result
+        .as_array()
+        .unwrap_or_else(|| panic!("completion must return an item array, got {result}"))
+        .iter()
+        .filter_map(|item| {
+            item.get("label")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// The range of a two-space-indented, four-character key on `line`.
+fn indented_key_range(line: u32) -> Value {
+    json!({
+        "start": { "line": line, "character": 2 },
+        "end": { "line": line, "character": 6 },
+    })
+}
+
+/// A config whose `@schema` line carries the keyword, the quoted reference,
+/// and a trailing comment after it.
+const CONFIG_WITH_DIRECTIVE_COMMENT: &str = r#"@schema "./schema.rune" # the app schema
+app:
+  name "Rune"
+end
+"#;
+
+/// A config whose `@schema` reference does not exist, and whose reference is
+/// non-ASCII: the `ä` of `schemä` is two UTF-8 bytes but one UTF-16 code unit.
+const CONFIG_WITH_MISSING_UNICODE_SCHEMA: &str = r#"@schema "schemä"
+app:
+  name "Rune"
+end
+"#;
+
+/// Definition follows the schema link only from the quoted reference itself:
+/// the `@schema` keyword and a trailing comment on that line are not links.
+#[tokio::test]
+async fn definition_follows_only_the_quoted_schema_reference() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let schema_uri = harness.document_uri("schema.rune");
+
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    harness
+        .did_open(&config_uri, CONFIG_WITH_DIRECTIVE_COMMENT)
+        .await;
+    harness.discard_server_messages().await;
+
+    // Line 0 is `@schema "./schema.rune" # the app schema`: the quoted token
+    // occupies characters 8..24, so character 12 is inside the reference.
+    let definition = harness
+        .request(
+            "textDocument/definition",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 0, "character": 12 },
+            }),
+        )
+        .await;
+    assert_eq!(definition["uri"], json!(schema_uri.as_str()));
+    assert_eq!(
+        definition["range"],
+        json!({
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": 0, "character": 0 },
+        }),
+        "a cursor on the quoted reference jumps to the top of the schema: {definition}"
+    );
+
+    // Character 3 is inside the `@schema` keyword and character 30 is inside
+    // the trailing comment: both are on the directive's line, neither is the
+    // reference.
+    for character in [3, 30] {
+        let definition = harness
+            .request(
+                "textDocument/definition",
+                json!({
+                    "textDocument": { "uri": config_uri },
+                    "position": { "line": 0, "character": character },
+                }),
+            )
+            .await;
+        assert_eq!(
+            definition,
+            Value::Null,
+            "character {character} of the directive line is not the reference"
+        );
+    }
+}
+
+/// A missing `@schema` reference is reported on the quoted token itself,
+/// measured in UTF-16 code units rather than UTF-8 bytes.
+#[tokio::test]
+async fn missing_unicode_schema_reference_reports_the_quoted_token_range() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+
+    harness
+        .did_open(&config_uri, CONFIG_WITH_MISSING_UNICODE_SCHEMA)
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "opening publishes only the config: {published:#?}"
+    );
+
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(config.diagnostics.len(), 1, "{published:#?}");
+
+    let missing = diagnostic_with_message(&config.diagnostics, "was not found");
+    assert_eq!(missing["code"], json!(701));
+    assert_eq!(
+        missing["range"],
+        json!({
+            "start": { "line": 0, "character": 8 },
+            "end": { "line": 0, "character": 16 },
+        }),
+        "the range is the quoted token in UTF-16 code units, not in bytes: {missing}"
+    );
+}
+
+/// A config that writes the same key twice inside one object.
+const CONFIG_TWO_USAGES: &str = r#"app:
+  name "Rune"
+  name "Other"
+end
+"#;
+
+/// Without a schema every indexed occurrence is a usage, so a request that
+/// excludes declarations still reports the occurrence on the cursor's line.
+#[tokio::test]
+async fn references_without_declaration_still_report_the_cursor_usage() {
+    let mut harness = LspHarness::start().await;
+    let uri = harness.document_uri("config.rune");
+
+    harness.did_open(&uri, CONFIG_TWO_USAGES).await;
+    harness.discard_server_messages().await;
+
+    let references = harness
+        .request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 1, "character": 3 },
+                "context": { "includeDeclaration": false },
+            }),
+        )
+        .await;
+    let locations = references
+        .as_array()
+        .unwrap_or_else(|| panic!("references must return locations, got {references}"));
+
+    assert_eq!(
+        locations.len(),
+        2,
+        "both occurrences are usages, the cursor's own included: {references}"
+    );
+    let ranges: Vec<Value> = locations
+        .iter()
+        .map(|location| {
+            assert_eq!(location["uri"], json!(uri.as_str()));
+            location["range"].clone()
+        })
+        .collect();
+    assert_eq!(
+        ranges,
+        vec![indented_key_range(1), indented_key_range(2)],
+        "the filter that dropped the cursor's line is gone: {references}"
+    );
+}
+
+/// A config with a nested `app.server.port` assignment.
+const CONFIG_APP_SERVER_PORT: &str = r#"app:
+  server:
+    port 8080
+  end
+end
+"#;
+
+/// A schema-scoped rename for a client that supports versioned document
+/// changes answers with `documentChanges` alone: one entry per edited
+/// document, sorted by URI, carrying the open buffer's version or `null` for a
+/// file that only exists on disk.
+#[tokio::test]
+async fn rename_with_document_changes_reports_versions_and_sorted_documents() {
+    let mut harness = LspHarness::start_with_initializer(|root| {
+        json!({
+            "processId": Value::Null,
+            "rootUri": Url::from_directory_path(root).expect("workspace root uri"),
+            "capabilities": { "workspace": { "workspaceEdit": { "documentChanges": true } } },
+        })
+    })
+    .await;
+
+    let schema_uri = harness.document_uri("schema.rune");
+    let config_uri = harness.document_uri("config.rune");
+    let disk_uri = harness.file_uri("disk/config.rune");
+
+    // Only the disk config is unopened. The schema is open in memory, so the
+    // disk config binds to that buffer through discovery.
+    harness.write_file("disk/config.rune", CONFIG_STRING_VALUE);
+
+    harness.did_open(&schema_uri, SCHEMA_STRING_FIELD).await;
+    harness
+        .replace_document(&schema_uri, 3, SCHEMA_STRING_FIELD)
+        .await;
+    // The open config writes the key twice, so its own edits must stay in
+    // source order.
+    harness.did_open(&config_uri, CONFIG_TWO_USAGES).await;
+    harness.discard_server_messages().await;
+
+    let rename = harness
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 1, "character": 3 },
+                "newName": "title",
+            }),
+        )
+        .await;
+
+    assert!(
+        rename.get("changes").is_none(),
+        "a versioned rename must not also carry a changes map: {rename}"
+    );
+
+    let document_changes = rename["documentChanges"]
+        .as_array()
+        .unwrap_or_else(|| panic!("rename must return documentChanges, got {rename}"));
+    let expected: Vec<Value> = [
+        (
+            config_uri.as_str(),
+            json!(1),
+            vec![indented_key_range(1), indented_key_range(2)],
+        ),
+        (disk_uri.as_str(), Value::Null, vec![indented_key_range(1)]),
+        (schema_uri.as_str(), json!(3), vec![indented_key_range(1)]),
+    ]
+    .into_iter()
+    .map(|(uri, version, ranges)| {
+        json!({
+            "textDocument": { "uri": uri, "version": version },
+            "edits": ranges
+                .into_iter()
+                .map(|range| json!({ "range": range, "newText": "title" }))
+                .collect::<Vec<Value>>(),
+        })
+    })
+    .collect();
+    assert_eq!(
+        document_changes, &expected,
+        "documents are sorted by URI and carry their version, or null on disk: {rename}"
+    );
+
+    // The same rename from a client without the capability still answers with
+    // the `changes` map and no `documentChanges`.
+    let mut plain = LspHarness::start().await;
+    let plain_schema_uri = plain.document_uri("schema.rune");
+    let plain_config_uri = plain.document_uri("config.rune");
+    plain.did_open(&plain_schema_uri, SCHEMA_STRING_FIELD).await;
+    plain.did_open(&plain_config_uri, CONFIG_STRING_VALUE).await;
+    plain.discard_server_messages().await;
+
+    let rename = plain
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": plain_config_uri },
+                "position": { "line": 1, "character": 3 },
+                "newName": "title",
+            }),
+        )
+        .await;
+
+    assert!(
+        rename.get("documentChanges").is_none(),
+        "a plain client must not receive documentChanges: {rename}"
+    );
+    let changes = rename["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("a plain rename must return changes, got {rename}"));
+    assert_eq!(changes.len(), 2, "the schema and the config: {rename}");
+    assert_eq!(
+        changes[plain_config_uri.as_str()],
+        json!([{ "range": indented_key_range(1), "newText": "title" }]),
+        "the usage is replaced in place: {rename}"
+    );
+}
+
+/// A config where `server.port` already has a `server.host` sibling.
+const CONFIG_WITH_SIBLING_HOST: &str = r#"server:
+  port 8080
+  host "localhost"
+end
+"#;
+
+/// A config whose `host` sibling lives under a different parent.
+const CONFIG_WITH_HOST_ELSEWHERE: &str = r#"server:
+  port 8080
+app:
+  host "localhost"
+end
+"#;
+
+/// A rename is rejected as JSON-RPC invalid params when the candidate name is
+/// already taken by a sibling in the same document, and accepted when it is
+/// not.
+#[tokio::test]
+async fn rename_rejects_a_sibling_that_already_exists_in_the_document() {
+    let mut harness = LspHarness::start().await;
+    let uri = harness.document_uri("config.rune");
+
+    harness.did_open(&uri, CONFIG_WITH_SIBLING_HOST).await;
+    harness.discard_server_messages().await;
+
+    let error = harness
+        .request_or_error(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 1, "character": 4 },
+                "newName": "host",
+            }),
+        )
+        .await
+        .expect_err("an existing sibling must reject the whole request");
+
+    assert_eq!(error["code"], json!(-32602), "{error}");
+    assert_eq!(
+        error["message"],
+        json!("Cannot rename 'server.port' to 'host': sibling 'server.host' already exists"),
+        "{error}"
+    );
+
+    // The same leaf under a different parent is not a sibling.
+    let other_uri = harness.document_uri("other.rune");
+    harness
+        .did_open(&other_uri, CONFIG_WITH_HOST_ELSEWHERE)
+        .await;
+    harness.discard_server_messages().await;
+
+    let rename = harness
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": other_uri },
+                "position": { "line": 1, "character": 4 },
+                "newName": "host",
+            }),
+        )
+        .await;
+    assert_eq!(
+        rename["changes"][other_uri.as_str()],
+        json!([{ "range": indented_key_range(1), "newText": "host" }]),
+        "`app.host` is not the sibling of `server.port`: {rename}"
+    );
+
+    // Renaming to the leaf the field already has cannot collide.
+    let rename = harness
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 1, "character": 4 },
+                "newName": "port",
+            }),
+        )
+        .await;
+    assert_eq!(
+        rename["changes"][uri.as_str()],
+        json!([{ "range": indented_key_range(1), "newText": "port" }]),
+        "renaming to the current leaf is not a collision: {rename}"
+    );
+}
+
+/// A schema declaring `app.server.port`.
+const SCHEMA_APP_SERVER_PORT: &str = r#"schema app:
+  server:
+    port int
+  end
+end
+"#;
+
+/// The same schema with the `app.server.host` sibling a rename could create.
+const SCHEMA_APP_SERVER_PORT_AND_HOST: &str = r#"schema app:
+  server:
+    port int
+    host string
+  end
+end
+"#;
+
+/// A config carrying the `host` sibling that only `app.server.port` renames
+/// would collide with.
+const CONFIG_APP_SERVER_PORT_AND_HOST: &str = r#"app:
+  server:
+    port 8080
+    host "localhost"
+  end
+end
+"#;
+
+/// A schema-scoped rename is rejected when the schema itself declares the
+/// sibling the new name would take.
+#[tokio::test]
+async fn rename_rejects_a_sibling_declared_by_the_schema() {
+    let mut harness = LspHarness::start().await;
+    let schema_uri = harness.document_uri("schema.rune");
+    let config_uri = harness.document_uri("config.rune");
+
+    harness
+        .did_open(&schema_uri, SCHEMA_APP_SERVER_PORT_AND_HOST)
+        .await;
+    harness.did_open(&config_uri, CONFIG_APP_SERVER_PORT).await;
+    harness.discard_server_messages().await;
+
+    // Line 2 of the config is `    port 8080`, so character 5 is on the key.
+    let error = harness
+        .request_or_error(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 2, "character": 5 },
+                "newName": "host",
+            }),
+        )
+        .await
+        .expect_err("the schema declares app.server.host, so the rename must be rejected");
+
+    assert_eq!(error["code"], json!(-32602), "{error}");
+    assert_eq!(
+        error["message"],
+        json!(
+            "Cannot rename 'app.server.port' to 'host': sibling 'app.server.host' already exists"
+        ),
+        "{error}"
+    );
+}
+
+/// A schema-scoped rename is rejected when a bound config that would be edited
+/// already has the sibling, even though the schema itself does not declare it.
+#[tokio::test]
+async fn rename_rejects_a_sibling_in_a_bound_config() {
+    let mut harness = LspHarness::start().await;
+    let schema_uri = harness.document_uri("schema.rune");
+    let config_uri = harness.document_uri("config.rune");
+    let other_uri = harness.document_uri("other.rune");
+
+    harness.did_open(&schema_uri, SCHEMA_APP_SERVER_PORT).await;
+    harness.did_open(&config_uri, CONFIG_APP_SERVER_PORT).await;
+    harness
+        .did_open(&other_uri, CONFIG_APP_SERVER_PORT_AND_HOST)
+        .await;
+    harness.discard_server_messages().await;
+
+    let error = harness
+        .request_or_error(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 2, "character": 5 },
+                "newName": "host",
+            }),
+        )
+        .await
+        .expect_err("a bound config owns the sibling, so the rename must be rejected");
+
+    assert_eq!(error["code"], json!(-32602), "{error}");
+    assert_eq!(
+        error["message"],
+        json!(
+            "Cannot rename 'app.server.port' to 'host': sibling 'app.server.host' already exists"
+        ),
+        "{error}"
+    );
+}
+
+/// A new name is validated by lexing it: `näme` is an identifier, while an
+/// empty name, a leading digit, a leading `_`, an embedded space, and a lexer
+/// keyword are not.
+#[tokio::test]
+async fn rename_accepts_a_unicode_identifier_and_rejects_invalid_names() {
+    let mut harness = LspHarness::start().await;
+    let uri = harness.document_uri("config.rune");
+
+    harness.did_open(&uri, CONFIG_STRING_VALUE).await;
+    harness.discard_server_messages().await;
+
+    let rename = harness
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 1, "character": 3 },
+                "newName": "näme",
+            }),
+        )
+        .await;
+    assert_eq!(
+        rename["changes"][uri.as_str()],
+        json!([{ "range": indented_key_range(1), "newText": "näme" }]),
+        "a Unicode identifier is a valid new name: {rename}"
+    );
+
+    for invalid in ["", "1name", "_name", "na me", "if"] {
+        let error = harness
+            .request_or_error(
+                "textDocument/rename",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": 1, "character": 3 },
+                    "newName": invalid,
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error["code"], json!(-32602), "newName {invalid:?}: {error}");
+        assert_eq!(
+            error["message"],
+            json!("New name must be a valid RUNE identifier"),
+            "newName {invalid:?}: {error}"
+        );
+    }
+}
+
+/// A config with a leading `@schema` line, a later key position, and a string
+/// value holding a `$`.
+const CONFIG_AFTER_SCHEMA_DIRECTIVE: &str = r#"@schema "./schema.rune"
+app:
+  name "$env.PATH"
+  
+end
+"#;
+
+/// Completion offers `$...` reference items only inside a reference run: a `$`
+/// inside a string literal is not a run, and a finished run on another line is
+/// not the cursor's run.
+#[tokio::test]
+async fn completion_offers_dollar_items_only_inside_a_reference_run() {
+    let mut harness = LspHarness::start().await;
+    let uri = harness.document_uri("config.rune");
+
+    // Line 1 is `  host $env`, whose reference run is characters 7..11.
+    harness.did_open(&uri, "app:\n  host $env\nend\n").await;
+    harness.discard_server_messages().await;
+
+    let labels = completion_labels(&mut harness, &uri, 1, 9).await;
+    assert!(
+        labels.contains(&"$env.".to_string()),
+        "a cursor inside `$env` offers reference items: {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"end".to_string()),
+        "reference items replace the normal completion: {labels:?}"
+    );
+
+    // The `$` of a string literal never becomes a reference token.
+    harness
+        .replace_document(&uri, 2, "app:\n  host \"$env.PATH\"\n  \nend\n")
+        .await;
+    harness.discard_server_messages().await;
+
+    let labels = completion_labels(&mut harness, &uri, 2, 2).await;
+    assert!(
+        labels.contains(&"end".to_string()),
+        "a `$` inside an earlier string is not a reference context: {labels:?}"
+    );
+    assert!(!labels.contains(&"$env.".to_string()), "{labels:?}");
+
+    // A finished reference elsewhere on the buffer is a different run.
+    harness
+        .replace_document(&uri, 3, "app:\n  host $sys.hostname\n  \nend\n")
+        .await;
+    harness.discard_server_messages().await;
+
+    let labels = completion_labels(&mut harness, &uri, 2, 2).await;
+    assert!(
+        labels.contains(&"end".to_string()),
+        "a finished `$...` on another line does not qualify: {labels:?}"
+    );
+    assert!(!labels.contains(&"$env.".to_string()), "{labels:?}");
+}
+
+/// Completion offers schema references only inside the `@schema` value; a key
+/// after that line keeps the normal field and keyword completion.
+#[tokio::test]
+async fn completion_offers_schema_references_only_inside_the_directive_value() {
+    let mut harness = LspHarness::start().await;
+    let uri = harness.document_uri("config.rune");
+
+    harness.did_open(&uri, CONFIG_AFTER_SCHEMA_DIRECTIVE).await;
+    harness.discard_server_messages().await;
+
+    // Line 0 is `@schema "./schema.rune"`, so character 12 is inside the value.
+    let labels = completion_labels(&mut harness, &uri, 0, 12).await;
+    assert!(
+        labels.contains(&"./schema.rune".to_string()),
+        "the directive value offers schema references: {labels:?}"
+    );
+    assert!(labels.contains(&"./schemas/".to_string()), "{labels:?}");
+    assert!(!labels.contains(&"end".to_string()), "{labels:?}");
+
+    // Line 3 is the empty key position after the directive line.
+    let labels = completion_labels(&mut harness, &uri, 3, 2).await;
+    assert!(
+        labels.contains(&"end".to_string()),
+        "a later key is normal field and keyword completion: {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"./schema.rune".to_string()),
+        "the directive value must not reach a later line: {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"$env.".to_string()),
+        "a `$` inside an earlier string must not offer reference items here: {labels:?}"
+    );
+
+    // A still-open `@schema "` has no string token at all, and is still the
+    // directive's value: the same line after the opening quote is the context.
+    harness.replace_document(&uri, 2, "@schema \"").await;
+    harness.discard_server_messages().await;
+
+    let labels = completion_labels(&mut harness, &uri, 0, 9).await;
+    assert!(
+        labels.contains(&"./schema.rune".to_string()),
+        "an unterminated directive value is still the directive's value: {labels:?}"
+    );
+    assert!(!labels.contains(&"end".to_string()), "{labels:?}");
 }

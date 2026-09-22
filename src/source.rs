@@ -168,19 +168,6 @@ impl LineIndex {
         Some(span.end)
     }
 
-    /// The text of `position`'s line up to the cursor.
-    pub(crate) fn text_before(&self, position: Position) -> &str {
-        let Some(offset) = self.position_to_byte(position) else {
-            return "";
-        };
-        let Some(span) = self.line_span(self.line_of(offset)) else {
-            return "";
-        };
-        self.text
-            .get(span.start..offset.max(span.start))
-            .unwrap_or("")
-    }
-
     pub(crate) fn range(&self, span: Span) -> Range {
         Range::new(
             self.byte_to_position(span.start),
@@ -319,9 +306,15 @@ pub(crate) struct SourceEntry {
 }
 
 /// A tolerant, span-aware view of one RUNE buffer.
+///
+/// The token stream the index was built from is kept, because a cursor question
+/// that is about a token rather than about structure - a quoted `@schema`
+/// value, or a `$...` reference run - is answered from real tokens instead of
+/// from raw line text.
 #[derive(Debug, Clone)]
 pub(crate) struct SourceIndex {
     lines: LineIndex,
+    tokens: Vec<SpannedToken>,
     entries: Vec<SourceEntry>,
     stray_closers: Vec<StrayCloserSpan>,
 }
@@ -334,6 +327,7 @@ impl SourceIndex {
 
         Self {
             lines,
+            tokens,
             entries,
             stray_closers,
         }
@@ -373,6 +367,112 @@ impl SourceIndex {
         self.entries
             .iter()
             .find(|entry| entry.kind.is_field() && entry.key_span.touches(offset))
+    }
+
+    /// The full token span of an entry's quoted value: the string token that
+    /// starts at the value's first byte, quotes included.
+    ///
+    /// `None` when the entry has no value at all, or when its value does not
+    /// open with a string literal, such as an array or a regex. A still-open
+    /// string yields no token either: the indexer stops at the unterminated
+    /// literal.
+    pub(crate) fn quoted_value_span(&self, entry: &SourceEntry) -> Option<Span> {
+        let start = entry.value_span?.start;
+
+        self.tokens
+            .iter()
+            .find(|token| token.span.start == start)
+            .filter(|token| matches!(token.token, Token::String(_)))
+            .map(|token| token.span)
+    }
+
+    /// True when the cursor is inside the quoted value of the named metadata
+    /// directive, such as `@schema "name"`.
+    ///
+    /// An unterminated `@schema "` has no string token, so it is recognised
+    /// from the directive's own line alone: the cursor must sit after the
+    /// opening quote on that line. No other line and no wider prefix takes
+    /// part.
+    pub(crate) fn metadata_string_context(&self, name: &str, position: Position) -> bool {
+        let Some(offset) = self.offset_at(position) else {
+            return false;
+        };
+        let Some(entry) = self.entries.iter().find(|entry| {
+            entry.kind == SourceEntryKind::Metadata && entry.name.as_deref() == Some(name)
+        }) else {
+            return false;
+        };
+
+        match self.quoted_value_span(entry) {
+            Some(span) => span.touches(offset),
+            None => entry.value_span.is_none() && self.after_open_quote(entry, offset),
+        }
+    }
+
+    /// True when `offset` lies after the opening quote of a still-open string
+    /// value on the directive's own line.
+    fn after_open_quote(&self, entry: &SourceEntry, offset: usize) -> bool {
+        let line = self.lines.line_of(entry.key_span.start);
+        let Some(span) = self.lines.line_span(line) else {
+            return false;
+        };
+        if offset > span.end {
+            return false;
+        }
+
+        let Some(rest) = self.text().get(entry.key_span.end..span.end) else {
+            return false;
+        };
+        rest.find('"')
+            .is_some_and(|quote| offset > entry.key_span.end + quote)
+    }
+
+    /// True when the cursor touches a `$...` reference run: a `Dollar` token
+    /// followed by the contiguous components of the same reference. The cursor
+    /// may sit anywhere on the run, exactly at its end included.
+    ///
+    /// A `$` inside a string literal is part of that string token and never a
+    /// `Dollar` token, so it never forms a run; a finished `$...` somewhere
+    /// else is a different run and does not qualify.
+    pub(crate) fn dollar_reference_context(&self, position: Position) -> bool {
+        let Some(offset) = self.offset_at(position) else {
+            return false;
+        };
+
+        self.dollar_reference_spans()
+            .into_iter()
+            .any(|span| span.touches(offset))
+    }
+
+    /// Byte spans of the `$...` reference runs of the buffer.
+    fn dollar_reference_spans(&self) -> Vec<Span> {
+        let mut spans = Vec::new();
+        let mut index = 0;
+
+        while let Some(token) = self.tokens.get(index) {
+            if token.token != Token::Dollar {
+                index += 1;
+                continue;
+            }
+
+            let start = token.span.start;
+            let mut end = token.span.end;
+            let mut next = index + 1;
+
+            while let Some(component) = self.tokens.get(next) {
+                let is_component = matches!(component.token, Token::Ident(_) | Token::Dot);
+                if !is_component || component.span.start != end {
+                    break;
+                }
+                end = component.span.end;
+                next += 1;
+            }
+
+            spans.push(Span::new(start, end));
+            index = next;
+        }
+
+        spans
     }
 
     /// The assignment on the cursor's line once its key is complete and the
@@ -998,7 +1098,6 @@ mod tests {
             index.full_range(),
             Range::new(position(0, 0), position(1, 8))
         );
-        assert_eq!(index.text_before(position(1, 4)), "name");
         assert_eq!(index.indent(1), "");
     }
 
