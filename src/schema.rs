@@ -765,4 +765,23 @@ end
             }
         ));
     }
+
+    #[test]
+    fn comments_before_blocks_are_ignored_and_hashes_survive_enum_values() {
+        let schema = SchemaDocument::from_str(
+            "schema app:\n  \"weird\" enum [\"a#b\", plain] required\nend\n# Not a description.\nschema other:\n  value string\nend\n",
+        )
+        .unwrap();
+
+        assert_eq!(schema.blocks.len(), 2);
+        assert_eq!(
+            schema.blocks[0].fields[0].kind,
+            SchemaType::Enum(vec!["a#b".into(), "plain".into()]),
+            "a '#' inside an enum value must not truncate it"
+        );
+        assert_eq!(
+            schema.blocks[1].fields[0].description, None,
+            "comments before a schema block must not become descriptions"
+        );
+    }
 }

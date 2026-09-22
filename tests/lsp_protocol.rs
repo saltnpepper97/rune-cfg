@@ -922,6 +922,454 @@ async fn schema_diagnostics_use_indexed_source_spans() {
     );
 }
 
+/// A schema whose block root and field name are both quoted. The quotes are
+/// not part of the names, so navigation and rename must use the span between
+/// them.
+const SCHEMA_QUOTED_KEYS: &str = "schema \"app\":\n  \"name\" string default \"x\"\nend\n";
+
+/// A config exercising [`SCHEMA_QUOTED_KEYS`] with quoted keys of its own and a
+/// `#` inside a value that must not shift the key position.
+const CONFIG_QUOTED_KEYS: &str = "app:\n  \"name\" \"a#b\"\nend\n";
+
+/// Navigation and rename on a quoted schema key use the inner name span: the
+/// quotes survive a rename because the edit range never covers them, and a
+/// cursor on a quote, on a type, or on a default is not a rename target.
+#[tokio::test]
+async fn quoted_schema_keys_use_inner_name_spans() {
+    let mut harness = LspHarness::start().await;
+    let schema_uri = harness.document_uri("schema.rune");
+    let config_uri = harness.document_uri("config.rune");
+
+    harness.did_open(&schema_uri, SCHEMA_QUOTED_KEYS).await;
+    harness.did_open(&config_uri, CONFIG_QUOTED_KEYS).await;
+    harness.discard_server_messages().await;
+
+    // `SCHEMA_QUOTED_KEYS` line 1 is `  "name" string default "x"`: the name
+    // occupies characters 3..7 between the quotes.
+    let name_range = json!({
+        "start": { "line": 1, "character": 3 },
+        "end": { "line": 1, "character": 7 },
+    });
+
+    // `CONFIG_QUOTED_KEYS` line 1 is `  "name" "a#b"`; character 4 sits inside
+    // the quoted key, and the `#` in the value must not affect it.
+    let definition = harness
+        .request(
+            "textDocument/definition",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 1, "character": 4 },
+            }),
+        )
+        .await;
+    assert_eq!(definition["uri"], json!(schema_uri.as_str()));
+    assert_eq!(
+        definition["range"], name_range,
+        "goto-definition must land on the decoded key, not on its quotes"
+    );
+
+    let references = harness
+        .request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": schema_uri },
+                "position": { "line": 1, "character": 4 },
+                "context": { "includeDeclaration": true },
+            }),
+        )
+        .await;
+    let locations = references
+        .as_array()
+        .unwrap_or_else(|| panic!("references must return locations, got {references}"));
+    assert_eq!(
+        locations.len(),
+        2,
+        "one schema declaration plus one config usage: {references}"
+    );
+    for location in locations {
+        assert_eq!(
+            location["range"], name_range,
+            "every occurrence of a quoted key is its inner span: {references}"
+        );
+    }
+
+    let prepare = harness
+        .request(
+            "textDocument/prepareRename",
+            json!({
+                "textDocument": { "uri": schema_uri },
+                "position": { "line": 1, "character": 4 },
+            }),
+        )
+        .await;
+    assert_eq!(
+        prepare, name_range,
+        "prepareRename must report the inner name span"
+    );
+
+    // Character 2 is the opening quote, character 10 is inside the `string`
+    // type, and character 25 is inside the `"x"` default: none of them may
+    // offer a rename, and a direct rename must reject them as well.
+    for character in [2, 10, 25] {
+        let prepare = harness
+            .request(
+                "textDocument/prepareRename",
+                json!({
+                    "textDocument": { "uri": schema_uri },
+                    "position": { "line": 1, "character": character },
+                }),
+            )
+            .await;
+        assert_eq!(
+            prepare,
+            Value::Null,
+            "character {character} is not part of the name token"
+        );
+
+        let rename = harness
+            .request(
+                "textDocument/rename",
+                json!({
+                    "textDocument": { "uri": schema_uri },
+                    "position": { "line": 1, "character": character },
+                    "newName": "title",
+                }),
+            )
+            .await;
+        assert_eq!(
+            rename,
+            Value::Null,
+            "a direct rename must reject character {character} too"
+        );
+    }
+
+    // Renaming the field edits only the inner span on both sides, so the
+    // schema's quotes remain in place around the new name.
+    let rename = harness
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": schema_uri },
+                "position": { "line": 1, "character": 4 },
+                "newName": "title",
+            }),
+        )
+        .await;
+    let changes = rename["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("rename must return a workspace edit, got {rename}"));
+    assert_eq!(changes.len(), 2, "the declaration and the usage: {rename}");
+    assert_eq!(
+        changes[schema_uri.as_str()],
+        json!([{ "range": name_range, "newText": "title" }]),
+        "the schema edit must not eat the quotes: {rename}"
+    );
+    assert_eq!(
+        changes[config_uri.as_str()],
+        json!([{ "range": name_range, "newText": "title" }]),
+        "the quoted config key is edited at its inner span too: {rename}"
+    );
+
+    // Line 0 is `schema "app":`; the quoted root name sits at 8..11 and gets
+    // the same treatment as the quoted field name.
+    let root_range = json!({
+        "start": { "line": 0, "character": 8 },
+        "end": { "line": 0, "character": 11 },
+    });
+    let prepare = harness
+        .request(
+            "textDocument/prepareRename",
+            json!({
+                "textDocument": { "uri": schema_uri },
+                "position": { "line": 0, "character": 9 },
+            }),
+        )
+        .await;
+    assert_eq!(prepare, root_range);
+
+    let rename = harness
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": schema_uri },
+                "position": { "line": 0, "character": 9 },
+                "newName": "main",
+            }),
+        )
+        .await;
+    let changes = rename["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("rename must return a workspace edit, got {rename}"));
+    assert_eq!(
+        changes[schema_uri.as_str()],
+        json!([{ "range": root_range, "newText": "main" }]),
+        "the quoted root is renamed through its inner span: {rename}"
+    );
+    assert_eq!(
+        changes[config_uri.as_str()],
+        json!([{
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 3 },
+            },
+            "newText": "main",
+        }]),
+        "the config usage of the root is the `app` key: {rename}"
+    );
+}
+
+/// A schema declaring the quoted non-BMP key `𐐀name`, which is one char but
+/// two UTF-16 code units and four UTF-8 bytes wide.
+const SCHEMA_NON_BMP_QUOTED_KEY: &str = "schema app:\n  \"\u{10400}name\" string\nend\n";
+
+/// A config exercising [`SCHEMA_NON_BMP_QUOTED_KEY`] through the same quoted
+/// non-BMP key.
+const CONFIG_NON_BMP_QUOTED_KEY: &str = "app:\n  \"\u{10400}name\" \"Rune\"\nend\n";
+
+/// Every range of a non-BMP quoted schema key is measured in UTF-16 code
+/// units: the key `𐐀name` runs from character 3 to character 9 - two units
+/// for the astral character - and never from chars or UTF-8 bytes.
+#[tokio::test]
+async fn non_bmp_quoted_schema_key_uses_utf16_ranges() {
+    let mut harness = LspHarness::start().await;
+    let schema_uri = harness.document_uri("schema.rune");
+    let config_uri = harness.document_uri("config.rune");
+
+    harness
+        .did_open(&schema_uri, SCHEMA_NON_BMP_QUOTED_KEY)
+        .await;
+    harness
+        .did_open(&config_uri, CONFIG_NON_BMP_QUOTED_KEY)
+        .await;
+    harness.discard_server_messages().await;
+
+    // Line 1 is `  "𐐀name" string`; character 5 sits inside the key, and
+    // the decoded name spans UTF-16 characters 3..9.
+    let name_range = json!({
+        "start": { "line": 1, "character": 3 },
+        "end": { "line": 1, "character": 9 },
+    });
+
+    let definition = harness
+        .request(
+            "textDocument/definition",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 1, "character": 5 },
+            }),
+        )
+        .await;
+    assert_eq!(definition["uri"], json!(schema_uri.as_str()));
+    assert_eq!(
+        definition["range"], name_range,
+        "the declaration range must count UTF-16 code units"
+    );
+
+    let prepare = harness
+        .request(
+            "textDocument/prepareRename",
+            json!({
+                "textDocument": { "uri": schema_uri },
+                "position": { "line": 1, "character": 5 },
+            }),
+        )
+        .await;
+    assert_eq!(prepare, name_range);
+
+    let references = harness
+        .request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": schema_uri },
+                "position": { "line": 1, "character": 5 },
+                "context": { "includeDeclaration": true },
+            }),
+        )
+        .await;
+    let locations = references
+        .as_array()
+        .unwrap_or_else(|| panic!("references must return locations, got {references}"));
+    assert_eq!(
+        locations.len(),
+        2,
+        "one schema declaration plus one config usage: {references}"
+    );
+    for location in locations {
+        assert_eq!(
+            location["range"], name_range,
+            "every occurrence is the UTF-16 inner span: {references}"
+        );
+    }
+
+    let rename = harness
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": schema_uri },
+                "position": { "line": 1, "character": 5 },
+                "newName": "title",
+            }),
+        )
+        .await;
+    let changes = rename["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("rename must return a workspace edit, got {rename}"));
+    assert_eq!(changes.len(), 2, "the declaration and the usage: {rename}");
+    assert_eq!(
+        changes[schema_uri.as_str()],
+        json!([{ "range": name_range, "newText": "title" }]),
+        "the schema edit must replace exactly `𐐀name` in UTF-16 units: {rename}"
+    );
+    assert_eq!(
+        changes[config_uri.as_str()],
+        json!([{ "range": name_range, "newText": "title" }]),
+        "the config edit is measured the same way: {rename}"
+    );
+}
+
+/// A schema that breaks right after a quoted non-BMP key: `=` is no valid
+/// schema token.
+const SCHEMA_INVALID_AFTER_NON_BMP_KEY: &str = "schema app:\n  \"\u{10400}name\" =\nend\n";
+
+/// Schema parse errors are published at UTF-16 columns. After the quoted
+/// non-BMP key on line 1, the invalid `=` sits at character 11 in UTF-16 code
+/// units - one more than the char count and two less than the byte count.
+#[tokio::test]
+async fn schema_error_after_non_bmp_key_publishes_utf16_column() {
+    let mut harness = LspHarness::start().await;
+    let schema_uri = harness.document_uri("schema.rune");
+
+    harness
+        .did_open(&schema_uri, SCHEMA_INVALID_AFTER_NON_BMP_KEY)
+        .await;
+
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "the schema publishes for itself: {published:#?}"
+    );
+    let schema = diagnostics_for(&published, &schema_uri, Some(1));
+    assert_eq!(schema.diagnostics.len(), 1, "{published:#?}");
+
+    let error = diagnostic_with_message(&schema.diagnostics, "Unknown schema type");
+    assert_eq!(error["code"], json!(600));
+    assert_eq!(
+        error["range"],
+        json!({
+            "start": { "line": 1, "character": 11 },
+            "end": { "line": 1, "character": 12 },
+        }),
+        "the column must count UTF-16 code units after the non-BMP key"
+    );
+}
+
+/// `schema schema:` with a default that repeats the field name: each line
+/// carries the name twice, and only the declaration's own token is the rename
+/// target.
+const SCHEMA_REPEATED_NAMES: &str = "schema schema:\n  name string default name\nend\n";
+
+/// The stored name span - not the first or last name-looking token on the
+/// line - decides what `schema schema:` and a repeated name select.
+#[tokio::test]
+async fn schema_declarations_select_the_exact_name_token() {
+    let mut harness = LspHarness::start().await;
+    let schema_uri = harness.document_uri("schema.rune");
+
+    harness.did_open(&schema_uri, SCHEMA_REPEATED_NAMES).await;
+    harness.discard_server_messages().await;
+
+    // Line 0 is `schema schema:`; the keyword at character 2 is not the root
+    // name, which sits at 7..13.
+    let on_keyword = harness
+        .request(
+            "textDocument/prepareRename",
+            json!({
+                "textDocument": { "uri": schema_uri },
+                "position": { "line": 0, "character": 2 },
+            }),
+        )
+        .await;
+    assert_eq!(
+        on_keyword,
+        Value::Null,
+        "the `schema` keyword is not the root name"
+    );
+
+    let on_root = harness
+        .request(
+            "textDocument/prepareRename",
+            json!({
+                "textDocument": { "uri": schema_uri },
+                "position": { "line": 0, "character": 9 },
+            }),
+        )
+        .await;
+    assert_eq!(
+        on_root,
+        json!({
+            "start": { "line": 0, "character": 7 },
+            "end": { "line": 0, "character": 13 },
+        })
+    );
+
+    let rename = harness
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": schema_uri },
+                "position": { "line": 0, "character": 9 },
+                "newName": "app",
+            }),
+        )
+        .await;
+    assert_eq!(
+        rename["changes"][schema_uri.as_str()],
+        json!([{
+            "range": {
+                "start": { "line": 0, "character": 7 },
+                "end": { "line": 0, "character": 13 },
+            },
+            "newText": "app",
+        }]),
+        "renaming the root must edit the name token, not the keyword: {rename}"
+    );
+
+    // Line 1 is `  name string default name`; the trailing `name` repeats the
+    // field name as its default and is not the declaration.
+    let on_default = harness
+        .request(
+            "textDocument/prepareRename",
+            json!({
+                "textDocument": { "uri": schema_uri },
+                "position": { "line": 1, "character": 24 },
+            }),
+        )
+        .await;
+    assert_eq!(
+        on_default,
+        Value::Null,
+        "the repeated name is the default, not the declaration"
+    );
+
+    let on_field = harness
+        .request(
+            "textDocument/prepareRename",
+            json!({
+                "textDocument": { "uri": schema_uri },
+                "position": { "line": 1, "character": 3 },
+            }),
+        )
+        .await;
+    assert_eq!(
+        on_field,
+        json!({
+            "start": { "line": 1, "character": 2 },
+            "end": { "line": 1, "character": 6 },
+        })
+    );
+}
+
 /// Two unrelated configs, with no schema anywhere: opening or changing one
 /// publishes for that document alone, and closing it clears its diagnostics
 /// with a `null` version.
