@@ -357,6 +357,36 @@ impl LspHarness {
             .expect("the server handles the notification");
     }
 
+    /// Sends two notifications the way a real client overlaps them on the
+    /// wire: both handler futures are created first, then driven together, so
+    /// each runs until it must wait for something. This is the concurrency the
+    /// server's own transport provides.
+    async fn notify_concurrently(
+        &mut self,
+        first: (&'static str, Value),
+        second: (&'static str, Value),
+    ) {
+        let first = JsonRpcRequest::build(first.0).params(first.1).finish();
+        let second = JsonRpcRequest::build(second.0).params(second.1).finish();
+
+        let first = self
+            .service
+            .ready()
+            .await
+            .expect("service accepts the first notification")
+            .call(first);
+        let second = self
+            .service
+            .ready()
+            .await
+            .expect("service accepts the second notification")
+            .call(second);
+
+        let (first, second) = futures::future::join(first, second).await;
+        first.expect("the server handles the first notification");
+        second.expect("the server handles the second notification");
+    }
+
     /// Opens a document with full-text sync, which is the sync kind the server
     /// advertises.
     async fn did_open(&mut self, uri: &Url, text: &str) {
@@ -3285,5 +3315,78 @@ async fn an_excluded_directory_still_resolves_for_open_documents() {
     assert!(
         !uris.iter().any(|uri| uri.contains("local.rune")),
         "the open document bound to its own schema is not a target here: {references}"
+    );
+}
+
+/// A watcher event racing a `didOpen` for the same file never replaces the
+/// buffer with disk text.
+///
+/// Regression guard: the watcher batch classified its events against the open
+/// documents before taking the index gate. tower-lsp dispatches messages
+/// concurrently, so a `didOpen` could finish first and still be overwritten
+/// from disk: the buffer with two usages was replaced by the disk copy with
+/// one, and the document dropped out of cross-file navigation entirely.
+#[tokio::test]
+async fn a_watched_change_never_overwrites_a_concurrently_opened_buffer() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let schema_uri = harness.document_uri("schema.rune");
+
+    // The disk copy writes `app.name` once; the buffer that opens concurrently
+    // with the watcher event writes it twice.
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    harness.write_file("config.rune", CONFIG_STRING_VALUE);
+
+    harness
+        .notify_concurrently(
+            (
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": config_uri,
+                        "languageId": "runecfg",
+                        "version": 1,
+                        "text": CONFIG_TWO_USAGES,
+                    }
+                }),
+            ),
+            (
+                "workspace/didChangeWatchedFiles",
+                json!({ "changes": [{ "uri": config_uri, "type": 2 }] }),
+            ),
+        )
+        .await;
+    harness.discard_server_messages().await;
+
+    let references = harness
+        .request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 1, "character": 3 },
+                "context": { "includeDeclaration": true },
+            }),
+        )
+        .await;
+
+    let locations = references
+        .as_array()
+        .unwrap_or_else(|| panic!("references must return locations, got {references}"));
+    assert_eq!(
+        locations.len(),
+        3,
+        "the declaration and both buffer usages, never the single disk usage: {references}"
+    );
+    let uris: Vec<&str> = locations
+        .iter()
+        .filter_map(|location| location["uri"].as_str())
+        .collect();
+    assert!(uris.contains(&schema_uri.as_str()), "{references}");
+    assert_eq!(
+        uris.iter()
+            .filter(|uri| **uri == config_uri.as_str())
+            .count(),
+        2,
+        "both usages in the open buffer are reported: {references}"
     );
 }

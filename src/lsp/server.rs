@@ -1419,54 +1419,62 @@ impl LanguageServer for RuneLanguageServer {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        let folders = self.workspace_paths().await;
-        let open: HashSet<Url> = self.documents.read().await.keys().cloned().collect();
         let mut changed: Vec<Url> = Vec::new();
         let mut removed: Vec<Url> = Vec::new();
-
-        for event in params.changes {
-            if event.typ != FileChangeType::CREATED
-                && event.typ != FileChangeType::CHANGED
-                && event.typ != FileChangeType::DELETED
-            {
-                continue;
-            }
-
-            // A file the editor holds a buffer for is the editor's business
-            // alone, and the batch is deduplicated before it is reconciled.
-            if !is_rune_file(&event.uri)
-                || open.contains(&event.uri)
-                || changed.contains(&event.uri)
-                || removed.contains(&event.uri)
-            {
-                continue;
-            }
-
-            if event.typ == FileChangeType::DELETED {
-                removed.push(event.uri);
-                continue;
-            }
-
-            // Only a file the workspace owns, or one the index already holds,
-            // is re-read: an event for a file inside an excluded directory
-            // does not turn bulk indexing on for it.
-            let eligible = match event.uri.to_file_path() {
-                Ok(path) => self.index.read().await.indexes_event(&path, &folders),
-                Err(_) => false,
-            };
-            if eligible {
-                changed.push(event.uri);
-            }
-        }
-
-        if changed.is_empty() && removed.is_empty() {
-            return;
-        }
-
-        let availability: Vec<Url> = changed.iter().chain(&removed).cloned().collect();
+        let mut availability: Vec<Url> = Vec::new();
 
         {
+            // The whole batch is classified and applied under one gate hold.
+            // The open buffers and the index membership the classification
+            // reads are only stable in here: tower-lsp dispatches messages
+            // concurrently, so a `didOpen` or `didChange` racing this batch
+            // must never have its buffer replaced with disk text, and a delete
+            // must never drop an entry the editor just opened.
             let _gate = self.index_gate.lock().await;
+            let folders = self.workspace_paths().await;
+            let open: HashSet<Url> = self.documents.read().await.keys().cloned().collect();
+
+            for event in params.changes {
+                if event.typ != FileChangeType::CREATED
+                    && event.typ != FileChangeType::CHANGED
+                    && event.typ != FileChangeType::DELETED
+                {
+                    continue;
+                }
+
+                // A file the editor holds a buffer for is the editor's business
+                // alone, and the batch is deduplicated before it is reconciled.
+                if !is_rune_file(&event.uri)
+                    || open.contains(&event.uri)
+                    || changed.contains(&event.uri)
+                    || removed.contains(&event.uri)
+                {
+                    continue;
+                }
+
+                if event.typ == FileChangeType::DELETED {
+                    removed.push(event.uri);
+                    continue;
+                }
+
+                // Only a file the workspace owns, or one the index already
+                // holds, is re-read: an event for a file inside an excluded
+                // directory does not turn bulk indexing on for it.
+                let eligible = match event.uri.to_file_path() {
+                    Ok(path) => self.index.read().await.indexes_event(&path, &folders),
+                    Err(_) => false,
+                };
+                if eligible {
+                    changed.push(event.uri);
+                }
+            }
+
+            if changed.is_empty() && removed.is_empty() {
+                return;
+            }
+
+            availability.extend(changed.iter().chain(&removed).cloned());
+
             // Created and changed files replace exactly their own entry; no
             // parent directory is rescanned, so a file nobody reported stays
             // invisible.

@@ -315,8 +315,8 @@ pub(crate) fn read_text(path: &Path) -> Option<String> {
 /// exactly this text.
 ///
 /// This is what keeps unchanged text from being reparsed: a version-only
-/// change, a rebuild overlay, and a watcher event that reports the same bytes
-/// all keep the same `Arc`.
+/// change, a rebuild, and a watcher event that reports the same bytes all keep
+/// the same `Arc`.
 pub(crate) fn reuse_or_index(existing: Option<Arc<SourceIndex>>, text: &str) -> Arc<SourceIndex> {
     match existing {
         Some(existing) if existing.text() == text => existing,
@@ -457,7 +457,10 @@ pub(crate) fn build_workspace_index(
         let Some(text) = read_text(&path) else {
             continue;
         };
-        let source = Arc::new(SourceIndex::new(&text));
+        // A rebuild never reparses text that did not change either: the
+        // previous index is the reuse source for every member the scan
+        // rediscovers.
+        let source = reuse_or_index(previous.source(&uri), &text);
         let candidates = candidate_paths(&uri, &source, folders);
         let indexed = candidates
             .iter()
@@ -1016,6 +1019,40 @@ end
         assert_eq!(third.text(), changed);
         // The text the earlier sources were built from is untouched.
         assert_eq!(second.text(), TEXT);
+    }
+
+    /// A rebuild reuses the source of every file whose text did not change, so
+    /// rediscovering an unchanged workspace member never reparses it.
+    #[test]
+    fn a_rebuild_reuses_sources_for_unchanged_members() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let root = std::fs::canonicalize(root.path()).expect("canonical root");
+        std::fs::write(root.join("config.rune"), TEXT).expect("write config");
+
+        let folders = vec![root.clone()];
+        let first = build_workspace_index(
+            std::slice::from_ref(&root),
+            &folders,
+            &ScanExcludes::default(),
+            &HashMap::new(),
+            &WorkspaceFileIndex::default(),
+        );
+        let uri = Url::from_file_path(root.join("config.rune")).unwrap();
+        let first_source = first.source(&uri).expect("the scanned config is indexed");
+
+        let second = build_workspace_index(
+            std::slice::from_ref(&root),
+            &folders,
+            &ScanExcludes::default(),
+            &HashMap::new(),
+            &first,
+        );
+        let second_source = second.source(&uri).expect("the scanned config is indexed");
+
+        assert!(
+            Arc::ptr_eq(&first_source, &second_source),
+            "an unchanged member must keep its source across a rebuild"
+        );
     }
 
     #[test]
