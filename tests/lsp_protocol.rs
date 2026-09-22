@@ -14,15 +14,20 @@
 //! measured positions in UTF-8 bytes. They are regression tests now: each one
 //! names the defect it pins down in its doc comment, and none of them shape
 //! their assertions around any particular implementation.
+//!
+//! The dependency and filesystem lifecycle tests at the end drive the same
+//! server through the events an editor sends for buffers and for files on
+//! disk: `didOpen`, `didChange`, `didClose`, `didChangeWatchedFiles`, and
+//! `didChangeWorkspaceFolders`. Every one of them asserts the exact set of
+//! published diagnostics, because the server's contract is that a document
+//! unrelated to a change is never republished.
 
 use std::path::Path;
-use std::time::Duration;
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use rune_cfg::lsp::RuneLanguageServer;
 use serde_json::{Value, json};
-use tokio::time::timeout;
 use tower::{Service, ServiceExt};
 use tower_lsp::jsonrpc::Request as JsonRpcRequest;
 use tower_lsp::lsp_types::Url;
@@ -61,10 +66,27 @@ end
 /// point, two UTF-16 code units, and four UTF-8 bytes.
 const UNFORMATTED_CONFIG: &str = "app:\nname \"😀\"";
 
-/// Budget for one server-to-client message. Every message this server sends is
-/// produced while the triggering request or notification is being handled, so
-/// this only bounds the wait when an expectation is wrong.
-const MESSAGE_BUDGET: Duration = Duration::from_secs(5);
+/// A config with an explicit relative schema reference and a string
+/// `app.name`.
+const CONFIG_WITH_CUSTOM_SCHEMA: &str = r#"@schema "./custom.rune"
+app:
+  name "Rune"
+end
+"#;
+
+/// A config bound to `other.rune` next to it.
+const CONFIG_BOUND_TO_OTHER_SCHEMA: &str = r#"@schema "./other.rune"
+app:
+  name "Rune"
+end
+"#;
+
+/// A config bound to the `shared.rune` next to it.
+const CONFIG_BOUND_TO_SHARED_SCHEMA: &str = r#"@schema "./shared.rune"
+app:
+  name "Rune"
+end
+"#;
 
 /// Scheduler turns used to hand over a message that is still sitting in the
 /// server's capacity-1 socket channel when a call returns.
@@ -143,6 +165,7 @@ struct LspHarness {
     next_request_id: i64,
     forwarder: tokio::task::JoinHandle<()>,
     workspace: tempfile::TempDir,
+    initialize_result: Value,
 }
 
 impl Drop for LspHarness {
@@ -154,48 +177,78 @@ impl Drop for LspHarness {
 impl LspHarness {
     /// Boots the same `LspService`/`ClientSocket` pair the `rune-lsp` binary
     /// uses, points it at a fresh temporary workspace, and completes the LSP
-    /// handshake.
+    /// handshake with that workspace as `rootUri`.
     async fn start() -> Self {
+        let mut harness = Self::boot().await;
+        let root_uri =
+            Url::from_directory_path(harness.workspace.path()).expect("workspace root uri");
+
+        harness
+            .initialize(json!({
+                "processId": Value::Null,
+                "rootUri": root_uri,
+                "capabilities": {},
+            }))
+            .await;
+
+        harness
+    }
+
+    /// Boots a harness and completes the handshake with the `initialize` params
+    /// `build` derives from the temporary workspace path.
+    ///
+    /// This is how a test describes the workspace the client offers: no
+    /// `rootUri` at all, one or more workspace folders, or a folder nested
+    /// inside the temporary directory so its parent can hold a schema too.
+    async fn start_with_initializer(build: impl FnOnce(&Path) -> Value) -> Self {
+        let mut harness = Self::boot().await;
+        let params = build(harness.workspace.path());
+
+        harness.initialize(params).await;
+
+        harness
+    }
+
+    /// Creates the service, the client socket and the forwarder task, without
+    /// sending anything on the wire yet.
+    async fn boot() -> Self {
         let workspace = tempfile::tempdir().expect("temporary workspace");
         let (service, socket) = LspService::new(RuneLanguageServer::new);
         let (sender, incoming) = unbounded();
         let forwarder = tokio::spawn(forward_client_messages(socket, sender));
 
-        let mut harness = Self {
+        Self {
             service,
             incoming,
             next_request_id: 0,
             forwarder,
             workspace,
-        };
+            initialize_result: Value::Null,
+        }
+    }
 
-        let root_uri =
-            Url::from_directory_path(harness.workspace.path()).expect("workspace root uri");
-        let result = harness
-            .request(
-                "initialize",
-                json!({
-                    "processId": Value::Null,
-                    "rootUri": root_uri,
-                    "capabilities": {},
-                }),
-            )
-            .await;
+    /// Sends `initialize`, asserts the server reported capabilities, completes
+    /// the handshake, and drops the log message `initialized` produces: nothing
+    /// else is on the wire before a document is opened.
+    async fn initialize(&mut self, params: Value) {
+        let result = self.request("initialize", params).await;
         assert!(
             result.get("capabilities").is_some(),
             "initialize must report server capabilities, got {result}"
         );
+        self.initialize_result = result;
 
-        harness.notify("initialized", json!({})).await;
-        // The `initialized` handler logs to the window; nothing else should be
-        // on the wire before a document is opened.
-        harness.discard_server_messages().await;
-
-        harness
+        self.notify("initialized", json!({})).await;
+        self.discard_server_messages().await;
     }
 
-    /// Path of the temporary workspace, which stays empty: documents are only
-    /// ever opened in memory.
+    /// The `InitializeResult` the server sent during the handshake.
+    fn initialize_result(&self) -> &Value {
+        &self.initialize_result
+    }
+
+    /// Path of the temporary workspace, which holds every file a test writes to
+    /// disk: other documents are only ever opened in memory.
     fn workspace_path(&self) -> &Path {
         self.workspace.path()
     }
@@ -203,6 +256,31 @@ impl LspHarness {
     /// File URI for a document in the temporary workspace.
     fn document_uri(&self, file_name: &str) -> Url {
         Url::from_file_path(self.workspace.path().join(file_name)).expect("document uri")
+    }
+
+    /// File URI for a path relative to the temporary workspace.
+    fn file_uri(&self, relative: &str) -> Url {
+        Url::from_file_path(self.workspace.path().join(relative)).expect("file uri")
+    }
+
+    /// Directory URI for a path relative to the temporary workspace, with the
+    /// trailing separator a workspace folder carries.
+    fn directory_uri(&self, relative: &str) -> Url {
+        Url::from_directory_path(self.workspace.path().join(relative)).expect("directory uri")
+    }
+
+    /// Writes a file into the temporary workspace, creating parent directories.
+    fn write_file(&self, relative: &str, text: &str) {
+        let path = self.workspace.path().join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent directory");
+        }
+        std::fs::write(path, text).expect("write file");
+    }
+
+    /// Removes a file from the temporary workspace.
+    fn remove_file(&self, relative: &str) {
+        std::fs::remove_file(self.workspace.path().join(relative)).expect("remove file");
     }
 
     /// Sends a JSON-RPC request and returns its `result` payload.
@@ -269,6 +347,47 @@ impl LspHarness {
         .await;
     }
 
+    /// Closes an open document.
+    async fn did_close(&mut self, uri: &Url) {
+        self.notify(
+            "textDocument/didClose",
+            json!({ "textDocument": { "uri": uri } }),
+        )
+        .await;
+    }
+
+    /// Reports file events the client's watcher observed, as `(uri, type)`
+    /// pairs where the type is the LSP `FileChangeType` number: 1 created,
+    /// 2 changed, 3 deleted.
+    async fn did_change_watched_files(&mut self, events: &[(Url, i64)]) {
+        let changes: Vec<Value> = events
+            .iter()
+            .map(|(uri, typ)| json!({ "uri": uri, "type": typ }))
+            .collect();
+
+        self.notify(
+            "workspace/didChangeWatchedFiles",
+            json!({ "changes": changes }),
+        )
+        .await;
+    }
+
+    /// Reports workspace folders the client added and removed.
+    async fn did_change_workspace_folders(&mut self, added: &[Url], removed: &[Url]) {
+        let folder = |uri: &Url| json!({ "uri": uri, "name": "workspace" });
+
+        self.notify(
+            "workspace/didChangeWorkspaceFolders",
+            json!({
+                "event": {
+                    "added": added.iter().map(folder).collect::<Vec<_>>(),
+                    "removed": removed.iter().map(folder).collect::<Vec<_>>(),
+                }
+            }),
+        )
+        .await;
+    }
+
     /// Hands over every message the server has already produced.
     ///
     /// A call only returns once its handler finished, which leaves at most one
@@ -297,34 +416,19 @@ impl LspHarness {
         self.take_server_messages().await;
     }
 
-    /// Collects at least `needed` `textDocument/publishDiagnostics`
-    /// notifications, ignoring unrelated notifications such as
-    /// `window/logMessage`.
+    /// Every `textDocument/publishDiagnostics` notification the request or
+    /// notification that just returned produced, in the order sent.
     ///
-    /// Each notification is awaited with a timeout and the collection is
-    /// returned as-is when it runs out, so a wrong expectation fails an
-    /// assertion that prints what was actually published instead of hanging.
-    async fn collect_diagnostics(&mut self, needed: usize) -> Vec<PublishedDiagnostics> {
-        let mut collected: Vec<PublishedDiagnostics> = self
-            .take_server_messages()
+    /// Nothing here waits on a timeout, so asserting that a change publishes
+    /// *nothing* costs no wall-clock time: a call only returns once its handler
+    /// has finished, and the bounded number of scheduler turns is enough to
+    /// forward the message the capacity-1 socket channel may still hold.
+    async fn collect_diagnostics(&mut self) -> Vec<PublishedDiagnostics> {
+        self.take_server_messages()
             .await
             .into_iter()
             .filter_map(ServerMessage::into_publish_diagnostics)
-            .collect();
-
-        while collected.len() < needed {
-            match timeout(MESSAGE_BUDGET, self.incoming.next()).await {
-                Ok(Some(message)) => {
-                    if let Some(diagnostics) = message.into_publish_diagnostics() {
-                        collected.push(diagnostics);
-                    }
-                }
-                // The socket closed, or nothing else is coming.
-                Ok(None) | Err(_) => break,
-            }
-        }
-
-        collected
+            .collect()
     }
 }
 
@@ -507,6 +611,10 @@ async fn formatting_reports_utf16_end_position() {
 /// schema is open in memory, so this proves the server uses open dependency
 /// state rather than file contents. The order of the two notifications is not
 /// assumed, because the server walks its open documents through a `HashMap`.
+///
+/// Opening a document only publishes for that document, so the two opens below
+/// publish two notifications in total - the schema, then the config - and not
+/// one per open document.
 #[tokio::test]
 async fn schema_change_republishes_diagnostics_for_open_dependents() {
     let mut harness = LspHarness::start().await;
@@ -516,10 +624,17 @@ async fn schema_change_republishes_diagnostics_for_open_dependents() {
     harness.did_open(&schema_uri, SCHEMA_STRING_FIELD).await;
     harness.did_open(&config_uri, CONFIG_STRING_VALUE).await;
 
-    // Opening each document revalidates every open document: one publication
-    // for the schema after the first open, then the schema and the config after
-    // the second.
-    let published = harness.collect_diagnostics(3).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        2,
+        "each open publishes only its own document: {published:#?}"
+    );
+    let schema = diagnostics_for(&published, &schema_uri, Some(1));
+    assert!(
+        schema.diagnostics.is_empty(),
+        "a schema that parses cleanly has no diagnostics: {published:#?}"
+    );
     let config = diagnostics_for(&published, &config_uri, Some(1));
     assert!(
         config.diagnostics.is_empty(),
@@ -536,7 +651,12 @@ async fn schema_change_republishes_diagnostics_for_open_dependents() {
     harness
         .replace_document(&schema_uri, 2, SCHEMA_INT_FIELD)
         .await;
-    let published = harness.collect_diagnostics(2).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        2,
+        "the schema and the dependent config are republished: {published:#?}"
+    );
 
     let schema = diagnostics_for(&published, &schema_uri, Some(2));
     assert!(
@@ -747,9 +867,20 @@ async fn schema_diagnostics_use_indexed_source_spans() {
         .await;
     harness.did_open(&config_uri, CONDITIONAL_CRLF_CONFIG).await;
 
-    // Opening the schema publishes its own diagnostics; opening the config
-    // revalidates both open documents.
-    let published = harness.collect_diagnostics(3).await;
+    // Each open publishes only its own document, so no unrelated document is
+    // revalidated when a config is opened.
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        2,
+        "each open publishes only its own document: {published:#?}"
+    );
+    assert!(
+        diagnostics_for(&published, &schema_uri, Some(1))
+            .diagnostics
+            .is_empty(),
+        "the CRLF schema parses cleanly: {published:#?}"
+    );
     let config = diagnostics_for(&published, &config_uri, Some(1));
     assert_eq!(
         config.diagnostics.len(),
@@ -788,5 +919,732 @@ async fn schema_diagnostics_use_indexed_source_spans() {
             "start": { "line": 10, "character": 3 },
             "end": { "line": 10, "character": 9 },
         })
+    );
+}
+
+/// Two unrelated configs, with no schema anywhere: opening or changing one
+/// publishes for that document alone, and closing it clears its diagnostics
+/// with a `null` version.
+///
+/// Regression guard: the server used to revalidate every open document on
+/// every open, change, and close, so each of these steps published for both
+/// configs.
+#[tokio::test]
+async fn independent_configs_publish_only_the_document_that_changed() {
+    let mut harness = LspHarness::start().await;
+    let first = harness.document_uri("first.rune");
+    let second = harness.document_uri("second.rune");
+
+    // No schema exists, so each config has nothing to validate against.
+    harness.did_open(&first, CONFIG_STRING_VALUE).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "one open publishes one document: {published:#?}"
+    );
+    assert_eq!(published[0].uri, first);
+    assert_eq!(published[0].version, Some(1));
+    assert!(
+        published[0].diagnostics.is_empty(),
+        "a config with no schema is clean: {published:#?}"
+    );
+
+    harness.did_open(&second, CONFIG_STRING_VALUE).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "the first config is not revalidated by the second open: {published:#?}"
+    );
+    assert_eq!(published[0].uri, second);
+    assert_eq!(published[0].version, Some(1));
+    assert!(published[0].diagnostics.is_empty(), "{published:#?}");
+
+    harness
+        .replace_document(&first, 2, CONFIG_STRING_VALUE)
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "only the changed buffer is republished: {published:#?}"
+    );
+    assert_eq!(published[0].uri, first);
+    assert_eq!(published[0].version, Some(2));
+    assert!(published[0].diagnostics.is_empty(), "{published:#?}");
+
+    harness.did_close(&first).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "closing publishes only the closed document: {published:#?}"
+    );
+    assert_eq!(published[0].uri, first);
+    assert_eq!(
+        published[0].version, None,
+        "a closed document is cleared without a version: {published:#?}"
+    );
+    assert!(published[0].diagnostics.is_empty(), "{published:#?}");
+}
+
+/// An open `schema.rune` overrides the file of the same name on disk while it
+/// is open, and closing it hands the config back to the disk contents.
+///
+/// Regression guard: closing a document used to revalidate every other open
+/// document and left the closed buffer's own dependency state behind.
+#[tokio::test]
+async fn closing_an_open_schema_falls_back_to_the_schema_on_disk() {
+    let mut harness = LspHarness::start().await;
+    let schema_uri = harness.document_uri("schema.rune");
+    let config_uri = harness.document_uri("config.rune");
+
+    // The file on disk is the string schema; the buffer opens with the int one.
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+
+    harness.did_open(&schema_uri, SCHEMA_INT_FIELD).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "the schema is the only open document: {published:#?}"
+    );
+    assert_eq!(published[0].uri, schema_uri);
+    assert!(
+        published[0].diagnostics.is_empty(),
+        "the int schema parses cleanly: {published:#?}"
+    );
+
+    harness.did_open(&config_uri, CONFIG_STRING_VALUE).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "only the newly opened config is published: {published:#?}"
+    );
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(
+        config.diagnostics.len(),
+        1,
+        "the open int schema rejects the string value: {published:#?}"
+    );
+    assert!(
+        config.diagnostics[0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("expected int, got string"),
+        "unexpected diagnostic: {published:#?}"
+    );
+
+    harness.did_close(&schema_uri).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        2,
+        "the closed schema is cleared and the config is revalidated: {published:#?}"
+    );
+
+    let schema = diagnostics_for(&published, &schema_uri, None);
+    assert!(
+        schema.diagnostics.is_empty(),
+        "a closed document is cleared: {published:#?}"
+    );
+
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert!(
+        config.diagnostics.is_empty(),
+        "the config now validates against the string schema on disk: {published:#?}"
+    );
+}
+
+/// A watched change to the file a config resolved to republishes that config,
+/// and nothing else: a config bound to a different schema is untouched, and an
+/// unrelated `.rune` event publishes nothing at all.
+#[tokio::test]
+async fn watched_schema_change_republishes_only_bound_configs() {
+    let mut harness = LspHarness::start().await;
+    let schema_uri = harness.document_uri("schema.rune");
+    let config_uri = harness.document_uri("config.rune");
+    let isolated_uri = harness.document_uri("isolated/config.rune");
+
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    harness.write_file("isolated/other.rune", SCHEMA_STRING_FIELD);
+
+    // The root config discovers `schema.rune`; the isolated one is bound to
+    // `other.rune` by an explicit directive and never sees the root schema.
+    harness.did_open(&config_uri, CONFIG_STRING_VALUE).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(published.len(), 1, "{published:#?}");
+    assert!(
+        diagnostics_for(&published, &config_uri, Some(1))
+            .diagnostics
+            .is_empty(),
+        "the config matches the string schema on disk: {published:#?}"
+    );
+
+    harness
+        .did_open(&isolated_uri, CONFIG_BOUND_TO_OTHER_SCHEMA)
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(published.len(), 1, "{published:#?}");
+    assert!(
+        diagnostics_for(&published, &isolated_uri, Some(1))
+            .diagnostics
+            .is_empty(),
+        "the isolated config matches its own schema: {published:#?}"
+    );
+
+    // The root schema becomes an int schema on disk.
+    harness.write_file("schema.rune", SCHEMA_INT_FIELD);
+    harness
+        .did_change_watched_files(&[(schema_uri.clone(), 2)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "exactly the config bound to the changed schema is republished: {published:#?}"
+    );
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(config.diagnostics.len(), 1, "{published:#?}");
+    assert!(
+        config.diagnostics[0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("expected int, got string"),
+        "unexpected diagnostic: {published:#?}"
+    );
+    assert!(
+        !published
+            .iter()
+            .any(|notification| notification.uri == isolated_uri),
+        "the isolated config is not republished: {published:#?}"
+    );
+
+    // An unrelated `.rune` file is not a schema for anybody.
+    harness.write_file("unrelated.rune", CONFIG_STRING_VALUE);
+    harness
+        .did_change_watched_files(&[(harness.file_uri("unrelated.rune"), 1)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert!(
+        published.is_empty(),
+        "an unrelated .rune event publishes nothing: {published:#?}"
+    );
+}
+
+/// A file the editor has open is the editor's buffer: a watched event for it
+/// is ignored, and the disk copy never replaces the buffer.
+#[tokio::test]
+async fn an_open_document_ignores_watched_events_for_its_file() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    harness.did_open(&config_uri, CONFIG_STRING_VALUE).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(published.len(), 1, "{published:#?}");
+    assert!(
+        published[0].diagnostics.is_empty(),
+        "the config matches the schema it discovered: {published:#?}"
+    );
+
+    // The disk copy of the open config becomes something else entirely.
+    harness.write_file("config.rune", SCHEMA_INT_FIELD);
+    harness
+        .did_change_watched_files(&[(config_uri.clone(), 2)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert!(
+        published.is_empty(),
+        "a watched event for an open document publishes nothing: {published:#?}"
+    );
+
+    // The buffer still wins: its symbols are the config's, not the schema's.
+    let symbols = harness
+        .request(
+            "textDocument/documentSymbol",
+            json!({ "textDocument": { "uri": config_uri } }),
+        )
+        .await;
+    assert_eq!(
+        symbol_names(&symbols),
+        vec!["app", "app.name"],
+        "the open buffer is still the config it was opened with: {symbols}"
+    );
+}
+
+/// Config text that does not parse neither loses nor reports its schema
+/// dependency: the dependency comes from the indexed `@schema` directive, and
+/// the parse diagnostics stay exactly as they were.
+#[tokio::test]
+async fn invalid_config_text_keeps_its_schema_dependency() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let custom_uri = harness.file_uri("custom.rune");
+
+    // An unclosed `app` block, so this can never be validated against a schema.
+    harness
+        .did_open(
+            &config_uri,
+            "@schema \"./custom.rune\"\napp:\n  name \"Rune\"\n",
+        )
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "opening publishes the config: {published:#?}"
+    );
+    let before = diagnostics_for(&published, &config_uri, Some(1))
+        .diagnostics
+        .clone();
+    assert!(
+        !before.is_empty(),
+        "unparsable text is reported: {published:#?}"
+    );
+
+    // Creating the directive's target rebinds the config, which is only
+    // possible because the invalid buffer still has a dependency.
+    harness.write_file("custom.rune", SCHEMA_INT_FIELD);
+    harness.did_change_watched_files(&[(custom_uri, 1)]).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "the config is rebound to the created schema: {published:#?}"
+    );
+    assert_eq!(published[0].uri, config_uri);
+    assert_eq!(published[0].version, Some(1));
+    assert_eq!(
+        published[0].diagnostics, before,
+        "the parse diagnostics stay exactly as they were: {published:#?}"
+    );
+}
+
+/// A client that supports workspace folders but sends none has a workspace
+/// without folders, so `rootUri` is not used as a discovery boundary.
+#[tokio::test]
+async fn initialize_without_folders_ignores_root_uri() {
+    let mut harness = LspHarness::start_with_initializer(|root| {
+        json!({
+            "processId": Value::Null,
+            "rootUri": Url::from_directory_path(root.join("child")).expect("root uri"),
+            "capabilities": { "workspace": { "workspaceFolders": true } },
+        })
+    })
+    .await;
+
+    let config_uri = harness.file_uri("child/config.rune");
+
+    // The schema sits above `rootUri`: an unbounded walk discovers it, while a
+    // boundary at `rootUri` would hide it and leave the config unvalidated.
+    harness.write_file("schema.rune", SCHEMA_INT_FIELD);
+    harness.write_file("child/config.rune", CONFIG_STRING_VALUE);
+
+    harness.did_open(&config_uri, CONFIG_STRING_VALUE).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(published.len(), 1, "{published:#?}");
+    assert_eq!(published[0].uri, config_uri);
+    assert_eq!(
+        published[0].diagnostics.len(),
+        1,
+        "rootUri must not stand in for a workspace folder: {published:#?}"
+    );
+}
+
+/// Discovery follows the nearest `schema.rune` once it appears or disappears on
+/// disk, rebinding the open config without touching any other document.
+#[tokio::test]
+async fn watched_schema_discovery_rebinds_configs_at_the_nearest_candidate() {
+    let mut harness = LspHarness::start().await;
+    let root_schema = harness.file_uri("schema.rune");
+    let nested_schema = harness.file_uri("nested/schema.rune");
+    let config_uri = harness.file_uri("nested/config.rune");
+
+    harness.write_file("schema.rune", SCHEMA_INT_FIELD);
+    harness.write_file("nested/config.rune", CONFIG_STRING_VALUE);
+
+    // With no nested schema, the walk reaches the parent int schema.
+    harness.did_open(&config_uri, CONFIG_STRING_VALUE).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "opening the config publishes the config: {published:#?}"
+    );
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(
+        config.diagnostics.len(),
+        1,
+        "the parent int schema rejects the string value: {published:#?}"
+    );
+
+    // A nearer string schema appears.
+    harness.write_file("nested/schema.rune", SCHEMA_STRING_FIELD);
+    harness
+        .did_change_watched_files(&[(nested_schema.clone(), 1)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "only the rebinding config is republished: {published:#?}"
+    );
+    assert_eq!(published[0].uri, config_uri);
+    assert_eq!(published[0].version, Some(1));
+    assert!(
+        published[0].diagnostics.is_empty(),
+        "the nearest string schema matches the config: {published:#?}"
+    );
+
+    // It disappears again, so the parent int schema takes over.
+    harness.remove_file("nested/schema.rune");
+    harness
+        .did_change_watched_files(&[(nested_schema.clone(), 3)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(published.len(), 1, "{published:#?}");
+    assert_eq!(published[0].uri, config_uri);
+    assert_eq!(
+        published[0].diagnostics.len(),
+        1,
+        "the parent int schema applies again: {published:#?}"
+    );
+
+    // With every candidate gone, the config has no schema to validate against.
+    harness.remove_file("schema.rune");
+    harness
+        .did_change_watched_files(&[(root_schema.clone(), 3)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(published.len(), 1, "{published:#?}");
+    assert_eq!(published[0].uri, config_uri);
+    assert!(
+        published[0].diagnostics.is_empty(),
+        "a config with no schema is clean: {published:#?}"
+    );
+}
+
+/// An `@schema` directive keeps a config bound to its target as that file is
+/// created, changed, and deleted on disk, and reports the missing reference
+/// again once it is gone.
+#[tokio::test]
+async fn watched_schema_directive_target_rebinds_and_clears_diagnostics() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let custom_uri = harness.file_uri("custom.rune");
+
+    // The referenced file does not exist yet, so the directive itself is the
+    // only diagnostic the config has.
+    harness
+        .did_open(&config_uri, CONFIG_WITH_CUSTOM_SCHEMA)
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(published.len(), 1, "{published:#?}");
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(
+        config.diagnostics.len(),
+        1,
+        "a missing @schema target is one diagnostic: {published:#?}"
+    );
+    assert_eq!(config.diagnostics[0]["code"], json!(701));
+    assert!(
+        config.diagnostics[0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("was not found"),
+        "unexpected diagnostic: {published:#?}"
+    );
+
+    // Creating the target binds the config to it.
+    harness.write_file("custom.rune", SCHEMA_STRING_FIELD);
+    harness
+        .did_change_watched_files(&[(custom_uri.clone(), 1)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "only the bound config is republished: {published:#?}"
+    );
+    assert_eq!(published[0].uri, config_uri);
+    assert!(
+        published[0].diagnostics.is_empty(),
+        "the created string schema matches the config: {published:#?}"
+    );
+
+    // Widening the target to int rejects the config's string value.
+    harness.write_file("custom.rune", SCHEMA_INT_FIELD);
+    harness
+        .did_change_watched_files(&[(custom_uri.clone(), 2)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(published.len(), 1, "{published:#?}");
+    assert_eq!(published[0].uri, config_uri);
+    assert_eq!(
+        published[0].diagnostics.len(),
+        1,
+        "the int schema rejects the string value: {published:#?}"
+    );
+
+    // Deleting it brings the missing reference back.
+    harness.remove_file("custom.rune");
+    harness.did_change_watched_files(&[(custom_uri, 3)]).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(published.len(), 1, "{published:#?}");
+    assert_eq!(published[0].uri, config_uri);
+    assert_eq!(
+        published[0].diagnostics.len(),
+        1,
+        "the missing @schema target is reported again: {published:#?}"
+    );
+    assert_eq!(published[0].diagnostics[0]["code"], json!(701));
+}
+
+/// A client that offers workspace folders gets the capability advertised, and
+/// the folder bounds discovery: a schema above it is never used, so deleting
+/// the local schema leaves the config with no schema at all.
+#[tokio::test]
+async fn workspace_folder_root_bounds_schema_discovery() {
+    let mut harness = LspHarness::start_with_initializer(|root| {
+        json!({
+            "processId": Value::Null,
+            "rootUri": Value::Null,
+            "workspaceFolders": [{
+                "uri": Url::from_directory_path(root.join("workspace"))
+                    .expect("workspace folder uri"),
+                "name": "workspace",
+            }],
+            "capabilities": { "workspace": { "workspaceFolders": true } },
+        })
+    })
+    .await;
+
+    let capabilities =
+        &harness.initialize_result()["capabilities"]["workspace"]["workspaceFolders"];
+    assert_eq!(
+        capabilities["supported"],
+        json!(true),
+        "the server must advertise workspace folder support: {capabilities}"
+    );
+    assert_eq!(
+        capabilities["changeNotifications"],
+        json!(true),
+        "the server must ask for folder change notifications: {capabilities}"
+    );
+
+    let local_schema_uri = harness.file_uri("workspace/schema.rune");
+    let config_uri = harness.file_uri("workspace/config.rune");
+
+    // One int schema inside the folder and one above it, plus a config whose
+    // string value only the local schema can reject.
+    harness.write_file("workspace/schema.rune", SCHEMA_INT_FIELD);
+    harness.write_file("workspace/config.rune", CONFIG_STRING_VALUE);
+    harness.write_file("schema.rune", SCHEMA_INT_FIELD);
+
+    harness.did_open(&config_uri, CONFIG_STRING_VALUE).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(published.len(), 1, "{published:#?}");
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(
+        config.diagnostics.len(),
+        1,
+        "the workspace-local int schema rejects the string value: {published:#?}"
+    );
+
+    let definition = harness
+        .request(
+            "textDocument/definition",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 1, "character": 3 },
+            }),
+        )
+        .await;
+    assert_eq!(
+        definition["uri"],
+        json!(local_schema_uri.as_str()),
+        "the schema inside the workspace folder is the one that resolves: {definition}"
+    );
+
+    // Deleting the local schema leaves the config with nothing: the schema
+    // above the workspace folder is out of discovery range.
+    harness.remove_file("workspace/schema.rune");
+    harness
+        .did_change_watched_files(&[(local_schema_uri, 3)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "only the config is republished: {published:#?}"
+    );
+    assert_eq!(published[0].uri, config_uri);
+    assert!(
+        published[0].diagnostics.is_empty(),
+        "discovery must not fall through to a schema above the folder: {published:#?}"
+    );
+}
+
+/// Removing the only workspace folder makes schema discovery unbounded, and
+/// adding it back restores the boundary.
+#[tokio::test]
+async fn removing_a_workspace_folder_extends_schema_discovery() {
+    let mut harness = LspHarness::start_with_initializer(|root| {
+        json!({
+            "processId": Value::Null,
+            "rootUri": Value::Null,
+            "workspaceFolders": [{
+                "uri": Url::from_directory_path(root.join("child"))
+                    .expect("child folder uri"),
+                "name": "child",
+            }],
+            "capabilities": { "workspace": { "workspaceFolders": true } },
+        })
+    })
+    .await;
+
+    let child_folder = harness.directory_uri("child");
+    let config_uri = harness.file_uri("child/config.rune");
+
+    // An int schema above the child folder, which the boundary hides.
+    harness.write_file("schema.rune", SCHEMA_INT_FIELD);
+    harness.write_file("child/config.rune", CONFIG_STRING_VALUE);
+
+    harness.did_open(&config_uri, CONFIG_STRING_VALUE).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(published.len(), 1, "{published:#?}");
+    assert_eq!(published[0].uri, config_uri);
+    assert!(
+        published[0].diagnostics.is_empty(),
+        "the workspace folder hides the schema above it: {published:#?}"
+    );
+
+    // With no folder left, the walk is unbounded and finds the parent schema.
+    harness
+        .did_change_workspace_folders(&[], std::slice::from_ref(&child_folder))
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "only the config whose schema changed is republished: {published:#?}"
+    );
+    assert_eq!(published[0].uri, config_uri);
+    assert_eq!(
+        published[0].diagnostics.len(),
+        1,
+        "the parent int schema rejects the string value: {published:#?}"
+    );
+
+    // Adding the folder back hides the schema again.
+    harness
+        .did_change_workspace_folders(std::slice::from_ref(&child_folder), &[])
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(published.len(), 1, "{published:#?}");
+    assert_eq!(published[0].uri, config_uri);
+    assert!(
+        published[0].diagnostics.is_empty(),
+        "the workspace folder bounds discovery again: {published:#?}"
+    );
+}
+
+/// A schema-scoped rename or reference query reaches configs in every workspace
+/// folder that is bound to the same schema.
+#[tokio::test]
+async fn schema_scoped_navigation_spans_every_workspace_folder() {
+    let mut harness = LspHarness::start_with_initializer(|root| {
+        json!({
+            "processId": Value::Null,
+            "rootUri": Value::Null,
+            "workspaceFolders": [
+                {
+                    "uri": Url::from_directory_path(root.join("one")).expect("one folder uri"),
+                    "name": "one",
+                },
+                {
+                    "uri": Url::from_directory_path(root.join("two")).expect("two folder uri"),
+                    "name": "two",
+                },
+            ],
+            "capabilities": { "workspace": { "workspaceFolders": true } },
+        })
+    })
+    .await;
+
+    // One schema, bound from the first folder by a relative path and from the
+    // second by its absolute path, so both configs resolve to the same schema
+    // URI and both folders have to be scanned for the answer to be complete.
+    let shared_schema = harness.workspace_path().join("one/shared.rune");
+    harness.write_file("one/shared.rune", SCHEMA_STRING_FIELD);
+    harness.write_file("one/config.rune", CONFIG_BOUND_TO_SHARED_SCHEMA);
+    harness.write_file(
+        "two/config.rune",
+        &format!(
+            "@schema \"{}\"\napp:\n  name \"Rune\"\nend\n",
+            shared_schema.display()
+        ),
+    );
+
+    let schema_uri = harness.file_uri("one/shared.rune");
+    let first = harness.file_uri("one/config.rune");
+    let second = harness.file_uri("two/config.rune");
+
+    let references = harness
+        .request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": first },
+                "position": { "line": 2, "character": 3 },
+                "context": { "includeDeclaration": true },
+            }),
+        )
+        .await;
+    let locations = references
+        .as_array()
+        .unwrap_or_else(|| panic!("references must return locations, got {references}"));
+    assert_eq!(
+        locations.len(),
+        3,
+        "the declaration and the usage in each folder: {references}"
+    );
+
+    let uris: Vec<&str> = locations
+        .iter()
+        .filter_map(|location| location["uri"].as_str())
+        .collect();
+    assert!(
+        uris.contains(&schema_uri.as_str()),
+        "the declaration in the shared schema: {references}"
+    );
+    assert!(
+        uris.contains(&first.as_str()),
+        "the usage in the first folder: {references}"
+    );
+    assert!(
+        uris.contains(&second.as_str()),
+        "the usage in the second folder: {references}"
+    );
+
+    let rename = harness
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": first },
+                "position": { "line": 1, "character": 3 },
+                "newName": "title",
+            }),
+        )
+        .await;
+    let changes = rename["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("rename must return a workspace edit, got {rename}"));
+    assert_eq!(
+        changes.len(),
+        3,
+        "the schema declaration and the config in each folder are renamed: {rename}"
     );
 }

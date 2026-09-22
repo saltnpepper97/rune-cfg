@@ -1,7 +1,7 @@
 // Author: Dustin Pilgrim
 // License: MIT
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -11,14 +11,15 @@ use tower_lsp::lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionResponse, CompletionItem, CompletionItemKind,
     CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
-    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, InsertTextFormat, Location,
-    MarkedString, MessageType, OneOf, Position, PrepareRenameResponse, Range, ReferenceParams,
-    RenameOptions, RenameParams, ServerCapabilities, SymbolKind, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url, WorkDoneProgressOptions,
-    WorkspaceEdit,
+    DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
+    DocumentSymbolResponse, FileChangeType, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, InsertTextFormat, Location, MarkedString, MessageType, OneOf, Position,
+    PrepareRenameResponse, Range, ReferenceParams, RenameOptions, RenameParams, ServerCapabilities,
+    SymbolKind, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextEdit, Url, WorkDoneProgressOptions, WorkspaceEdit, WorkspaceFoldersServerCapabilities,
+    WorkspaceServerCapabilities,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -52,34 +53,203 @@ struct Occurrence {
     is_declaration: bool,
 }
 
+/// The ordered schema candidates of one config document, together with the
+/// explicit `@schema` directive they came from, when the document has one.
+struct CandidateSet {
+    directive: Option<SchemaDirective>,
+    candidates: Vec<PathBuf>,
+}
+
+/// Schema resolution state for one open config document: the candidates a
+/// config may bind to, and the first one that is open or present on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaDependency {
+    /// Ordered, nearest / highest priority first.
+    candidates: Vec<PathBuf>,
+    /// First candidate that is open or exists on disk.
+    resolved: Option<Url>,
+}
+
 pub struct RuneLanguageServer {
     client: Client,
-    root_uri: RwLock<Option<Url>>,
+    workspace_folders: RwLock<Vec<Url>>,
     documents: RwLock<HashMap<Url, OpenDocument>>,
+    /// Present for open config documents only, never for schema documents.
+    schema_dependencies: RwLock<HashMap<Url, SchemaDependency>>,
 }
 
 impl RuneLanguageServer {
     pub fn new(client: Client) -> Self {
         Self {
             client,
-            root_uri: RwLock::new(None),
+            workspace_folders: RwLock::new(Vec::new()),
             documents: RwLock::new(HashMap::new()),
+            schema_dependencies: RwLock::new(HashMap::new()),
         }
     }
 
-    async fn validate_all_open_documents(&self) {
-        let documents = self.documents.read().await.clone();
+    /// Publish diagnostics for exactly the given open `.rune` documents, which
+    /// includes an empty list for a document that has no diagnostics left.
+    ///
+    /// Nothing else is revalidated, so a document unrelated to a change is not
+    /// touched by it. The buffers are snapshotted before publishing so no lock
+    /// is held across a client call.
+    async fn validate_open_documents(&self, targets: &[Url]) {
+        let snapshot: Vec<(Url, i32, Arc<SourceIndex>)> = {
+            let documents = self.documents.read().await;
+            targets
+                .iter()
+                .filter(|uri| is_rune_file(uri))
+                .filter_map(|uri| {
+                    documents.get(uri).map(|document| {
+                        (uri.clone(), document.version, Arc::clone(&document.source))
+                    })
+                })
+                .collect()
+        };
 
-        for (uri, document) in documents {
-            if !is_rune_file(&uri) {
-                continue;
-            }
-
-            let diagnostics = self.diagnostics_for_document(&uri, &document.source).await;
+        for (uri, version, source) in snapshot {
+            let diagnostics = self.diagnostics_for_document(&uri, &source).await;
             self.client
-                .publish_diagnostics(uri, diagnostics, Some(document.version))
+                .publish_diagnostics(uri, diagnostics, Some(version))
                 .await;
         }
+    }
+
+    /// File paths of the workspace folders, which bound schema discovery.
+    async fn workspace_paths(&self) -> Vec<PathBuf> {
+        self.workspace_folders
+            .read()
+            .await
+            .iter()
+            .filter_map(|uri| uri.to_file_path().ok())
+            .collect()
+    }
+
+    /// Ordered schema candidates for one config document.
+    ///
+    /// An explicit `@schema` directive supplies its own candidate order; a
+    /// document without one discovers ancestor `schema.rune` files, nearest
+    /// first, and never looks above its containing workspace folder.
+    async fn candidate_set(&self, uri: &Url, source: &SourceIndex) -> CandidateSet {
+        if let Some(directive) = schema_directive(source) {
+            let candidates = uri
+                .to_file_path()
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .map(|config_dir| schema_candidates(&directive.reference, &config_dir))
+                .unwrap_or_default();
+
+            return CandidateSet {
+                directive: Some(directive),
+                candidates,
+            };
+        }
+
+        let candidates = match uri.to_file_path() {
+            Ok(path) => discovery_candidates(&self.workspace_paths().await, &path),
+            Err(_) => Vec::new(),
+        };
+
+        CandidateSet {
+            directive: None,
+            candidates,
+        }
+    }
+
+    /// The first candidate that is open in the editor or present on disk.
+    async fn resolve_candidates(&self, candidates: &[PathBuf]) -> Option<Url> {
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let open: HashSet<Url> = self.documents.read().await.keys().cloned().collect();
+
+        for candidate in candidates {
+            let Ok(uri) = Url::from_file_path(candidate) else {
+                continue;
+            };
+            if open.contains(&uri) || candidate.exists() {
+                return Some(uri);
+            }
+        }
+
+        None
+    }
+
+    /// Dependency state for an open config document.
+    ///
+    /// Schema documents have none: they are what configs depend on, so they
+    /// never take part in discovery themselves.
+    async fn dependency_for(&self, uri: &Url, source: &SourceIndex) -> Option<SchemaDependency> {
+        if is_schema_document(uri, source.text()) {
+            return None;
+        }
+
+        let candidates = self.candidate_set(uri, source).await.candidates;
+        let resolved = self.resolve_candidates(&candidates).await;
+
+        Some(SchemaDependency {
+            candidates,
+            resolved,
+        })
+    }
+
+    /// Recompute the dependency state of every open config document against the
+    /// final disk state, and return the open configs that must be revalidated.
+    ///
+    /// A config is affected when it was forced, when its resolved schema URI
+    /// changed, or when one of the changed files is the schema it resolved to
+    /// before or resolves to now. A change to the candidate list alone records
+    /// new state without republishing, because the resolved schema is what the
+    /// document is validated against.
+    async fn refresh_dependencies_and_collect_affected(
+        &self,
+        changed_uris: &[Url],
+        forced_documents: &[Url],
+    ) -> Vec<Url> {
+        let documents: Vec<(Url, Arc<SourceIndex>)> = {
+            let documents = self.documents.read().await;
+            documents
+                .iter()
+                .map(|(uri, document)| (uri.clone(), Arc::clone(&document.source)))
+                .collect()
+        };
+        let previous_dependencies = self.schema_dependencies.read().await.clone();
+
+        let mut updated: HashMap<Url, SchemaDependency> = HashMap::new();
+        let mut affected: Vec<Url> = Vec::new();
+
+        for (uri, source) in &documents {
+            let Some(dependency) = self.dependency_for(uri, source).await else {
+                continue;
+            };
+            let previous = previous_dependencies.get(uri);
+
+            let resolved_changed =
+                previous.and_then(|dependency| dependency.resolved.clone()) != dependency.resolved;
+            let schema_file_changed = changed_uris.iter().any(|changed| {
+                previous.and_then(|dependency| dependency.resolved.as_ref()) == Some(changed)
+                    || dependency.resolved.as_ref() == Some(changed)
+            });
+
+            if forced_documents.contains(uri) || resolved_changed || schema_file_changed {
+                affected.push(uri.clone());
+            }
+
+            // Record the recomputed dependency. A candidate-list-only change is
+            // stored without publishing: the resolved schema is what the
+            // document is validated against, and it is what gates a republish.
+            let entry = match previous {
+                Some(previous) if previous == &dependency => previous.clone(),
+                _ => dependency,
+            };
+            updated.insert(uri.clone(), entry);
+        }
+
+        *self.schema_dependencies.write().await = updated;
+
+        affected
     }
 
     async fn diagnostics_for_document(
@@ -142,20 +312,27 @@ impl RuneLanguageServer {
         uri: &Url,
         source: &SourceIndex,
     ) -> Result<Option<String>, RuneDiagnostic> {
-        if let Some(directive) = schema_directive(source) {
-            let schema_uri = self.resolve_schema_directive_uri(uri, &directive).await?;
-            return self
-                .schema_text_for_uri(&schema_uri)
-                .await
-                .map(Some)
-                .ok_or_else(|| schema_reference_diagnostic(&directive, &[]));
+        let candidates = self.candidate_set(uri, source).await;
+
+        match candidates.directive {
+            Some(directive) => {
+                let Some(schema_uri) = self.resolve_candidates(&candidates.candidates).await else {
+                    return Err(schema_reference_diagnostic(
+                        &directive,
+                        &candidates.candidates,
+                    ));
+                };
+
+                self.schema_text_for_uri(&schema_uri)
+                    .await
+                    .map(Some)
+                    .ok_or_else(|| schema_reference_diagnostic(&directive, &[]))
+            }
+            None => match self.resolve_candidates(&candidates.candidates).await {
+                Some(schema_uri) => Ok(self.schema_text_for_uri(&schema_uri).await),
+                None => Ok(None),
+            },
         }
-
-        let Some(schema_uri) = self.schema_uri_for(uri).await else {
-            return Ok(None);
-        };
-
-        Ok(self.schema_text_for_uri(&schema_uri).await)
     }
 
     async fn schema_text_for_uri(&self, schema_uri: &Url) -> Option<String> {
@@ -167,30 +344,6 @@ impl RuneLanguageServer {
         std::fs::read_to_string(path).ok()
     }
 
-    async fn resolve_schema_directive_uri(
-        &self,
-        uri: &Url,
-        directive: &SchemaDirective,
-    ) -> Result<Url, RuneDiagnostic> {
-        let path = uri
-            .to_file_path()
-            .map_err(|_| schema_reference_diagnostic(directive, &[]))?;
-        let config_dir = path
-            .parent()
-            .ok_or_else(|| schema_reference_diagnostic(directive, &[]))?;
-
-        let candidates = schema_candidates(&directive.reference, config_dir);
-        for candidate in &candidates {
-            if (candidate.exists() || self.is_open_uri_for_path(candidate.as_path()).await)
-                && let Ok(uri) = Url::from_file_path(candidate.clone())
-            {
-                return Ok(uri);
-            }
-        }
-
-        Err(schema_reference_diagnostic(directive, &candidates))
-    }
-
     async fn schema_for(&self, uri: &Url) -> Option<SchemaDocument> {
         let schema_text = self.schema_text_for(uri).await?;
         SchemaDocument::from_str(&schema_text).ok()
@@ -200,14 +353,8 @@ impl RuneLanguageServer {
     /// explicit `@schema` directive when present and otherwise discovering
     /// `schema.rune` upward from the config directory.
     async fn schema_uri_for_document(&self, uri: &Url, source: &SourceIndex) -> Option<Url> {
-        if let Some(directive) = schema_directive(source) {
-            return self
-                .resolve_schema_directive_uri(uri, &directive)
-                .await
-                .ok();
-        }
-
-        self.schema_uri_for(uri).await
+        let candidates = self.candidate_set(uri, source).await.candidates;
+        self.resolve_candidates(&candidates).await
     }
 
     /// Resolve the rename/references target at a position: the field path plus
@@ -231,11 +378,12 @@ impl RuneLanguageServer {
     }
 
     /// Config files bound to `schema_uri` (via `@schema` or discovery), drawn
-    /// from open documents and the workspace tree. Excludes the schema itself.
+    /// from open documents and every workspace folder. Excludes the schema
+    /// itself.
     async fn related_config_uris(&self, schema_uri: &Url) -> Vec<Url> {
         let mut candidates: Vec<Url> = self.documents.read().await.keys().cloned().collect();
 
-        if let Some(root) = self.root_path().await {
+        for root in self.workspace_paths().await {
             let mut paths = Vec::new();
             collect_rune_files(&root, &mut paths);
             for path in paths {
@@ -245,7 +393,7 @@ impl RuneLanguageServer {
             }
         }
 
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let mut result = Vec::new();
         for uri in candidates {
             if !seen.insert(uri.clone()) {
@@ -316,46 +464,6 @@ impl RuneLanguageServer {
             .map(|source| source.text().to_string())
     }
 
-    async fn schema_uri_for(&self, uri: &Url) -> Option<Url> {
-        let path = uri.to_file_path().ok()?;
-        let mut directory = path.parent()?.to_path_buf();
-        let root_path = self.root_path().await;
-
-        loop {
-            let candidate = directory.join("schema.rune");
-            if (candidate.exists() || self.is_open_uri_for_path(candidate.as_path()).await)
-                && let Ok(uri) = Url::from_file_path(candidate)
-            {
-                return Some(uri);
-            }
-
-            if root_path.as_ref().is_some_and(|root| directory == *root) {
-                break;
-            }
-
-            if !directory.pop() {
-                break;
-            }
-        }
-
-        None
-    }
-
-    async fn root_path(&self) -> Option<PathBuf> {
-        self.root_uri
-            .read()
-            .await
-            .as_ref()
-            .and_then(|uri| uri.to_file_path().ok())
-    }
-
-    async fn is_open_uri_for_path(&self, path: &Path) -> bool {
-        let Ok(uri) = Url::from_file_path(path) else {
-            return false;
-        };
-        self.documents.read().await.contains_key(&uri)
-    }
-
     async fn schema_source_label_for_document(
         &self,
         uri: &Url,
@@ -365,7 +473,7 @@ impl RuneLanguageServer {
             return Some(format!("@schema \"{}\"", directive.reference));
         }
 
-        let schema_uri = self.schema_uri_for(uri).await?;
+        let schema_uri = self.schema_uri_for_document(uri, source).await?;
         schema_uri
             .to_file_path()
             .ok()
@@ -376,7 +484,7 @@ impl RuneLanguageServer {
 #[tower_lsp::async_trait]
 impl LanguageServer for RuneLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
-        *self.root_uri.write().await = params.root_uri;
+        *self.workspace_folders.write().await = workspace_folders_from_initialize(&params);
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -398,6 +506,13 @@ impl LanguageServer for RuneLanguageServer {
                     prepare_provider: Some(true),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 })),
+                workspace: Some(WorkspaceServerCapabilities {
+                    workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                        supported: Some(true),
+                        change_notifications: Some(OneOf::Left(true)),
+                    }),
+                    file_operations: None,
+                }),
                 ..ServerCapabilities::default()
             },
             server_info: Some(tower_lsp::lsp_types::ServerInfo {
@@ -825,35 +940,123 @@ impl LanguageServer for RuneLanguageServer {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let document = params.text_document;
+        let uri = document.uri.clone();
         self.documents.write().await.insert(
-            document.uri,
+            uri.clone(),
             OpenDocument {
                 version: document.version,
                 source: Arc::new(SourceIndex::new(&document.text)),
             },
         );
-        self.validate_all_open_documents().await;
+
+        // The opened document is the one that changed; an open `schema.rune`
+        // with no disk file can rebind configs that were opened before it.
+        let changed = std::slice::from_ref(&uri);
+        let affected = self
+            .refresh_dependencies_and_collect_affected(changed, changed)
+            .await;
+        let targets = union_of_targets(changed, &affected);
+        self.validate_open_documents(&targets).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        if let Some(change) = params.content_changes.into_iter().last() {
-            self.documents.write().await.insert(
-                params.text_document.uri,
-                OpenDocument {
-                    version: params.text_document.version,
-                    source: Arc::new(SourceIndex::new(&change.text)),
-                },
-            );
-        }
+        // A change without full text carries nothing to revalidate.
+        let Some(change) = params.content_changes.into_iter().last() else {
+            return;
+        };
 
-        self.validate_all_open_documents().await;
+        let uri = params.text_document.uri.clone();
+        self.documents.write().await.insert(
+            uri.clone(),
+            OpenDocument {
+                version: params.text_document.version,
+                source: Arc::new(SourceIndex::new(&change.text)),
+            },
+        );
+
+        let changed = std::slice::from_ref(&uri);
+        let affected = self
+            .refresh_dependencies_and_collect_affected(changed, changed)
+            .await;
+        let targets = union_of_targets(changed, &affected);
+        self.validate_open_documents(&targets).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.documents.write().await.remove(&uri);
-        self.client.publish_diagnostics(uri, Vec::new(), None).await;
-        self.validate_all_open_documents().await;
+        self.schema_dependencies.write().await.remove(&uri);
+
+        self.client
+            .publish_diagnostics(uri.clone(), Vec::new(), None)
+            .await;
+
+        // Dependents now fall back to the on-disk schema, the next candidate,
+        // or none at all. No other document is revalidated.
+        let affected = self
+            .refresh_dependencies_and_collect_affected(std::slice::from_ref(&uri), &[])
+            .await;
+        self.validate_open_documents(&affected).await;
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let open: HashSet<Url> = self.documents.read().await.keys().cloned().collect();
+        let mut changed: Vec<Url> = Vec::new();
+
+        for event in params.changes {
+            if event.typ != FileChangeType::CREATED
+                && event.typ != FileChangeType::CHANGED
+                && event.typ != FileChangeType::DELETED
+            {
+                continue;
+            }
+
+            // A file the editor holds a buffer for is the editor's business
+            // alone, and the batch is deduplicated before it is reconciled.
+            if !is_rune_file(&event.uri)
+                || open.contains(&event.uri)
+                || changed.contains(&event.uri)
+            {
+                continue;
+            }
+
+            changed.push(event.uri);
+        }
+
+        if changed.is_empty() {
+            return;
+        }
+
+        // One reconciliation against the final disk state, then only the open
+        // configs the change affects. The unopened file publishes nothing
+        // itself.
+        let affected = self
+            .refresh_dependencies_and_collect_affected(&changed, &[])
+            .await;
+        self.validate_open_documents(&affected).await;
+    }
+
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        let mut folders = self.workspace_folders.read().await.clone();
+
+        for removed in &params.event.removed {
+            folders.retain(|folder| folder != &removed.uri);
+        }
+        for added in &params.event.added {
+            if added.uri.scheme() != "file" || folders.contains(&added.uri) {
+                continue;
+            }
+            folders.push(added.uri.clone());
+        }
+
+        *self.workspace_folders.write().await = folders;
+
+        // Removing or adding a folder moves the discovery boundary, so only a
+        // config whose resolved schema URI changed is revalidated.
+        let affected = self
+            .refresh_dependencies_and_collect_affected(&[], &[])
+            .await;
+        self.validate_open_documents(&affected).await;
     }
 }
 
@@ -862,6 +1065,87 @@ fn is_rune_file(uri: &Url) -> bool {
         .ok()
         .and_then(|path| path.extension().map(|extension| extension == "rune"))
         .unwrap_or(false)
+}
+
+/// The union of the forced documents and the configs a change affects, in that
+/// order and without duplicates: forced schema documents publish their own
+/// diagnostics, and forced configs are already part of the affected set.
+fn union_of_targets(forced: &[Url], affected: &[Url]) -> Vec<Url> {
+    let mut targets: Vec<Url> = Vec::new();
+
+    for uri in forced.iter().chain(affected) {
+        if !targets.contains(uri) {
+            targets.push(uri.clone());
+        }
+    }
+
+    targets
+}
+
+/// Workspace folders from `initialize`, applying the LSP fallback rules.
+///
+/// Folders the client sent win, even an explicit empty list, because the client
+/// is stating the workspace it has. A client that supports workspace folders
+/// but sent none has a workspace without folders, so nothing may be discovered
+/// from `rootUri`. Only a client that does not use workspace folders at all
+/// falls back to `rootUri` as a single-folder workspace. Non-file URIs are
+/// ignored everywhere.
+fn workspace_folders_from_initialize(params: &InitializeParams) -> Vec<Url> {
+    if let Some(folders) = &params.workspace_folders {
+        return folders
+            .iter()
+            .map(|folder| folder.uri.clone())
+            .filter(|uri| uri.scheme() == "file")
+            .collect();
+    }
+
+    let client_uses_workspace_folders = params
+        .capabilities
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.workspace_folders)
+        == Some(true);
+    if client_uses_workspace_folders {
+        return Vec::new();
+    }
+
+    params
+        .root_uri
+        .iter()
+        .filter(|uri| uri.scheme() == "file")
+        .cloned()
+        .collect()
+}
+
+/// Ancestor `schema.rune` candidates for one config file, nearest first.
+///
+/// The walk stops at the deepest workspace folder containing the file, so a
+/// schema above that folder is never discovered. A file outside every folder
+/// keeps the unbounded walk up to the filesystem root.
+fn discovery_candidates(folders: &[PathBuf], config_path: &Path) -> Vec<PathBuf> {
+    let Some(mut directory) = config_path.parent().map(Path::to_path_buf) else {
+        return Vec::new();
+    };
+
+    let boundary = folders
+        .iter()
+        .filter(|folder| directory.starts_with(folder))
+        .max_by_key(|folder| folder.components().count())
+        .cloned();
+
+    let mut candidates = Vec::new();
+    loop {
+        candidates.push(directory.join("schema.rune"));
+
+        if boundary.as_ref().is_some_and(|folder| directory == *folder) {
+            break;
+        }
+        if !directory.pop() {
+            break;
+        }
+    }
+
+    candidates
 }
 
 fn is_schema_file(uri: &Url) -> bool {
