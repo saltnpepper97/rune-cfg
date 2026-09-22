@@ -2,7 +2,7 @@
   "name": "rune-cfg",
   "displayName": "RUNE",
   "description": "Language support for RUNE configuration files.",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "saltnpepper97",
   "license": "GPL-3.0-or-later",
   "repository": {

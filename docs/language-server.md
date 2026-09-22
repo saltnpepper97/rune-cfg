@@ -86,7 +86,7 @@ Completion uses the active schema to suggest only fields that belong in the curr
 Install the released server binary with:
 
 ```sh
-cargo install rune-cfg --version 0.6.0
+cargo install rune-cfg --version 0.7.0
 ```
 
 Or run the server directly from this repository with:

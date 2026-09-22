@@ -12,7 +12,7 @@ It provides:
 Install the language server binary first:
 
 ```sh
-cargo install rune-cfg --version 0.6.0
+cargo install rune-cfg --version 0.7.0
 ```
 
 Then install extension dependencies and compile the client:
