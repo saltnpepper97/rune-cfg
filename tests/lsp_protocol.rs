@@ -3198,3 +3198,92 @@ async fn an_open_buffer_wins_over_the_indexed_file_on_disk() {
         "the unopened schema carries no version: {rename}"
     );
 }
+
+/// Exclusions are a bulk-indexing rule, not a resolution rule: an `@schema`
+/// reference into an excluded directory still resolves, and a document the
+/// editor opens inside one is still part of cross-file navigation. The file
+/// nobody opened stays invisible.
+#[tokio::test]
+async fn an_excluded_directory_still_resolves_for_open_documents() {
+    const LOCAL_DIRECTIVE_CONFIG: &str =
+        "@schema \"./schemas/local.rune\"\napp:\n  name \"Rune\"\nend\n";
+
+    let mut harness = LspHarness::start_with_initializer(|root| {
+        write_workspace_fixture(root, "schema.rune", SCHEMA_STRING_FIELD);
+        write_workspace_fixture(root, "config.rune", CONFIG_STRING_VALUE);
+        // Every fixture below an excluded directory is out of bulk indexing.
+        write_workspace_fixture(root, "vendor/schemas/local.rune", SCHEMA_STRING_FIELD);
+        write_workspace_fixture(root, "vendor/local.rune", LOCAL_DIRECTIVE_CONFIG);
+        write_workspace_fixture(root, "vendor/opened.rune", CONFIG_STRING_VALUE);
+        write_workspace_fixture(root, "vendor/unopened.rune", CONFIG_STRING_VALUE);
+
+        json!({
+            "processId": Value::Null,
+            "rootUri": Url::from_directory_path(root).expect("workspace root uri"),
+            "initializationOptions": { "exclude": ["vendor"] },
+            "capabilities": {},
+        })
+    })
+    .await;
+
+    let config_uri = harness.document_uri("config.rune");
+    let schema_uri = harness.document_uri("schema.rune");
+    let local_uri = harness.file_uri("vendor/local.rune");
+    let opened_uri = harness.file_uri("vendor/opened.rune");
+    let unopened_uri = harness.file_uri("vendor/unopened.rune");
+
+    // The directive names a schema inside the excluded directory, and the
+    // config validates against it: an excluded directory is not an
+    // unreachable one.
+    harness.did_open(&local_uri, LOCAL_DIRECTIVE_CONFIG).await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        published.len(),
+        1,
+        "only the opened document publishes: {published:#?}"
+    );
+    assert_eq!(published[0].uri, local_uri);
+    assert!(
+        published[0].diagnostics.is_empty(),
+        "the directive into the excluded directory resolves and validates: {published:#?}"
+    );
+
+    // An open document is a reference target whatever its directory, while a
+    // file in the same excluded directory that nobody opened is not. The
+    // opened config discovers the root schema, from inside the excluded
+    // directory.
+    harness.did_open(&opened_uri, CONFIG_STRING_VALUE).await;
+    harness.discard_server_messages().await;
+
+    let references = harness
+        .request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 1, "character": 3 },
+                "context": { "includeDeclaration": true },
+            }),
+        )
+        .await;
+
+    let uris: Vec<&str> = references
+        .as_array()
+        .unwrap_or_else(|| panic!("references must return locations, got {references}"))
+        .iter()
+        .filter_map(|location| location["uri"].as_str())
+        .collect();
+    assert!(uris.contains(&schema_uri.as_str()), "{references}");
+    assert!(uris.contains(&config_uri.as_str()), "{references}");
+    assert!(
+        uris.contains(&opened_uri.as_str()),
+        "an open document is indexed wherever it lives: {references}"
+    );
+    assert!(
+        !uris.contains(&unopened_uri.as_str()),
+        "a file in an excluded directory nobody opened stays invisible: {references}"
+    );
+    assert!(
+        !uris.iter().any(|uri| uri.contains("local.rune")),
+        "the open document bound to its own schema is not a target here: {references}"
+    );
+}
