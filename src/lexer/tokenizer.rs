@@ -29,7 +29,8 @@ pub(super) fn next_token_with_flag(
         Some('@') => tokenize_symbol(lexer, Token::At),
         Some('r') => tokenize_regex_or_ident(lexer),
         Some('"') | Some('\'') => tokenize_string(lexer),
-        Some(c) if c.is_ascii_digit() => tokenize_number(lexer),
+        Some(c) if c.is_ascii_digit() => tokenize_number(lexer, false),
+        Some('-') if next_is_ascii_digit(lexer) => tokenize_number(lexer, true),
         Some(c) if c.is_alphabetic() => tokenize_identifier_or_keyword(lexer),
         Some(ch) => tokenize_unexpected_char(lexer, ch),
         None => Ok(Token::Eof),
@@ -170,15 +171,42 @@ fn tokenize_string(lexer: &mut Lexer) -> Result<Token, RuneError> {
     Ok(Token::String(content))
 }
 
-fn tokenize_number(lexer: &mut Lexer) -> Result<Token, RuneError> {
+fn next_is_ascii_digit(lexer: &Lexer) -> bool {
+    lexer
+        .input
+        .clone()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_digit())
+}
+
+fn tokenize_number(lexer: &mut Lexer, signed: bool) -> Result<Token, RuneError> {
     let mut num = String::new();
 
+    if signed {
+        num.push(bump(lexer).expect("the current character is '-'"));
+    }
+
     while let Some(ch) = lexer.peek {
-        if ch.is_ascii_digit() || ch == '.' {
+        if ch.is_ascii_digit() {
             num.push(ch);
             bump(lexer);
         } else {
             break;
+        }
+    }
+
+    // A range delimiter is two dots, not part of the number. Otherwise a
+    // value such as 1..65535 would be scanned as one invalid float.
+    if lexer.peek == Some('.') && lexer.input.clone().next() != Some('.') {
+        num.push('.');
+        bump(lexer);
+        while let Some(ch) = lexer.peek {
+            if ch.is_ascii_digit() {
+                num.push(ch);
+                bump(lexer);
+            } else {
+                break;
+            }
         }
     }
 

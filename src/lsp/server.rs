@@ -2107,13 +2107,40 @@ fn schema_field_at_position(
     schema: &SchemaDocument,
     position: Position,
 ) -> Option<(Vec<String>, Span)> {
-    let path = schema_path_at_line(schema, position.line)?;
-    let name = path.last()?;
     let lines = LineIndex::new(schema_text);
-    let span = lines.identifier_span_on_line(position.line as usize, name)?;
     let offset = lines.position_to_byte(position)?;
 
-    span.touches(offset).then_some((path, span))
+    for block in &schema.blocks {
+        if block.name_span.touches(offset) {
+            return Some((vec![block.root.clone()], block.name_span));
+        }
+
+        let mut path = vec![block.root.clone()];
+        if let Some(found) = schema_field_at_offset(&block.fields, &mut path, offset) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
+fn schema_field_at_offset(
+    fields: &[SchemaField],
+    path: &mut Vec<String>,
+    offset: usize,
+) -> Option<(Vec<String>, Span)> {
+    for field in fields {
+        path.push(field.name.clone());
+        if field.name_span.touches(offset) {
+            return Some((path.clone(), field.name_span));
+        }
+        if let Some(found) = schema_field_at_offset(&field.fields, path, offset) {
+            return Some(found);
+        }
+        path.pop();
+    }
+
+    None
 }
 
 fn schema_definition_range(
@@ -2121,29 +2148,17 @@ fn schema_definition_range(
     schema: &SchemaDocument,
     path: &[String],
 ) -> Option<Range> {
-    let line = definition_line_for_path(schema, path)?;
-    let name = path.last()?;
-    let lines = LineIndex::new(schema_text);
-    let span = lines.identifier_span_on_line(line as usize, name)?;
-    Some(lines.range(span))
-}
-
-/// Resolve a config path to the 0-based line of its schema definition.
-///
-/// A single-segment path refers to a top-level block; deeper paths refer to a
-/// nested field. Schema lines are stored 1-based, so they are converted here.
-fn definition_line_for_path(schema: &SchemaDocument, path: &[String]) -> Option<u32> {
-    let line = if path.len() == 1 {
+    let span = if path.len() == 1 {
         schema
             .blocks
             .iter()
             .find(|block| block.root == path[0])?
-            .line
+            .name_span
     } else {
-        find_field_by_path(schema, path)?.line
+        find_field_by_path(schema, path)?.name_span
     };
 
-    Some(line.saturating_sub(1) as u32)
+    Some(LineIndex::new(schema_text).range(span))
 }
 
 /// Every occurrence of `target_path` (key ranges) in one document.
@@ -2183,55 +2198,13 @@ fn collect_rune_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The field path declared on `position`'s line inside a schema file.
-/// This line-only helper is intentionally private to the exact-token resolver
-/// below; callers must not use it as a cursor hit test.
-fn schema_path_at_line(schema: &SchemaDocument, line: u32) -> Option<Vec<String>> {
-    let target_line = line as usize + 1;
-
-    for block in &schema.blocks {
-        if block.line == target_line {
-            return Some(vec![block.root.clone()]);
-        }
-        if let Some(path) = find_schema_path_by_line(
-            &block.fields,
-            std::slice::from_ref(&block.root),
-            target_line,
-        ) {
-            return Some(path);
-        }
-    }
-
-    None
-}
-
-/// Resolve a schema field only when the cursor intersects its name token.
+/// Resolve a schema field only when the cursor intersects its stored name span.
 fn schema_path_at_position(
     schema_text: &str,
     schema: &SchemaDocument,
     position: Position,
 ) -> Option<Vec<String>> {
     schema_field_at_position(schema_text, schema, position).map(|(path, _)| path)
-}
-
-fn find_schema_path_by_line(
-    fields: &[SchemaField],
-    prefix: &[String],
-    target_line: usize,
-) -> Option<Vec<String>> {
-    for field in fields {
-        let mut path = prefix.to_vec();
-        path.push(field.name.clone());
-
-        if field.line == target_line {
-            return Some(path);
-        }
-        if let Some(found) = find_schema_path_by_line(&field.fields, &path, target_line) {
-            return Some(found);
-        }
-    }
-
-    None
 }
 
 /// How one line takes part in the document's nesting.
@@ -2601,22 +2574,6 @@ end
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].start, Position::new(1, 2));
         assert_eq!(ranges[0].end, Position::new(1, 6));
-    }
-
-    #[test]
-    fn definition_line_resolves_blocks_and_fields() {
-        let schema = SchemaDocument::from_str(
-            "schema app:\n  name string required\n  server:\n    port int\n  end\nend\n",
-        )
-        .unwrap();
-
-        // Top-level block (`schema app:` is line 1 -> 0-based 0).
-        assert_eq!(definition_line_for_path(&schema, &["app".into()]), Some(0));
-        // Nested field (`port int` is line 4 -> 0-based 3).
-        assert_eq!(
-            definition_line_for_path(&schema, &["app".into(), "server".into(), "port".into()]),
-            Some(3)
-        );
     }
 
     #[test]

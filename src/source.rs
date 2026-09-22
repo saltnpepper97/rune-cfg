@@ -234,39 +234,6 @@ impl LineIndex {
 
         utf16.min(text.encode_utf16().count() + 1)
     }
-
-    /// Names carried by the identifier and string tokens of one zero-based
-    /// line, paired with their spans. Quoted keys are reported with the name
-    /// the parser stores, not with their quotes.
-    pub(crate) fn named_tokens_on_line(&self, line: usize) -> Vec<(Span, String)> {
-        let Some(text) = self.line_text(line) else {
-            return Vec::new();
-        };
-        let base = self.line_span(line).map(|span| span.start).unwrap_or(0);
-
-        let mut names = Vec::new();
-        let mut lexer = Lexer::new(text);
-        // A multi-line lexeme cannot be lexed from one line; the names found
-        // before it still describe the line.
-        for token in std::iter::from_fn(|| next_token_or_stop(&mut lexer)) {
-            if let Some(name) = token_name(&token.token) {
-                names.push((
-                    Span::new(base + token.span.start, base + token.span.end),
-                    name,
-                ));
-            }
-        }
-
-        names
-    }
-
-    /// Span of the token on `line` that reads as `name`.
-    pub(crate) fn identifier_span_on_line(&self, line: usize, name: &str) -> Option<Span> {
-        self.named_tokens_on_line(line)
-            .into_iter()
-            .find(|(_, token_name)| token_name == name)
-            .map(|(span, _)| span)
-    }
 }
 
 /// What a structural entry is.
@@ -1323,25 +1290,5 @@ mod tests {
             "@author \"x\"\nschema app:\nend\n"
         ));
         assert!(!starts_with_schema_block(""));
-    }
-
-    #[test]
-    fn token_names_on_a_line_back_exact_schema_edits() {
-        let index = LineIndex::new("schema app:\n  name string\nend\n");
-
-        assert_eq!(
-            index.identifier_span_on_line(0, "app"),
-            Some(Span::new(7, 10))
-        );
-        // Line 1 starts after `schema app:\n`, so its tokens are offset by 12.
-        assert_eq!(
-            index.identifier_span_on_line(1, "name"),
-            Some(Span::new(14, 18))
-        );
-        assert_eq!(
-            index.identifier_span_on_line(1, "string"),
-            Some(Span::new(19, 25))
-        );
-        assert_eq!(index.identifier_span_on_line(2, "name"), None);
     }
 }

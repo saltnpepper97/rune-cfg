@@ -251,6 +251,30 @@ endif
 }
 
 #[test]
+fn range_numbers_stop_before_double_dots() {
+    let mut lexer = Lexer::new("1..65535 0.5..1.5 -10..10");
+    let expected = [
+        Token::Number(1.0),
+        Token::Dot,
+        Token::Dot,
+        Token::Number(65535.0),
+        Token::Number(0.5),
+        Token::Dot,
+        Token::Dot,
+        Token::Number(1.5),
+        Token::Number(-10.0),
+        Token::Dot,
+        Token::Dot,
+        Token::Number(10.0),
+        Token::Eof,
+    ];
+
+    for token in expected {
+        assert_eq!(lexer.next_token(), Ok(token));
+    }
+}
+
+#[test]
 fn test_token_spans_cover_lexemes() {
     let input = "app:\n  name \"Rune\" # comment\n";
     let mut lexer = Lexer::new(input);

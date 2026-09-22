@@ -3,20 +3,23 @@
 
 use crate::RuneError;
 use crate::ast::Value;
+use crate::lexer::{Lexer, SpannedToken, Token};
+use crate::source::{LineIndex, Span};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct SchemaDocument {
     pub blocks: Vec<SchemaBlock>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct SchemaBlock {
     pub root: String,
     pub fields: Vec<SchemaField>,
     pub line: usize,
+    pub(crate) name_span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct SchemaField {
     pub name: String,
     pub kind: SchemaType,
@@ -26,6 +29,7 @@ pub struct SchemaField {
     pub range: Option<(f64, f64)>,
     pub fields: Vec<SchemaField>,
     pub line: usize,
+    pub(crate) name_span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +47,31 @@ pub enum SchemaType {
     Object,
 }
 
+impl PartialEq for SchemaDocument {
+    fn eq(&self, other: &Self) -> bool {
+        self.blocks == other.blocks
+    }
+}
+
+impl PartialEq for SchemaBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root && self.fields == other.fields && self.line == other.line
+    }
+}
+
+impl PartialEq for SchemaField {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.kind == other.kind
+            && self.description == other.description
+            && self.required == other.required
+            && self.default == other.default
+            && self.range == other.range
+            && self.fields == other.fields
+            && self.line == other.line
+    }
+}
+
 impl SchemaDocument {
     pub fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, RuneError> {
         let content = std::fs::read_to_string(&path).map_err(|e| RuneError::FileError {
@@ -57,57 +86,7 @@ impl SchemaDocument {
     // Retain the established inherent API alongside the FromStr impl below.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(content: &str) -> Result<Self, RuneError> {
-        let lines: Vec<(usize, String)> = content
-            .lines()
-            .enumerate()
-            .map(|(idx, line)| (idx + 1, line.trim().to_string()))
-            .collect();
-
-        let mut blocks = Vec::new();
-        let mut index = 0;
-
-        while index < lines.len() {
-            let (line_no, line) = &lines[index];
-            let line = strip_comment(line).trim();
-            if line.is_empty() {
-                index += 1;
-                continue;
-            }
-
-            let Some(rest) = line.strip_prefix("schema ") else {
-                return Err(schema_error(
-                    format!("Expected schema block, got '{}'", line),
-                    *line_no,
-                    "Use: schema <name>:",
-                ));
-            };
-
-            let Some(root) = rest.strip_suffix(':').map(str::trim) else {
-                return Err(schema_error(
-                    "Expected ':' after schema name",
-                    *line_no,
-                    "Use: schema app:",
-                ));
-            };
-
-            if root.is_empty() {
-                return Err(schema_error(
-                    "Expected schema name",
-                    *line_no,
-                    "Use: schema app:",
-                ));
-            }
-
-            index += 1;
-            let fields = parse_fields_until_end(&lines, &mut index)?;
-            blocks.push(SchemaBlock {
-                root: root.to_string(),
-                fields,
-                line: *line_no,
-            });
-        }
-
-        Ok(Self { blocks })
+        SchemaParser::new(content).parse()
     }
 }
 
@@ -119,314 +98,507 @@ impl std::str::FromStr for SchemaDocument {
     }
 }
 
-fn parse_fields_until_end(
-    lines: &[(usize, String)],
-    index: &mut usize,
-) -> Result<Vec<SchemaField>, RuneError> {
-    let mut fields = Vec::new();
-    let mut pending_description = Vec::new();
+struct SchemaParser<'a> {
+    source: &'a str,
+    lines: LineIndex,
+    lexer: Lexer<'a>,
+    current: Option<SpannedToken>,
+    leading_start: usize,
+    statement_spans: Vec<Span>,
+}
 
-    while *index < lines.len() {
-        let (line_no, raw_line) = &lines[*index];
-        let line = strip_comment(raw_line).trim();
-        if let Some(comment) = schema_comment(raw_line) {
-            pending_description.push(comment.to_string());
-            *index += 1;
-            continue;
+impl<'a> SchemaParser<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            lines: LineIndex::new(source),
+            lexer: Lexer::new(source),
+            current: None,
+            leading_start: 0,
+            statement_spans: Vec::new(),
         }
+    }
 
-        if line.is_empty() {
-            *index += 1;
-            continue;
-        }
+    fn parse(mut self) -> Result<SchemaDocument, RuneError> {
+        let mut blocks = Vec::new();
 
-        if line == "end" {
-            *index += 1;
-            return Ok(fields);
-        }
-
-        if let Some(name) = line.strip_suffix(':').map(str::trim) {
-            if name.is_empty() {
-                return Err(schema_error(
-                    "Expected object field name before ':'",
-                    *line_no,
-                    "Use: server:",
-                ));
+        loop {
+            let comments = self.skip_layout()?;
+            let token = self.peek()?.clone();
+            match token.token {
+                Token::Eof => break,
+                Token::Ident(ref keyword) if keyword == "schema" => {
+                    self.take();
+                    let (root, name_span) =
+                        self.expect_name("Expected schema name", "Use: schema app:")?;
+                    self.expect_token(
+                        Token::Colon,
+                        "Expected ':' after schema name",
+                        "Use: schema app:",
+                    )?;
+                    self.expect_boundary("Expected end of schema declaration", "Use: schema app:")?;
+                    let line = self.line_of(name_span);
+                    let fields = self.parse_fields()?;
+                    blocks.push(SchemaBlock {
+                        root,
+                        fields,
+                        line,
+                        name_span,
+                    });
+                }
+                _ => {
+                    return Err(self.error_at(
+                        &token,
+                        format!("Expected schema block, got {}", token_label(&token.token)),
+                        "Use: schema <name>:",
+                    ));
+                }
             }
 
-            *index += 1;
-            let nested = parse_fields_until_end(lines, index)?;
-            fields.push(SchemaField {
-                name: name.to_string(),
+            // Comments before a schema block are deliberately ignored.
+            let _ = comments;
+        }
+
+        Ok(SchemaDocument { blocks })
+    }
+
+    fn parse_fields(&mut self) -> Result<Vec<SchemaField>, RuneError> {
+        let mut fields = Vec::new();
+
+        loop {
+            let comments = self.skip_layout()?;
+            let token = self.peek()?.clone();
+
+            match token.token {
+                Token::End => {
+                    self.take();
+                    self.expect_boundary(
+                        "Expected end of schema block",
+                        "Close schema blocks with 'end'",
+                    )?;
+                    return Ok(fields);
+                }
+                Token::Eof => {
+                    return Err(self.error_at(
+                        &token,
+                        "Unclosed schema block",
+                        "Close schema blocks and nested objects with 'end'",
+                    ));
+                }
+                _ => {
+                    let mut field = self.parse_field()?;
+                    field.description = take_description(comments);
+                    fields.push(field);
+                }
+            }
+        }
+    }
+
+    fn parse_field(&mut self) -> Result<SchemaField, RuneError> {
+        let (name, name_span) =
+            self.expect_name("Expected schema field name", "Use: name string required")?;
+        let line = self.line_of(name_span);
+
+        if self.peek()?.token == Token::Colon {
+            self.take();
+            self.expect_boundary("Expected newline after object field ':'", "Use: server:")?;
+            let fields = self.parse_fields()?;
+            return Ok(SchemaField {
+                name,
                 kind: SchemaType::Object,
-                description: take_description(&mut pending_description),
+                description: None,
                 required: false,
                 default: None,
                 range: None,
-                fields: nested,
-                line: *line_no,
+                fields,
+                line,
+                name_span,
             });
-            continue;
         }
 
-        let mut field = parse_field(line, *line_no)?;
-        field.description = take_description(&mut pending_description);
-        fields.push(field);
-        *index += 1;
-    }
-
-    Err(schema_error(
-        "Unclosed schema block",
-        lines.last().map(|(line, _)| *line).unwrap_or(0),
-        "Close schema blocks and nested objects with 'end'",
-    ))
-}
-
-fn parse_field(line: &str, line_no: usize) -> Result<SchemaField, RuneError> {
-    let Some((name, rest)) = split_once_whitespace(line) else {
-        return Err(schema_error(
-            format!("Expected type for schema field '{}'", line),
-            line_no,
-            "Use: name string required",
-        ));
-    };
-
-    let (kind, options) = parse_type(rest.trim(), line_no)?;
-    let required = contains_word(options, "required");
-    let range = parse_range(options, line_no)?;
-    let default = parse_default(options, line_no)?;
-
-    Ok(SchemaField {
-        name: name.to_string(),
-        kind,
-        description: None,
-        required,
-        default,
-        range,
-        fields: Vec::new(),
-        line: line_no,
-    })
-}
-
-fn parse_type(input: &str, line_no: usize) -> Result<(SchemaType, &str), RuneError> {
-    if let Some(rest) = input.strip_prefix("enum") {
-        let rest = rest.trim_start();
-        let Some((values, after)) = parse_bracketed(rest) else {
-            return Err(schema_error(
-                "Expected enum values",
-                line_no,
-                "Use: environment enum [\"dev\", \"prod\"]",
-            ));
-        };
-        return Ok((SchemaType::Enum(parse_string_list(values)), after));
-    }
-
-    if input.starts_with('[') {
-        let Some((inner, after)) = parse_bracketed(input) else {
-            return Err(schema_error(
-                "Expected array type",
-                line_no,
-                "Use: plugins [string]",
-            ));
-        };
-        let (inner_type, trailing) = parse_type(inner.trim(), line_no)?;
-        if !trailing.trim().is_empty() {
-            return Err(schema_error(
-                "Unexpected text inside array type",
-                line_no,
-                "Use a single array element type like [string]",
+        let next = self.peek()?.clone();
+        if matches!(next.token, Token::Newline | Token::Eof) {
+            return Err(self.error_at(
+                &next,
+                format!("Expected type for schema field '{}'", name),
+                "Use: name string required",
             ));
         }
-        return Ok((SchemaType::Array(Box::new(inner_type)), after));
-    }
 
-    let (word, after) = split_first_word(input);
-    let kind = match word {
-        "string" | "str" => SchemaType::String,
-        "int" | "integer" => SchemaType::Int,
-        "float" => SchemaType::Float,
-        "number" => SchemaType::Number,
-        "bool" | "boolean" => SchemaType::Bool,
-        "regex" => SchemaType::Regex,
-        "null" => SchemaType::Null,
-        "any" => SchemaType::Any,
-        "object" => SchemaType::Object,
-        _ => {
-            return Err(schema_error(
-                format!("Unknown schema type '{}'", word),
-                line_no,
-                "Use string, int, float, number, bool, regex, null, any, enum, object, or [type]",
-            ));
-        }
-    };
+        let kind = self.parse_type()?;
+        let mut required = false;
+        let mut default = None;
+        let mut range = None;
 
-    Ok((kind, after))
-}
-
-fn parse_range(input: &str, line_no: usize) -> Result<Option<(f64, f64)>, RuneError> {
-    let Some(range_start) = find_word(input, "range") else {
-        return Ok(None);
-    };
-    let after = input[(range_start + "range".len())..].trim_start();
-    let range_text = split_first_word(after).0;
-    let Some((min, max)) = range_text.split_once("..") else {
-        return Err(schema_error(
-            "Expected range in min..max form",
-            line_no,
-            "Use: port int range 1..65535",
-        ));
-    };
-
-    let min = min.parse::<f64>().map_err(|_| {
-        schema_error(
-            "Invalid range minimum",
-            line_no,
-            "Use numeric range bounds like 1..65535",
-        )
-    })?;
-    let max = max.parse::<f64>().map_err(|_| {
-        schema_error(
-            "Invalid range maximum",
-            line_no,
-            "Use numeric range bounds like 1..65535",
-        )
-    })?;
-    Ok(Some((min, max)))
-}
-
-fn parse_default(input: &str, line_no: usize) -> Result<Option<Value>, RuneError> {
-    let Some(default_start) = find_word(input, "default") else {
-        return Ok(None);
-    };
-    let raw = input[(default_start + "default".len())..].trim();
-    if raw.is_empty() {
-        return Err(schema_error(
-            "Expected value after default",
-            line_no,
-            "Use: debug bool default false",
-        ));
-    }
-    Ok(Some(parse_literal_value(raw)))
-}
-
-fn parse_literal_value(raw: &str) -> Value {
-    let raw = raw.trim();
-    if raw == "true" {
-        return Value::Bool(true);
-    }
-    if raw == "false" {
-        return Value::Bool(false);
-    }
-    if raw == "null" || raw == "None" {
-        return Value::Null;
-    }
-    if let Ok(n) = raw.parse::<f64>() {
-        return Value::Number(n);
-    }
-    if let Some(s) = parse_quoted(raw) {
-        return Value::String(s);
-    }
-    Value::String(raw.to_string())
-}
-
-fn parse_string_list(input: &str) -> Vec<String> {
-    input
-        .split(',')
-        .filter_map(|part| {
-            let trimmed = part.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(parse_quoted(trimmed).unwrap_or_else(|| trimmed.to_string()))
-            }
-        })
-        .collect()
-}
-
-fn parse_bracketed(input: &str) -> Option<(&str, &str)> {
-    let mut depth = 0usize;
-    for (idx, ch) in input.char_indices() {
-        match ch {
-            '[' => depth += 1,
-            ']' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some((&input[1..idx], &input[(idx + 1)..]));
+        loop {
+            let token = self.peek()?.clone();
+            match token.token {
+                Token::Newline | Token::Eof => {
+                    self.consume_boundary();
+                    break;
+                }
+                Token::Ident(ref modifier) if modifier == "required" => {
+                    self.take();
+                    required = true;
+                }
+                Token::Ident(ref modifier) if modifier == "range" => {
+                    self.take();
+                    range = Some(self.parse_range()?);
+                }
+                Token::Ident(ref modifier) if modifier == "default" => {
+                    self.take();
+                    default = Some(self.parse_default()?);
+                }
+                _ => {
+                    return Err(self.error_at(
+                        &token,
+                        format!("Unexpected schema modifier {}", token_label(&token.token)),
+                        "Use modifiers like required, range min..max, or default value",
+                    ));
                 }
             }
-            _ => {}
+        }
+
+        Ok(SchemaField {
+            name,
+            kind,
+            description: None,
+            required,
+            default,
+            range,
+            fields: Vec::new(),
+            line,
+            name_span,
+        })
+    }
+
+    fn parse_type(&mut self) -> Result<SchemaType, RuneError> {
+        let token = self.peek()?.clone();
+        match token.token {
+            Token::Ident(ref word) if word == "enum" => {
+                self.take();
+                self.expect_token(
+                    Token::LBracket,
+                    "Expected enum values",
+                    "Use: environment enum [\"dev\", \"prod\"]",
+                )?;
+                let mut values = Vec::new();
+                loop {
+                    let value = self.peek()?.clone();
+                    match value.token {
+                        Token::RBracket => {
+                            self.take();
+                            break;
+                        }
+                        Token::Newline => {
+                            self.take();
+                        }
+                        Token::Eof => {
+                            return Err(self.error_at(
+                                &value,
+                                "Expected enum values",
+                                "Use: environment enum [\"dev\", \"prod\"]",
+                            ));
+                        }
+                        _ => {
+                            let Some(value) = enum_value(&value.token) else {
+                                return Err(self.error_at(
+                                    &value,
+                                    "Invalid enum value",
+                                    "Use strings, numbers, booleans, or null in enum brackets",
+                                ));
+                            };
+                            self.take();
+                            values.push(value);
+                        }
+                    }
+                }
+                Ok(SchemaType::Enum(values))
+            }
+            Token::LBracket => {
+                self.take();
+                if self.peek()?.token == Token::RBracket {
+                    let token = self.peek()?.clone();
+                    return Err(self.error_at(
+                        &token,
+                        "Expected array type",
+                        "Use: plugins [string]",
+                    ));
+                }
+                let inner = self.parse_type()?;
+                self.expect_token(
+                    Token::RBracket,
+                    "Expected array type",
+                    "Use: plugins [string]",
+                )?;
+                Ok(SchemaType::Array(Box::new(inner)))
+            }
+            Token::Null => {
+                self.take();
+                Ok(SchemaType::Null)
+            }
+            Token::Ident(ref word) => {
+                self.take();
+                let kind = match word.as_str() {
+                    "string" | "str" => SchemaType::String,
+                    "int" | "integer" => SchemaType::Int,
+                    "float" => SchemaType::Float,
+                    "number" => SchemaType::Number,
+                    "bool" | "boolean" => SchemaType::Bool,
+                    "regex" => SchemaType::Regex,
+                    "null" => SchemaType::Null,
+                    "any" => SchemaType::Any,
+                    "object" => SchemaType::Object,
+                    _ => {
+                        return Err(self.error_at(
+                            &token,
+                            format!("Unknown schema type '{}'", word),
+                            "Use string, int, float, number, bool, regex, null, any, enum, object, or [type]",
+                        ));
+                    }
+                };
+                Ok(kind)
+            }
+            _ => Err(self.error_at(
+                &token,
+                format!("Unknown schema type {}", token_label(&token.token)),
+                "Use string, int, float, number, bool, regex, null, any, enum, object, or [type]",
+            )),
         }
     }
-    None
-}
 
-fn parse_quoted(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    if bytes.len() < 2 {
-        return None;
+    fn parse_range(&mut self) -> Result<(f64, f64), RuneError> {
+        let minimum = self.expect_number(
+            "Invalid range minimum",
+            "Use numeric range bounds like 1..65535",
+        )?;
+        self.expect_token(
+            Token::Dot,
+            "Expected range in min..max form",
+            "Use: port int range 1..65535",
+        )?;
+        self.expect_token(
+            Token::Dot,
+            "Expected range in min..max form",
+            "Use: port int range 1..65535",
+        )?;
+        let maximum = self.expect_number(
+            "Invalid range maximum",
+            "Use numeric range bounds like 1..65535",
+        )?;
+        Ok((minimum, maximum))
     }
-    let quote = bytes[0] as char;
-    if (quote == '"' || quote == '\'') && bytes[bytes.len() - 1] as char == quote {
-        return Some(input[1..input.len() - 1].to_string());
+
+    fn parse_default(&mut self) -> Result<Value, RuneError> {
+        let token = self.peek()?.clone();
+        let value = match token.token {
+            Token::String(value) => Value::String(value),
+            Token::Number(value) => Value::Number(value),
+            Token::Bool(value) => Value::Bool(value),
+            Token::Null => Value::Null,
+            Token::Ident(value) => Value::String(value),
+            _ => {
+                return Err(self.error_at(
+                    &token,
+                    "Expected value after default",
+                    "Use: debug bool default false",
+                ));
+            }
+        };
+        self.take();
+        Ok(value)
     }
-    None
-}
 
-fn split_once_whitespace(input: &str) -> Option<(&str, &str)> {
-    let idx = input.find(char::is_whitespace)?;
-    Some((&input[..idx], &input[idx..]))
-}
+    fn expect_number(&mut self, message: &str, hint: &str) -> Result<f64, RuneError> {
+        let token = self.peek()?.clone();
+        if let Token::Number(number) = token.token {
+            self.take();
+            Ok(number)
+        } else {
+            Err(self.error_at(&token, message, hint))
+        }
+    }
 
-fn split_first_word(input: &str) -> (&str, &str) {
-    let trimmed = input.trim_start();
-    if let Some(idx) = trimmed.find(char::is_whitespace) {
-        (&trimmed[..idx], &trimmed[idx..])
-    } else {
-        (trimmed, "")
+    fn expect_name(&mut self, message: &str, hint: &str) -> Result<(String, Span), RuneError> {
+        let token = self.peek()?.clone();
+        let span = token.span;
+        let quoted = matches!(&token.token, Token::String(_));
+        let name = match token.token {
+            Token::Ident(name) | Token::String(name) => {
+                self.take();
+                name
+            }
+            _ => return Err(self.error_at(&token, message, hint)),
+        };
+        let name_span = if quoted { span.inner() } else { span };
+        Ok((name, name_span))
+    }
+
+    fn expect_token(
+        &mut self,
+        expected: Token,
+        message: &str,
+        hint: &str,
+    ) -> Result<(), RuneError> {
+        let token = self.peek()?.clone();
+        if token.token == expected {
+            self.take();
+            Ok(())
+        } else {
+            Err(self.error_at(&token, message, hint))
+        }
+    }
+
+    fn expect_boundary(&mut self, message: &str, hint: &str) -> Result<(), RuneError> {
+        let token = self.peek()?.clone();
+        match token.token {
+            Token::Newline => {
+                self.take();
+                Ok(())
+            }
+            Token::Eof => Ok(()),
+            _ => Err(self.error_at(&token, message, hint)),
+        }
+    }
+
+    fn consume_boundary(&mut self) {
+        if matches!(
+            self.current.as_ref().map(|token| &token.token),
+            Some(Token::Newline)
+        ) {
+            self.take();
+        }
+    }
+
+    fn skip_layout(&mut self) -> Result<Vec<String>, RuneError> {
+        let mut comments = Vec::new();
+        loop {
+            let token = self.peek()?.clone();
+            comments.extend(leading_comments(
+                self.source,
+                self.leading_start,
+                token.span.start,
+                &self.statement_spans,
+            ));
+            if token.token == Token::Newline {
+                self.take();
+                continue;
+            }
+            return Ok(comments);
+        }
+    }
+
+    fn peek(&mut self) -> Result<&SpannedToken, RuneError> {
+        if self.current.is_none() {
+            self.current = Some(self.lexer.next_token_spanned()?);
+        }
+        Ok(self.current.as_ref().expect("token is present"))
+    }
+
+    fn take(&mut self) -> SpannedToken {
+        let token = self.current.take().expect("peeked token");
+        if matches!(token.token, Token::Newline | Token::Eof) {
+            self.leading_start = token.span.end;
+            self.statement_spans.clear();
+        } else {
+            self.statement_spans.push(token.span);
+        }
+        token
+    }
+
+    fn line_of(&self, span: Span) -> usize {
+        self.lines.line_of(span.start) + 1
+    }
+
+    fn error_at(
+        &self,
+        token: &SpannedToken,
+        message: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> RuneError {
+        let line = self.lines.line_of(token.span.start);
+        let line_start = self
+            .lines
+            .line_span(line)
+            .map(|span| span.start)
+            .unwrap_or(token.span.start);
+        let column = self
+            .source
+            .get(line_start..token.span.start)
+            .map(|text| text.chars().count() + 1)
+            .unwrap_or(1);
+        schema_error(message, line + 1, column, hint)
     }
 }
 
-fn contains_word(input: &str, word: &str) -> bool {
-    find_word(input, word).is_some()
-}
-
-fn find_word(input: &str, word: &str) -> Option<usize> {
-    input.match_indices(word).find_map(|(idx, _)| {
-        let before = input[..idx].chars().next_back();
-        let after = input[(idx + word.len())..].chars().next();
-        let before_ok = before.map(|c| c.is_whitespace()).unwrap_or(true);
-        let after_ok = after.map(|c| c.is_whitespace()).unwrap_or(true);
-        before_ok
-            .then_some(())
-            .and_then(|_| after_ok.then_some(idx))
-    })
-}
-
-fn strip_comment(line: &str) -> &str {
-    line.split_once('#')
-        .map(|(before, _)| before)
-        .unwrap_or(line)
-}
-
-fn schema_comment(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    let comment = trimmed.strip_prefix('#')?.trim();
-    (!comment.is_empty()).then_some(comment)
-}
-
-fn take_description(lines: &mut Vec<String>) -> Option<String> {
-    if lines.is_empty() {
-        None
-    } else {
-        Some(std::mem::take(lines).join("\n"))
+fn enum_value(token: &Token) -> Option<String> {
+    match token {
+        Token::String(value) | Token::Ident(value) | Token::Regex(value) => Some(value.clone()),
+        Token::Number(value) => Some(value.to_string()),
+        Token::Bool(value) => Some(value.to_string()),
+        Token::Null => Some("null".into()),
+        _ => None,
     }
 }
 
-fn schema_error(message: impl Into<String>, line: usize, hint: impl Into<String>) -> RuneError {
+fn leading_comments(source: &str, start: usize, end: usize, protected: &[Span]) -> Vec<String> {
+    if start >= end {
+        return Vec::new();
+    }
+
+    let mut comments = Vec::new();
+    let Some(text) = source.get(start..end) else {
+        return comments;
+    };
+
+    let mut line_start = 0;
+    for line_with_terminator in text.split_inclusive('\n') {
+        let line = line_with_terminator
+            .strip_suffix('\n')
+            .unwrap_or(line_with_terminator)
+            .strip_suffix('\r')
+            .unwrap_or_else(|| {
+                line_with_terminator
+                    .strip_suffix('\n')
+                    .unwrap_or(line_with_terminator)
+            });
+        let leading = line.len() - line.trim_start().len();
+        let marker = start + line_start + leading;
+        let trimmed = &line[leading..];
+
+        if let Some(comment) = trimmed.strip_prefix('#')
+            && !protected.iter().any(|span| span.touches(marker))
+        {
+            let comment = comment.trim();
+            if !comment.is_empty() {
+                comments.push(comment.to_string());
+            }
+        }
+
+        line_start += line_with_terminator.len();
+    }
+
+    comments
+}
+
+fn take_description(comments: Vec<String>) -> Option<String> {
+    (!comments.is_empty()).then(|| comments.join("\n"))
+}
+
+fn token_label(token: &Token) -> String {
+    token.describe()
+}
+
+fn schema_error(
+    message: impl Into<String>,
+    line: usize,
+    column: usize,
+    hint: impl Into<String>,
+) -> RuneError {
     RuneError::SyntaxError {
         message: message.into(),
         line,
-        column: 0,
+        column,
         hint: Some(hint.into()),
         code: Some(600),
     }
@@ -508,5 +680,89 @@ end
             server.fields[0].description.as_deref(),
             Some("Public hostname.")
         );
+    }
+
+    #[test]
+    fn parser_supports_quoted_names_and_exact_columns() {
+        let schema = SchemaDocument::from_str(
+            "schema \"app.name\":\n  \"na\\me\" string default \"a#b\"\nend\n",
+        )
+        .unwrap();
+
+        assert_eq!(schema.blocks[0].root, "app.name");
+        assert_eq!(schema.blocks[0].fields[0].name, "name");
+        assert_eq!(schema.blocks[0].fields[0].fields.len(), 0);
+        assert_eq!(schema.blocks[0].name_span, Span::new(8, 16));
+        assert_eq!(schema.blocks[0].fields[0].name_span, Span::new(22, 27));
+        assert_eq!(
+            schema.blocks[0].fields[0].default,
+            Some(Value::String("a#b".into()))
+        );
+    }
+
+    #[test]
+    fn comments_and_literals_follow_statement_boundaries() {
+        let schema = SchemaDocument::from_str(
+            "schema app:\n  # The value description.\n  value string default \"a#b\" # inline\n  # The null description.\n  nothing null\nend\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            schema.blocks[0].fields[0].description.as_deref(),
+            Some("The value description.")
+        );
+        assert_eq!(
+            schema.blocks[0].fields[0].default,
+            Some(Value::String("a#b".into()))
+        );
+        assert_eq!(
+            schema.blocks[0].fields[1].description.as_deref(),
+            Some("The null description.")
+        );
+        assert_eq!(schema.blocks[0].fields[1].kind, SchemaType::Null);
+    }
+
+    #[test]
+    fn parser_preserves_semantics_across_line_endings_and_ranges() {
+        let lf = SchemaDocument::from_str(
+            "schema app:\n  port int range -10..10\n  ratio number range 0.5..1.5\nend\n",
+        )
+        .unwrap();
+        let crlf = SchemaDocument::from_str(
+            "schema app:\r\n  port int range -10..10\r\n  ratio number range 0.5..1.5\r\nend\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(lf, crlf);
+        assert_eq!(lf.blocks[0].fields[0].line, 2);
+        assert_eq!(crlf.blocks[0].fields[0].line, 2);
+        assert_eq!(lf.blocks[0].fields[0].range, Some((-10.0, 10.0)));
+    }
+
+    #[test]
+    fn parser_reports_real_error_columns() {
+        let error = SchemaDocument::from_str("schema app:\n  value mystery\nend\n").unwrap_err();
+        assert_eq!(
+            error,
+            RuneError::SyntaxError {
+                message: "Unknown schema type 'mystery'".into(),
+                line: 2,
+                column: 9,
+                hint: Some("Use string, int, float, number, bool, regex, null, any, enum, object, or [type]".into()),
+                code: Some(600),
+            }
+        );
+
+        let error =
+            SchemaDocument::from_str("schema app:\n  \u{10400} mystery\nend\n").unwrap_err();
+        assert!(matches!(
+            error,
+            RuneError::SyntaxError {
+                line: 2,
+                column: 5,
+                code: Some(600),
+                ..
+            }
+        ));
     }
 }
