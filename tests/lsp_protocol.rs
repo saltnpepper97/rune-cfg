@@ -698,3 +698,95 @@ async fn schema_scoped_navigation_resolves_indexed_field_paths() {
         "the usage is replaced in place: {rename}"
     );
 }
+
+/// A schema for the source-indexed diagnostic test, in CRLF form: `app.mode`
+/// must be an int and `app.𐐀name` a string.
+const SCHEMA_CONDITIONAL_FIELDS: &str =
+    "schema app:\r\n  mode int required\r\n  \u{10400}name string required\r\nend\r\n";
+
+/// A CRLF config whose `app.mode` is written in all three branches of an
+/// `if`/`elseif`/`else` chain. The active branch is the `elseif`, so that is the
+/// occurrence a diagnostic has to point at; the value carries a `#`, and the
+/// second field is a quoted non-BMP key.
+const CONDITIONAL_CRLF_CONFIG: &str = "first false\r\nsecond true\r\napp:\r\n  if first = true:\r\n    mode 100\r\n  elseif second = true:\r\n    mode \"beta#1\"\r\n  else:\r\n    mode 200\r\n  endif\r\n  \"\u{10400}name\" 42\r\nend\r\n";
+
+/// The one published diagnostic whose message contains `needle`.
+fn diagnostic_with_message<'a>(diagnostics: &'a [Value], needle: &str) -> &'a Value {
+    let matching: Vec<&Value> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains(needle)
+        })
+        .collect();
+
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly one diagnostic containing {needle:?}, got {diagnostics:#?}"
+    );
+
+    matching[0]
+}
+
+/// Schema diagnostics are reported at the exact source span of the key that
+/// supplied the value: the active `elseif` occurrence, not an inactive sibling
+/// writing the same path, and a quoted non-BMP key counted in UTF-16 code units
+/// on a CRLF buffer.
+#[tokio::test]
+async fn schema_diagnostics_use_indexed_source_spans() {
+    let mut harness = LspHarness::start().await;
+    let schema_uri = harness.document_uri("schema.rune");
+    let config_uri = harness.document_uri("config.rune");
+
+    harness
+        .did_open(&schema_uri, SCHEMA_CONDITIONAL_FIELDS)
+        .await;
+    harness.did_open(&config_uri, CONDITIONAL_CRLF_CONFIG).await;
+
+    // Opening the schema publishes its own diagnostics; opening the config
+    // revalidates both open documents.
+    let published = harness.collect_diagnostics(3).await;
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(
+        config.diagnostics.len(),
+        2,
+        "each invalid field is reported once: {published:#?}"
+    );
+
+    // Line 6 is `    mode "beta#1"` - the elseif branch. The `#` inside the
+    // value must not move the key, and the inactive `if`/`else` occurrences of
+    // the same path must not be the ones underlined.
+    let mode = diagnostic_with_message(&config.diagnostics, "app.mode");
+    assert_eq!(mode["code"], json!(652));
+    assert!(
+        mode["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("expected int, got string"),
+        "the selected elseif value is the one validated: {mode}"
+    );
+    assert_eq!(
+        mode["range"],
+        json!({
+            "start": { "line": 6, "character": 4 },
+            "end": { "line": 6, "character": 8 },
+        })
+    );
+
+    // Line 10 is `  "𐐀name" 42`: the range covers the decoded key inside its
+    // quotes, and 𐐀 is two UTF-16 code units, so the end column is 9 and not
+    // the 11 UTF-8 bytes of the same text.
+    let name = diagnostic_with_message(&config.diagnostics, "app.\u{10400}name");
+    assert_eq!(name["code"], json!(652));
+    assert_eq!(
+        name["range"],
+        json!({
+            "start": { "line": 10, "character": 3 },
+            "end": { "line": 10, "character": 9 },
+        })
+    );
+}

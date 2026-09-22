@@ -5,8 +5,10 @@
 use super::*;
 use std::collections::HashMap;
 
+use crate::RuneDiagnostic;
 use crate::SchemaDocument;
 use crate::ast::ObjectItem;
+use crate::source::SourceIndex;
 
 #[test]
 fn test_config_from_string() {
@@ -776,26 +778,35 @@ end
     )
     .expect("schema should parse");
 
-    let config = RuneConfig::from_str(
-        r#"
+    let text = r#"
 app:
   name "RuneApp"
 end
-"#,
-    )
-    .expect("config should parse");
+"#;
+    let config = RuneConfig::from_str(text).expect("config should parse");
 
     let diagnostics = config.validate_schema(&schema);
     assert_eq!(diagnostics.len(), 1);
-    assert!(
-        diagnostics[0]
-            .message
-            .contains("Missing required field 'version' inside 'app'")
+    assert_eq!(
+        diagnostics[0].message,
+        "Missing required field 'version' inside 'app'"
     );
+    assert_eq!(diagnostics[0].code, Some(651));
+    // The whole `app` key token: line 2, columns 1 through 4.
     let range = diagnostics[0].range.unwrap();
     assert_eq!(range.start.line, 2);
     assert_eq!(range.start.column, 1);
+    assert_eq!(range.end.line, 2);
     assert_eq!(range.end.column, 4);
+    assert_eq!(
+        diagnostics[0].hint.as_deref(),
+        Some("Add 'version' near: app:")
+    );
+
+    // Validating with an index the caller already built - the path the language
+    // server takes - reports the very same diagnostic.
+    let indexed = config.validate_schema_with_source(&schema, &SourceIndex::new(text));
+    assert_eq!(indexed, diagnostics);
 }
 
 #[test]
@@ -811,23 +822,37 @@ end
     )
     .expect("schema should parse");
 
-    let config = RuneConfig::from_str(
-        r#"
+    let text = r#"
 app:
   server:
     port "8080"
   end
 end
-"#,
-    )
-    .expect("config should parse");
+"#;
+    let config = RuneConfig::from_str(text).expect("config should parse");
 
     let diagnostics = config.validate_schema(&schema);
     assert_eq!(diagnostics.len(), 1);
+    assert_eq!(
+        diagnostics[0].message,
+        "'app.server.port' expected int, got string"
+    );
+    assert_eq!(diagnostics[0].code, Some(652));
+    // The whole `port` key token: line 4, columns 5 through 9.
     let range = diagnostics[0].range.unwrap();
     assert_eq!(range.start.line, 4);
     assert_eq!(range.start.column, 5);
+    assert_eq!(range.end.line, 4);
     assert_eq!(range.end.column, 9);
+    assert_eq!(
+        diagnostics[0].hint.as_deref(),
+        Some("Check around: port \"8080\"")
+    );
+
+    // Validating with an index the caller already built - the path the language
+    // server takes - reports the very same diagnostic.
+    let indexed = config.validate_schema_with_source(&schema, &SourceIndex::new(text));
+    assert_eq!(indexed, diagnostics);
 }
 
 #[test]
@@ -931,4 +956,405 @@ fn test_inject_import_invalidates_resolved_cache() {
 
     let after: String = config.get("greeting").expect("greeting");
     assert_eq!(after, "after");
+}
+
+// ===== Source-indexed schema validation =====
+//
+// Every diagnostic below is asserted as a complete range: the exact key token
+// the source index reports, in 1-based UTF-16 lines and columns.
+
+/// A parsed config plus the schema diagnostics for it, located through the
+/// source index the language server builds for the same text.
+fn indexed_schema_diagnostics(
+    config_text: &str,
+    schema_text: &str,
+) -> (RuneConfig, Vec<RuneDiagnostic>) {
+    let config = RuneConfig::from_str(config_text).expect("config should parse");
+    let schema = SchemaDocument::from_str(schema_text).expect("schema should parse");
+    let diagnostics = config.validate_schema_with_source(&schema, &SourceIndex::new(config_text));
+
+    (config, diagnostics)
+}
+
+/// The one diagnostic whose message contains `needle`.
+fn diagnostic_containing<'a>(
+    diagnostics: &'a [RuneDiagnostic],
+    needle: &str,
+) -> &'a RuneDiagnostic {
+    let matching: Vec<&RuneDiagnostic> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains(needle))
+        .collect();
+
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly one diagnostic containing {needle:?}, got {diagnostics:#?}"
+    );
+
+    matching[0]
+}
+
+/// `(line, start column, end column)` of a diagnostic, all 1-based.
+fn diagnostic_span(diagnostic: &RuneDiagnostic) -> (usize, usize, usize) {
+    let range = diagnostic
+        .range
+        .unwrap_or_else(|| panic!("diagnostic has no range: {diagnostic:?}"));
+
+    assert_eq!(
+        range.start.line, range.end.line,
+        "a key token never crosses a line: {diagnostic:?}"
+    );
+
+    (range.start.line, range.start.column, range.end.column)
+}
+
+#[test]
+fn schema_diagnostic_points_at_the_active_elseif_occurrence() {
+    let config_text = r#"first false
+second true
+app:
+  if first = true:
+    mode 100
+  elseif second = true:
+    mode "beta"
+  else:
+    mode 200
+  endif
+end
+"#;
+    let schema_text = r#"schema app:
+  mode int required
+end
+"#;
+
+    let (_, diagnostics) = indexed_schema_diagnostics(config_text, schema_text);
+
+    // `app.mode` is written in all three branches; only the elseif branch is
+    // selected, so its own occurrence - line 7 - carries the diagnostic, and
+    // the string value proves the elseif occurrence supplied the value too.
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostic_span(&diagnostics[0]), (7, 5, 9));
+    assert_eq!(
+        diagnostics[0].message,
+        "'app.mode' expected int, got string"
+    );
+    assert_eq!(diagnostics[0].code, Some(652));
+}
+
+#[test]
+fn schema_diagnostic_ignores_inactive_conditional_branches() {
+    let config_text = r#"first true
+app:
+  if first = true:
+    mode 100
+  else:
+    mode "beta"
+  endif
+end
+"#;
+    let schema_text = r#"schema app:
+  mode int required
+end
+"#;
+
+    let (_, diagnostics) = indexed_schema_diagnostics(config_text, schema_text);
+
+    // Control for the elseif case: the only invalid value sits in the branch the
+    // condition did not select, and it must not be validated at all.
+    assert_eq!(diagnostics, vec![], "inactive branches are not validated");
+}
+
+#[test]
+fn schema_diagnostic_matches_the_full_path_not_the_leaf_name() {
+    let config_text = r#"app:
+  server:
+    port "8080"
+  end
+  client:
+    port 9090
+  end
+end
+"#;
+    let schema_text = r#"schema app:
+  server:
+    port int required
+  end
+  client:
+    port string required
+  end
+end
+"#;
+
+    let (_, diagnostics) = indexed_schema_diagnostics(config_text, schema_text);
+
+    // Both objects hold a `port`; each diagnostic has to point at the
+    // occurrence of its own full path.
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostic_span(diagnostic_containing(&diagnostics, "app.server.port")),
+        (3, 5, 9)
+    );
+    assert_eq!(
+        diagnostic_span(diagnostic_containing(&diagnostics, "app.client.port")),
+        (6, 5, 9)
+    );
+}
+
+#[test]
+fn schema_diagnostic_uses_the_first_effective_duplicate() {
+    let config_text = r#"app:
+  server:
+    port "8080"
+  end
+  server:
+    port 9090
+  end
+end
+"#;
+    let schema_text = r#"schema app:
+  server:
+    port int required
+  end
+end
+"#;
+
+    let (config, diagnostics) = indexed_schema_diagnostics(config_text, schema_text);
+
+    // Resolution keeps the first `server` object, so its `port` supplies the
+    // value and the location; the later duplicate is shadowed.
+    assert_eq!(
+        config.get_value("app.server.port").unwrap(),
+        Value::String("8080".to_string())
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostic_span(&diagnostics[0]), (3, 5, 9));
+    assert_eq!(
+        diagnostics[0].message,
+        "'app.server.port' expected int, got string"
+    );
+}
+
+#[test]
+fn missing_field_diagnostic_underlines_the_active_parent_occurrence() {
+    let config_text = r#"app:
+  if debug:
+    server:
+      host "inactive"
+      port "inactive"
+    end
+  else:
+    server:
+      host 42
+    end
+  endif
+end
+"#;
+    let schema_text = r#"schema app:
+  server:
+    host string required
+    port int required
+  end
+end
+"#;
+
+    let (_, diagnostics) = indexed_schema_diagnostics(config_text, schema_text);
+
+    // The parent objects are duplicated across the two branches. `port` is
+    // missing, so the diagnostic covers the selected `app.server` - line 8 -
+    // and neither the inactive (line 3) nor the first textual key.
+    let missing = diagnostic_containing(&diagnostics, "Missing required field");
+    assert_eq!(
+        missing.message,
+        "Missing required field 'port' inside 'app.server'"
+    );
+    assert_eq!(missing.code, Some(651));
+    assert_eq!(diagnostic_span(missing), (8, 5, 11));
+    assert_eq!(missing.hint.as_deref(), Some("Add 'port' near: server:"));
+
+    // The active `host` is the second occurrence of its path; the inactive one
+    // (line 4) still advanced the pairing, so the type error covers line 9.
+    let host = diagnostic_containing(&diagnostics, "app.server.host");
+    assert_eq!(host.message, "'app.server.host' expected string, got int");
+    assert_eq!(diagnostic_span(host), (9, 7, 11));
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+}
+
+#[test]
+fn quoted_key_diagnostic_excludes_quotes_and_ignores_hash_in_value() {
+    let config_text = r#"app:
+  "port" "8080#1"
+end
+"#;
+    let schema_text = r#"schema app:
+  port int required
+end
+"#;
+
+    let (_, diagnostics) = indexed_schema_diagnostics(config_text, schema_text);
+
+    // The range covers the decoded key inside its quotes, and the `#` of the
+    // value neither moves the key nor truncates the hint line.
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostic_span(&diagnostics[0]), (2, 4, 8));
+    assert_eq!(
+        diagnostics[0].message,
+        "'app.port' expected int, got string"
+    );
+    assert_eq!(
+        diagnostics[0].hint.as_deref(),
+        Some("Check around: \"port\" \"8080#1\"")
+    );
+}
+
+#[test]
+fn crlf_source_reports_the_same_range_as_lf() {
+    let lf = "app:\n  server:\n    port \"8080\"\n  end\nend\n";
+    let crlf = lf.replace('\n', "\r\n");
+    let schema_text = r#"schema app:
+  server:
+    port int required
+  end
+end
+"#;
+
+    let (_, lf_diagnostics) = indexed_schema_diagnostics(lf, schema_text);
+    let (_, crlf_diagnostics) = indexed_schema_diagnostics(&crlf, schema_text);
+
+    assert_eq!(diagnostic_span(&lf_diagnostics[0]), (3, 5, 9));
+    assert_eq!(diagnostic_span(&crlf_diagnostics[0]), (3, 5, 9));
+    assert_eq!(
+        crlf_diagnostics, lf_diagnostics,
+        "a CRLF buffer reports the same line, columns, and hint as its LF form"
+    );
+}
+
+#[test]
+fn non_bmp_key_columns_count_utf16_code_units() {
+    let config_text = "app:\n  \"\u{10400}name\" 42\nend\n";
+    let schema_text = "schema app:\n  \u{10400}name string required\nend\n";
+
+    let (_, diagnostics) = indexed_schema_diagnostics(config_text, schema_text);
+
+    // The key is one non-BMP scalar: two UTF-16 code units, four UTF-8 bytes.
+    // Columns therefore run 4..10, not 4..12 (bytes) and not 4..9 (scalars).
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostic_span(&diagnostics[0]), (2, 4, 10));
+    assert_eq!(
+        diagnostics[0].message,
+        "'app.\u{10400}name' expected string, got int"
+    );
+}
+
+#[test]
+fn snapshot_values_agree_with_get_value_for_conditionals_and_duplicates() {
+    let config_text = r#"first false
+second true
+app:
+  if first = true:
+    mode 100
+  elseif second = true:
+    mode "beta"
+  else:
+    mode 200
+  endif
+  server:
+    port 1
+  end
+  server:
+    port 2
+  end
+end
+"#;
+    let schema_text = r#"schema app:
+  mode int required
+  server:
+    port string required
+  end
+end
+"#;
+
+    let (config, diagnostics) = indexed_schema_diagnostics(config_text, schema_text);
+
+    // The values validation saw are the ones `get_value` reports: the selected
+    // elseif branch and the first of the duplicate `server` objects.
+    assert_eq!(
+        config.get_value("app.mode").unwrap(),
+        Value::String("beta".to_string())
+    );
+    assert_eq!(
+        config.get_value("app.server.port").unwrap(),
+        Value::Number(1.0)
+    );
+
+    // ... which is exactly what the diagnostics say, in both message and range.
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+
+    let mode = diagnostic_containing(&diagnostics, "app.mode");
+    assert_eq!(mode.message, "'app.mode' expected int, got string");
+    assert_eq!(diagnostic_span(mode), (7, 5, 9));
+
+    let port = diagnostic_containing(&diagnostics, "app.server.port");
+    assert_eq!(port.message, "'app.server.port' expected string, got int");
+    assert_eq!(diagnostic_span(port), (12, 5, 9));
+}
+
+#[test]
+fn unresolved_root_reports_the_schema_root_as_missing() {
+    // A config whose root does not resolve makes `get_value` report every path
+    // as missing. Validation keeps that behavior: it reports the schema root
+    // instead of the fields that happen to resolve on their own.
+    let config_text = r#"value $var.nope
+app:
+  name "RuneApp"
+end
+"#;
+    let schema_text = r#"schema app:
+  name string required
+end
+"#;
+
+    let (config, diagnostics) = indexed_schema_diagnostics(config_text, schema_text);
+
+    assert!(config.get_value("app").is_err());
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "Required schema root 'app' is missing"
+    );
+    assert_eq!(diagnostics[0].code, Some(650));
+    assert_eq!(diagnostics[0].range, None);
+}
+
+#[test]
+fn reference_produced_descendant_uses_the_nearest_source_backed_ancestor() {
+    let config_text = r#"other:
+  port "8080"
+end
+app:
+  server $var.other
+end
+"#;
+    let schema_text = r#"schema app:
+  server:
+    port int required
+  end
+end
+"#;
+
+    let (_, diagnostics) = indexed_schema_diagnostics(config_text, schema_text);
+
+    // `app.server` comes from a reference, so `port` has no indexed occurrence
+    // of its own; its diagnostic covers the assignment it lives in rather than
+    // an unrelated `port` key elsewhere in the document.
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "'app.server.port' expected int, got string"
+    );
+    assert_eq!(diagnostic_span(&diagnostics[0]), (5, 3, 9));
+    assert_eq!(
+        diagnostics[0].hint.as_deref(),
+        Some("Check around: server $var.other")
+    );
 }

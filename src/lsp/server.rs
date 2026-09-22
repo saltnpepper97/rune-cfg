@@ -126,7 +126,7 @@ impl RuneLanguageServer {
             Err(error) => return vec![diagnostic_from_error(error, source.lines())],
         };
 
-        config.validate_schema(&schema)
+        config.validate_schema_with_source(&schema, source)
     }
 
     async fn schema_text_for(&self, uri: &Url) -> Option<String> {

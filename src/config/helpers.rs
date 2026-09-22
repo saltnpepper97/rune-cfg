@@ -221,7 +221,11 @@ fn column_for_token(line: &str, token: &str) -> usize {
 }
 
 /// Shared condition evaluation for both inline conditionals and block if/endif.
-fn condition_is_met(
+///
+/// Schema validation uses this same evaluator for its location snapshot, so an
+/// `if`/`elseif`/`else` chain selects one branch for values and diagnostics
+/// alike.
+pub(super) fn condition_is_met(
     condition: &crate::ast::Condition,
     parser: &parser::Parser,
     doc: &Document,
