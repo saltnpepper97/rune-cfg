@@ -38,9 +38,9 @@ use super::workspace_index::{
     buffer_overlay, build_entries, build_workspace_index, candidate_paths, child_keys,
     effective_origin, effective_sources, expand_schema_path, first_candidate, gather_occurrences,
     gather_view, gathered_scope_keys, import_source, is_schema_document, is_schema_path_reference,
-    parse_quoted_string, prepare_disk_entries, prepare_text_entry, read_text, read_texts,
-    references_to, resolve_all, resolve_candidates, resolve_reference, schema_directive,
-    schema_reference_items,
+    normalize_path, parse_quoted_string, prepare_disk_entries, prepare_text_entry, read_text,
+    read_texts, references_to, resolve_all, resolve_candidates, resolve_reference,
+    schema_directive, schema_reference_items,
 };
 
 /// What resolving a config document's schema candidates found.
@@ -835,8 +835,10 @@ impl RuneLanguageServer {
             .unwrap_or_else(default_range);
 
         // The imported buffer answers the related range when the index holds it,
-        // which is where an editor sees the failing file itself.
-        let imported_uri = Url::from_file_path(&failure.resolved_path).ok();
+        // which is where an editor sees the failing file itself. The index keys
+        // every target lexically normalized, so the loader's spelling of the
+        // path is normalized before it becomes a URI.
+        let imported_uri = Url::from_file_path(normalize_path(&failure.resolved_path)).ok();
         let imported = match &imported_uri {
             Some(uri) => self.index.read().await.source(uri),
             None => None,
@@ -1109,13 +1111,19 @@ impl RuneLanguageServer {
         let sources = effective_sources(&index, &view);
 
         // `alias.` and `alias.object.` complete from the imported document the
-        // alias resolves to.
+        // alias resolves to. A `gather` alias whose target is not there has no
+        // children at all, so nothing else is offered after it.
         let prefix_keys = source.reference_prefix_at(position).and_then(|prefix| {
             let (alias, rest) = prefix.split_first()?;
-            let binding = view.alias(alias)?;
-            let imported = index.source(&binding.uri)?;
 
-            Some(child_keys(&imported, rest))
+            match view.alias(alias) {
+                Some(binding) => {
+                    let imported = index.source(&binding.uri)?;
+                    Some(child_keys(&imported, rest))
+                }
+                None if view.alias_names.contains(alias) => Some(Vec::new()),
+                None => None,
+            }
         });
 
         let supplied = gathered_scope_keys(&sources, &source.scope_at(position));
@@ -2829,7 +2837,10 @@ fn gather_anchor<'a>(
     view: &GatherView,
     failure: &ImportFailure,
 ) -> Option<&'a GatherDirective> {
-    let target = Url::from_file_path(&failure.resolved_path).ok();
+    // The loader resolves a path without lexical normalization, while the view
+    // keys its first hops by the normalized spelling: normalize here so `..`
+    // and `.` spellings still find the hop that reached the failing file.
+    let target = Url::from_file_path(normalize_path(&failure.resolved_path)).ok();
     let hop = target
         .as_ref()
         .and_then(|target| view.first_hop.get(target))
@@ -2912,8 +2923,20 @@ fn imported_source<'a>(sources: &'a [EffectiveSource], uri: &Url) -> Option<&'a 
 /// The config path a validation message is about.
 ///
 /// The messages are the ones `validate_schema_with_source` produces, read the
-/// same way the quick-fix parsers already read them.
+/// same way the quick-fix parsers already read them. An array item message
+/// names the item (`app.plugins[1]`), which is still supplied by the field that
+/// declares the array, so the index notation is dropped here: the path has to
+/// find the declaration that really provides the value.
 fn diagnostic_path(message: &str) -> Option<Vec<String>> {
+    let path = message_path(message)?;
+    Some(
+        path.iter()
+            .map(|segment| strip_item_indexes(segment).to_string())
+            .collect(),
+    )
+}
+
+fn message_path(message: &str) -> Option<Vec<String>> {
     if let Some(rest) = message.strip_prefix('\'') {
         let end = rest.find('\'')?;
         return Some(split_path(&rest[..end]));
@@ -2928,6 +2951,25 @@ fn diagnostic_path(message: &str) -> Option<Vec<String>> {
     let rest = message.strip_prefix("Missing required config path '")?;
     let end = rest.find('\'')?;
     Some(split_path(&rest[..end]))
+}
+
+/// `plugins[1]` names the same declared field as `plugins`, and `grid[1][2]`
+/// the same field as `grid`: only trailing numeric item indexes are removed.
+fn strip_item_indexes(segment: &str) -> &str {
+    let mut segment = segment;
+
+    while let Some(rest) = segment.strip_suffix(']') {
+        let Some(open) = rest.rfind('[') else {
+            break;
+        };
+        let inner = &rest[open + 1..];
+        if inner.is_empty() || !inner.bytes().all(|byte| byte.is_ascii_digit()) {
+            break;
+        }
+        segment = &rest[..open];
+    }
+
+    segment
 }
 
 /// What a document's gather view adds to one completion.
@@ -3706,6 +3748,24 @@ end
             missing_required_field_from_message("Missing required field 'version' inside 'app'")
                 .unwrap();
         assert_eq!(missing, ("app".into(), "version".into()));
+    }
+
+    /// An array item message is about the field that supplies the array, so the
+    /// item indexes are dropped from the path a declaration is looked up with.
+    #[test]
+    fn diagnostic_paths_drop_array_item_indexes() {
+        assert_eq!(
+            diagnostic_path("'app.plugins[1]' expected string, got int"),
+            Some(vec!["app".to_string(), "plugins".to_string()])
+        );
+        assert_eq!(
+            diagnostic_path("'app.grid[1][2]' expected string, got int"),
+            Some(vec!["app".to_string(), "grid".to_string()])
+        );
+        assert_eq!(
+            diagnostic_path("'app.plugins' expected array, got string"),
+            Some(vec!["app".to_string(), "plugins".to_string()])
+        );
     }
 
     #[test]

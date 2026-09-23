@@ -162,6 +162,10 @@ pub(crate) struct GatherView {
     /// Reachable targets the index holds no text for. Some are missing, some
     /// exist but cannot be read, and only a read can tell them apart.
     pub(crate) unresolved: Vec<Url>,
+    /// Every alias a walked `gather` statement declares, bound or not. A
+    /// statement whose target is not there still names something, which is
+    /// what a cursor after `alias.` is asking about.
+    pub(crate) alias_names: Vec<String>,
 }
 
 impl GatherView {
@@ -617,7 +621,7 @@ pub(crate) fn gather_path(raw_path: &str, from: &Path) -> PathBuf {
 ///
 /// Nothing is read and no symlink is followed: this only makes two spellings of
 /// one location compare equal, which is what a link between two files needs.
-fn normalize_path(path: &Path) -> PathBuf {
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
 
     for component in path.components() {
@@ -687,6 +691,7 @@ pub(crate) fn gather_view(index: &WorkspaceFileIndex, root: &Url) -> GatherView 
         reachable: Vec::new(),
         first_hop: HashMap::new(),
         unresolved: Vec::new(),
+        alias_names: Vec::new(),
     };
     let mut reachable: HashSet<Url> = HashSet::new();
     let mut unresolved: HashSet<Url> = HashSet::new();
@@ -730,6 +735,11 @@ fn walk_edge(
     reachable: &mut HashSet<Url>,
     unresolved: &mut HashSet<Url>,
 ) {
+    // The statement declares its alias whether or not its target loads.
+    if !view.alias_names.contains(&edge.alias) {
+        view.alias_names.push(edge.alias.clone());
+    }
+
     let Some(target) = edge.uri.clone() else {
         return;
     };

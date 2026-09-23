@@ -4685,7 +4685,7 @@ async fn completion_after_an_alias_lists_imported_children() {
     harness.discard_server_messages().await;
     let items = completion_labels(&mut harness, &config_uri, 2, 14).await;
     assert!(
-        !items.contains(&"accent".to_string()) && !items.contains(&"theme".to_string()),
+        items.is_empty(),
         "a gather that resolves to nothing completes nothing: {items:?}"
     );
 
@@ -4880,5 +4880,75 @@ async fn gather_references_span_statements_and_imported_declarations() {
             .iter()
             .any(|location| location["uri"] == json!(config_b.as_str())),
         "the aliased use in the importing config is included: {declaration:#?}"
+    );
+}
+
+/// A nested import reached through a `..` path is still reported on the root's
+/// own first hop, even when earlier gathers name other files.
+#[tokio::test]
+async fn a_nested_failure_behind_a_parent_path_is_anchored_on_its_first_hop() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+
+    harness.write_file("first.rune", "a 1\n");
+    harness.write_file("sub/mid.rune", "gather \"../broken.rune\"\n");
+    harness.write_file("broken.rune", "deep \"1\n");
+    harness
+        .did_open(
+            &config_uri,
+            "gather \"first.rune\"\ngather \"sub/mid.rune\"\n",
+        )
+        .await;
+    let published = harness.collect_diagnostics().await;
+
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(config.diagnostics.len(), 1, "{published:#?}");
+    let diagnostic = &config.diagnostics[0];
+    let message = diagnostic["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("broken.rune") && message.contains("has a syntax error"),
+        "the failing file is named: {message}"
+    );
+    assert_eq!(
+        diagnostic["range"],
+        json!({ "start": { "line": 1, "character": 7 }, "end": { "line": 1, "character": 21 } }),
+        "the anchor is the root's own first hop to the failing file: {published:#?}"
+    );
+}
+
+/// A schema error about a value an include supplies is anchored on the gather
+/// statement that brought it in, even when the message names an array item and
+/// a later include declares the same parent object.
+#[tokio::test]
+async fn an_imported_array_item_error_is_anchored_on_its_gather_statement() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+
+    harness.write_file(
+        "schema.rune",
+        "schema app:\n  name string\n  plugins [string]\nend\n",
+    );
+    harness.write_file("defaults.rune", "app:\n  plugins [\"a\", 42]\nend\n");
+    harness.write_file("theme.rune", "app:\n  theme \"dark\"\nend\n");
+    harness
+        .did_open(
+            &config_uri,
+            "gather \"defaults.rune\"\ngather \"theme.rune\"\napp:\n  name \"x\"\nend\n",
+        )
+        .await;
+    let published = harness.collect_diagnostics().await;
+
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(config.diagnostics.len(), 1, "{published:#?}");
+    let diagnostic = &config.diagnostics[0];
+    let message = diagnostic["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("'app.plugins[1]' expected string, got int"),
+        "{message}"
+    );
+    assert_eq!(
+        diagnostic["range"],
+        json!({ "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 22 } }),
+        "the value is written in defaults.rune, so its gather statement is the anchor: {published:#?}"
     );
 }
