@@ -86,7 +86,7 @@ Completion uses the active schema to suggest only fields that belong in the curr
 Install the released server binary with:
 
 ```sh
-cargo install rune-cfg --version 0.7.0
+cargo install rune-cfg --version 0.7.1
 ```
 
 Or run the server directly from this repository with:
@@ -176,7 +176,7 @@ Run the extension from VS Code's Extension Development Host. By default it launc
 
 The VS Code extension does not bundle `rune-lsp`. It starts `rune-lsp` over stdio, resolving the binary from `PATH` by default, or from the `runecfg.server.path` setting when that is set.
 
-The extension and the crate are released together. Both are `0.7.0`: extension 0.7.0 is built for the `rune-lsp` from crate 0.7.0. Mismatched versions are not guaranteed to work together.
+The extension and the crate are released together. Both are `0.7.1`: extension 0.7.1 is built for the `rune-lsp` from crate 0.7.1. Mismatched versions are not guaranteed to work together.
 
 Before a release, run the full checklist from the repository root, in order:
 

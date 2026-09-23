@@ -31,7 +31,7 @@ For LSP diagnostics, completion, hover, navigation, rename, and formatting, inst
 See [Language Server](../../docs/language-server.md) for the full capability list and schema-aware behavior.
 
 ```sh
-cargo install rune-cfg --version 0.7.0
+cargo install rune-cfg --version 0.7.1
 ```
 
 For local development, build the binary from this repository:
