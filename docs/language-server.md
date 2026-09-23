@@ -16,10 +16,12 @@ An experimental Tree-sitter grammar is included under [`editors/tree-sitter-rune
 - schema validation diagnostics for config files
 - schema-aware key and enum-value completion
 - hover text for schema-backed fields
-- document symbols for object blocks and keys
-- go-to-definition from a config key to its schema field, and from `@schema` to the schema file
-- find-references for a key within a document or across schema-bound configs
+- document symbols for object blocks and keys, plus one symbol per `gather` statement
+- go-to-definition from a config key to its schema field, from a `gather` path to the gathered file, and from `@schema` to the schema file
+- go-to-definition through a reference such as `shared.name` or an include-supplied key
+- find-references for a key within a document, across schema-bound configs, and across `gather` links
 - rename of a key within a document or across schema-bound configs
+- diagnostics and navigation for `gather` imports, resolved the way the runtime loads them
 - document formatting with 2-space block indentation
 - a quickfix code action for missing `end` diagnostics
 - quickfix code actions for invalid enum values and missing required fields
@@ -80,6 +82,50 @@ end
 ```
 
 Completion uses the active schema to suggest only fields that belong in the current object, filters fields already present in that object, and uses snippets for common value shapes such as booleans, arrays, enums, and object blocks. Hover text includes the schema source so app-provided schemas are visible from the editor.
+
+## Gather Imports
+
+`gather` statements are resolved the way the runtime resolves them, so the editor sees the config the program would load rather than the open buffer alone.
+
+```rune
+# an include: the gathered file's keys are merged into this document
+# and it also stays reachable under its default alias
+#
+gather "defaults.rune"
+
+# a namespaced import: the keys stay behind the alias
+gather "shared.rune" as shared
+
+app:
+  theme defaults.theme
+  name shared.name
+end
+```
+
+- Paths resolve relative to the file that writes the statement, with `~/` expanded, and nested gathers resolve relative to the file that declares them.
+- An unaliased gather is an **include**: its keys merge into the importing document and override it, in source order, exactly as the runtime merges them.
+- An explicitly aliased gather is a **namespace** only. Its keys are never merged into the importing document, and a bare reference to one of them is not resolved.
+- A gathered file that is not there is skipped silently, exactly as the runtime skips it: no "file not found" diagnostic is published, though the schema consequences of the missing keys are.
+- A gathered file that is there but cannot be read is reported as a load error on the importing document's own `gather` path.
+- An imported file that does not parse is reported on the `gather` path that reached it, as the first hop from the importing document, and the message names the failing file and its parser position.
+- Cycles terminate: every resolved path is visited once, and no diagnostic is published about them.
+
+Diagnostics follow the values. A schema diagnostic about a key an include supplies is anchored on the statement that brought the key in, marked with `Provided by gather "…"`, and carries the imported declaration as related information. Quick fixes that would edit this buffer are not offered for those diagnostics, because the value is not written here.
+
+Navigation follows the same view:
+
+- Definition on a `gather` path opens the gathered file; a path that resolves to nothing answers `null`.
+- Definition on `alias.key` or `alias.object.key` opens the exact key in the gathered file.
+- Definition on a bare reference opens the declaration that supplies it, whether that is a local key or one an include provides.
+- Hover on a `gather` statement reports the resolved file, the alias, and whether it includes or namespaces the file. Hover on an imported reference reports the resolved path, the source file, and the kind of declaration — never the value.
+- Completion after `alias.` suggests the gathered file's own keys, and keys an unaliased gather supplies are treated as already present so they are not suggested twice.
+- Document symbols include one module symbol per `gather` statement, named by its alias, with the target path as detail. The gathered file's keys are never inlined into the importing document.
+
+### Open Buffers and Watched Files
+
+An open buffer always wins over the copy on disk, for the file it belongs to and for anything that gathers it. Opening, changing, or closing the buffer of a gathered file revalidates the documents that gather it.
+
+Disk changes are followed transitively: editing, deleting, or recreating a file any number of `gather` hops away republishes the configs that reach it, and no config that does not reach it is republished. A `gather` that names a file outside the workspace, or below an excluded directory, is followed too — the import is what makes that file part of the project, and no directory is scanned because of it.
 
 ## Installation
 
@@ -217,3 +263,5 @@ npm test
 ## Plain vs Schema-Aware Mode
 
 Place a `schema.rune` next to your config file or in a parent directory, or use `@schema` to point at an app-provided schema. When a schema is available, `rune-lsp` validates the config and uses the schema for completion and hover. Without a schema, `rune-lsp` stays in plain RUNE mode and only reports syntax-level diagnostics.
+
+Gather imports work in both modes: an unaliased include is validated when a schema is available, and a gathered file is parsed and reported on even when no schema exists.

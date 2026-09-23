@@ -24,17 +24,23 @@ use tower_lsp::lsp_types::{
 };
 use tower_lsp::{Client, LanguageServer};
 
+use crate::config::{ImportFailure, LoadedConfig};
 use crate::diagnostic::{DiagnosticSeverity, RuneDiagnostic};
 use crate::lexer::{Lexer, Token};
-use crate::source::{LineIndex, SourceEntry, SourceEntryKind, SourceIndex, Span};
+use crate::source::{
+    GatherDirective, LineIndex, ReferenceRun, SourceEntry, SourceEntryKind, SourceIndex, Span,
+};
 use crate::{RuneConfig, RuneError, SchemaDocument, SchemaField, SchemaType};
 
 use super::workspace_index::{
-    CandidateHit, CandidateSlot, EntryPlan, IndexedFile, Resolution, ScanExcludes, SchemaDirective,
-    WorkspaceFileIndex, build_entries, build_workspace_index, candidate_paths, expand_schema_path,
-    first_candidate, is_schema_document, is_schema_path_reference, parse_quoted_string,
-    prepare_disk_entries, prepare_text_entry, read_text, resolve_all, resolve_candidates,
-    schema_directive, schema_reference_items,
+    CandidateHit, CandidateSlot, DeclarationKey, EffectiveSource, EntryPlan, GatherEdge,
+    GatherView, IndexedFile, Resolution, ScanExcludes, SchemaDirective, WorkspaceFileIndex,
+    buffer_overlay, build_entries, build_workspace_index, candidate_paths, child_keys,
+    effective_origin, effective_sources, expand_schema_path, first_candidate, gather_occurrences,
+    gather_view, gathered_scope_keys, import_source, is_schema_document, is_schema_path_reference,
+    parse_quoted_string, prepare_disk_entries, prepare_text_entry, read_text, read_texts,
+    references_to, resolve_all, resolve_candidates, resolve_reference, schema_directive,
+    schema_reference_items,
 };
 
 /// What resolving a config document's schema candidates found.
@@ -64,17 +70,23 @@ struct Occurrence {
     is_declaration: bool,
 }
 
-/// Schema resolution state for one open config document: the candidates a
-/// config may bind to, and the first one that is open or present on disk.
+/// Schema resolution and import state for one open config document: the
+/// candidates a config may bind to, the schema it currently resolved to, and
+/// every file its `gather` statements reach.
 ///
 /// The index owns the live state; this is the snapshot the last reconciliation
 /// reported, so the next one can tell what changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SchemaDependency {
+struct DocumentDependency {
     /// Ordered, nearest / highest priority first.
-    candidates: Vec<PathBuf>,
+    schema_candidates: Vec<PathBuf>,
     /// First candidate that is open or exists on disk.
-    resolved: Option<Url>,
+    resolved_schema: Option<Url>,
+    /// Every gather target the document reaches, transitively, including
+    /// candidates that are not there.
+    gather_targets: Vec<Url>,
+    /// The aliases the document's gather view binds, as `(alias, target)`.
+    gather_bindings: Vec<(String, Url)>,
 }
 
 pub struct RuneLanguageServer {
@@ -94,7 +106,7 @@ pub struct RuneLanguageServer {
     index_gate: Mutex<()>,
     /// The dependency state the last reconciliation reported for each open
     /// config document, which is what makes a change detectable.
-    schema_dependencies: RwLock<HashMap<Url, SchemaDependency>>,
+    document_dependencies: RwLock<HashMap<Url, DocumentDependency>>,
     /// The client's `workspace.workspaceEdit.documentChanges` capability.
     /// Renames report versioned document changes only when it is set.
     supports_document_changes: RwLock<bool>,
@@ -108,7 +120,7 @@ impl RuneLanguageServer {
             documents: RwLock::new(HashMap::new()),
             index: RwLock::new(WorkspaceFileIndex::default()),
             index_gate: Mutex::new(()),
-            schema_dependencies: RwLock::new(HashMap::new()),
+            document_dependencies: RwLock::new(HashMap::new()),
             supports_document_changes: RwLock::new(false),
         }
     }
@@ -243,21 +255,105 @@ impl RuneLanguageServer {
         self.documents.write().await.remove(uri);
     }
 
+    /// Cache the text of files read on demand, as non-members, and return how
+    /// many were newly indexed.
+    ///
+    /// One gate hold covers the whole batch, and a file another task indexed
+    /// while this one was reading keeps its own entry, which is how an editor
+    /// buffer that arrives mid-read always wins.
+    async fn cache_reads(&self, reads: Vec<(Url, String)>) -> usize {
+        let _gate = self.index_gate.lock().await;
+        let mut cached = 0;
+
+        for (uri, text) in reads {
+            if self.index.read().await.source(&uri).is_some() {
+                continue;
+            }
+
+            let Some((uri, file)) = self.plan_entry(&uri, &text, false, false).await else {
+                continue;
+            };
+            self.index.write().await.insert(uri, file);
+            cached += 1;
+        }
+
+        cached
+    }
+
     /// Cache the text of a file read on demand, as a non-member, and return the
     /// source that now backs it.
     async fn cache_read(&self, uri: &Url, text: &str) -> Option<Arc<SourceIndex>> {
-        let _gate = self.index_gate.lock().await;
+        self.cache_reads(vec![(uri.clone(), text.to_string())])
+            .await;
+        self.index.read().await.source(uri)
+    }
 
-        // Another task may have indexed the file while this one was reading.
-        if let Some(source) = self.index.read().await.source(uri) {
-            return Some(source);
+    /// Index every file the given roots reach through their `gather`
+    /// statements.
+    ///
+    /// A target the index already holds - an editor buffer or a file the scan
+    /// found - is used as it is, and only what is left is read, in one blocking
+    /// task per round and cached as a non-member. A target that cannot be read
+    /// stays out of the index, which is what leaves a missing import missing
+    /// and an unreadable one reportable; because every resolved path is visited
+    /// once, a cycle cannot make this loop forever.
+    async fn ensure_gather_closures(&self, roots: &[Url]) {
+        loop {
+            let pending: Vec<(Url, PathBuf)> = {
+                let index = self.index.read().await;
+                let mut pending: Vec<(Url, PathBuf)> = Vec::new();
+
+                for root in roots {
+                    for target in gather_view(&index, root).unresolved {
+                        if pending.iter().any(|(uri, _)| *uri == target) {
+                            continue;
+                        }
+                        if let Ok(path) = target.to_file_path() {
+                            pending.push((target, path));
+                        }
+                    }
+                }
+
+                pending
+            };
+
+            if pending.is_empty() {
+                return;
+            }
+
+            let read = tokio::task::spawn_blocking(move || read_texts(pending))
+                .await
+                .unwrap_or_default();
+            if read.is_empty() {
+                return;
+            }
+
+            // Only a round that really indexed something can have discovered
+            // more targets; anything else is as far as this can go.
+            if self.cache_reads(read).await == 0 {
+                return;
+            }
+        }
+    }
+
+    /// The open documents whose gather view reaches one of the given URIs.
+    ///
+    /// Those are the documents whose closure may have to grow when one of the
+    /// URIs changes; nothing else is read because of it.
+    async fn open_dependents_of(&self, uris: &[Url]) -> Vec<Url> {
+        let index = self.index.read().await;
+        let documents = self.documents.read().await;
+        let mut dependents: Vec<Url> = Vec::new();
+
+        for uri in uris {
+            for root in index.roots_depending_on(uri) {
+                if documents.contains_key(&root) && !dependents.contains(&root) {
+                    dependents.push(root);
+                }
+            }
         }
 
-        let (uri, file) = self.plan_entry(uri, text, false, false).await?;
-        let source = Arc::clone(&file.source);
-        self.index.write().await.insert(uri, file);
-
-        Some(source)
+        dependents
     }
 
     /// Re-resolve cached bindings whose candidate list mentions a URI whose
@@ -472,16 +568,18 @@ impl RuneLanguageServer {
     /// final index state, and return the open configs that must be revalidated.
     ///
     /// A config is affected when it was forced, when its resolved schema URI
-    /// changed, or when one of the changed files is the schema it resolved to
-    /// before or resolves to now. A change to the candidate list alone records
-    /// new state without republishing, because the resolved schema is what the
-    /// document is validated against.
+    /// changed, when one of the changed files is the schema it resolved to
+    /// before or resolves to now, when one of the changed files is anywhere in
+    /// its transitive gather set, or when the set of files it gathers changed.
+    /// A change to the candidate list alone, or to a gather's own source text,
+    /// records new state without republishing on its own, because the resolved
+    /// schema and the gathered files are what the document is validated against.
     async fn refresh_dependencies_and_collect_affected(
         &self,
         changed_uris: &[Url],
         forced_documents: &[Url],
     ) -> Vec<Url> {
-        let current: HashMap<Url, SchemaDependency> = {
+        let current: HashMap<Url, DocumentDependency> = {
             let index = self.index.read().await;
             let documents = self.documents.read().await;
 
@@ -495,39 +593,61 @@ impl RuneLanguageServer {
                         return None;
                     }
 
+                    let view = gather_view(&index, uri);
                     Some((
                         uri.clone(),
-                        SchemaDependency {
-                            candidates: file.candidates.clone(),
-                            resolved: file.resolved.clone(),
+                        DocumentDependency {
+                            schema_candidates: file.candidates.clone(),
+                            resolved_schema: file.resolved.clone(),
+                            gather_targets: view.reachable,
+                            gather_bindings: view
+                                .aliases
+                                .iter()
+                                .map(|binding| (binding.alias.clone(), binding.uri.clone()))
+                                .collect(),
                         },
                     ))
                 })
                 .collect()
         };
-        let previous_dependencies = self.schema_dependencies.read().await.clone();
+        let previous_dependencies = self.document_dependencies.read().await.clone();
 
         let mut affected: Vec<Url> = Vec::new();
 
         for (uri, dependency) in &current {
             let previous = previous_dependencies.get(uri);
 
-            let resolved_changed =
-                previous.and_then(|dependency| dependency.resolved.clone()) != dependency.resolved;
+            let resolved_changed = previous.map(|dependency| &dependency.resolved_schema)
+                != Some(&dependency.resolved_schema);
             let schema_file_changed = changed_uris.iter().any(|changed| {
-                previous.and_then(|dependency| dependency.resolved.as_ref()) == Some(changed)
-                    || dependency.resolved.as_ref() == Some(changed)
+                previous.and_then(|dependency| dependency.resolved_schema.as_ref()) == Some(changed)
+                    || dependency.resolved_schema.as_ref() == Some(changed)
+            });
+            // A change to any file the document reaches, including one that is
+            // not there yet, is a change to what it is validated against.
+            let gather_file_changed = changed_uris.iter().any(|changed| {
+                previous.is_some_and(|dependency| dependency.gather_targets.contains(changed))
+                    || dependency.gather_targets.contains(changed)
+            });
+            let gather_bindings_changed = previous.is_some_and(|previous| {
+                previous.gather_targets != dependency.gather_targets
+                    || previous.gather_bindings != dependency.gather_bindings
             });
 
-            if forced_documents.contains(uri) || resolved_changed || schema_file_changed {
+            if forced_documents.contains(uri)
+                || resolved_changed
+                || schema_file_changed
+                || gather_file_changed
+                || gather_bindings_changed
+            {
                 affected.push(uri.clone());
             }
         }
 
-        // Record the recomputed dependency. A candidate-list-only change is
-        // stored without publishing: the resolved schema is what the document
-        // is validated against, and it is what gates a republish.
-        *self.schema_dependencies.write().await = current;
+        // Record the recomputed dependency. A state change that does not alter
+        // what the document is validated against is stored without publishing:
+        // the next reconciliation tells what moved.
+        *self.document_dependencies.write().await = current;
 
         affected
     }
@@ -537,47 +657,213 @@ impl RuneLanguageServer {
         uri: &Url,
         source: &Arc<SourceIndex>,
     ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
-        let rune_diagnostics = if is_schema_document(uri, source) {
-            match SchemaDocument::from_str(source.text()) {
+        if is_schema_document(uri, source) {
+            let rune_diagnostics = match SchemaDocument::from_str(source.text()) {
                 Ok(_) => Vec::new(),
                 Err(error) => vec![diagnostic_from_error(error, source.lines())],
-            }
-        } else {
-            self.config_diagnostics(uri, source).await
-        };
+            };
 
-        rune_diagnostics
-            .into_iter()
-            .map(lsp_diagnostic_from_rune)
-            .collect()
+            return rune_diagnostics
+                .into_iter()
+                .map(lsp_diagnostic_from_rune)
+                .collect();
+        }
+
+        self.config_diagnostics(uri, source).await
     }
 
+    /// The diagnostics of one open config, built from the same gather view the
+    /// runtime loads for it.
+    ///
+    /// The root buffer and every file its `gather` statements reach are loaded
+    /// by the loader the runtime uses, with open buffers winning over disk, so
+    /// what the editor validates is what the program would read. Only an open
+    /// document is ever published for.
     async fn config_diagnostics(
         &self,
         uri: &Url,
         source: &Arc<SourceIndex>,
-    ) -> Vec<RuneDiagnostic> {
-        let config = match RuneConfig::from_str(source.text()) {
-            Ok(config) => config,
+    ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+        self.ensure_gather_closures(std::slice::from_ref(uri)).await;
+        let context = self.gather_context(uri).await;
+
+        let Some(loaded) = self.load_config(uri, source, &context).await else {
+            return Vec::new();
+        };
+
+        let loaded = match loaded {
+            Ok(loaded) => loaded,
+            // The buffer itself does not parse: its diagnostics are about the
+            // buffer, exactly as they always were.
             Err(error) => {
                 let mut diagnostics = vec![diagnostic_from_error(error, source.lines())];
                 diagnostics.extend(recovery_diagnostics(source));
                 dedupe_diagnostics(&mut diagnostics);
-                return diagnostics;
+                return diagnostics
+                    .into_iter()
+                    .map(lsp_diagnostic_from_rune)
+                    .collect();
             }
         };
 
+        // One import that could not be loaded is what stops the runtime, and it
+        // is reported on the root's own statement that reached it.
+        if let Some(failure) = loaded.failures.into_iter().next() {
+            return vec![
+                self.gather_failure_diagnostic(source, &context, failure)
+                    .await,
+            ];
+        }
+
+        let config = loaded.config;
+
         let schema_source = match self.schema_source_for_document(uri, source).await {
             SchemaBinding::Found(schema_source) => schema_source,
-            binding => return self.schema_binding_diagnostics(uri, source, &binding).await,
+            binding => {
+                return self
+                    .schema_binding_diagnostics(uri, source, &binding)
+                    .await
+                    .into_iter()
+                    .map(lsp_diagnostic_from_rune)
+                    .collect();
+            }
         };
 
         let schema = match SchemaDocument::from_str(schema_source.text()) {
             Ok(schema) => schema,
-            Err(error) => return vec![diagnostic_from_error(error, source.lines())],
+            Err(error) => {
+                return vec![lsp_diagnostic_from_rune(diagnostic_from_error(
+                    error,
+                    source.lines(),
+                ))];
+            }
         };
 
-        config.validate_schema_with_source(&schema, source)
+        config
+            .validate_schema_with_source(&schema, source)
+            .into_iter()
+            .map(|diagnostic| import_aware_diagnostic(source, &context, diagnostic))
+            .collect()
+    }
+
+    /// The gather view of one root document, with the files that merge into it
+    /// and the buffers a config load prefers over disk.
+    async fn gather_context(&self, uri: &Url) -> GatherContext {
+        let (view, sources, open) = {
+            let index = self.index.read().await;
+            let view = gather_view(&index, uri);
+            let sources = effective_sources(&index, &view);
+            let open: Vec<(Url, Arc<SourceIndex>)> = index
+                .entries()
+                .filter(|(_, file)| file.open)
+                .map(|(uri, file)| (uri.clone(), Arc::clone(&file.source)))
+                .collect();
+
+            (view, sources, open)
+        };
+
+        // Locating an editor buffer touches the filesystem, so it happens in a
+        // blocking task like every other read.
+        let overlay = tokio::task::spawn_blocking(move || buffer_overlay(&open))
+            .await
+            .unwrap_or_default();
+
+        GatherContext {
+            view,
+            sources,
+            overlay,
+        }
+    }
+
+    /// Load one config the way the runtime loads it: the buffer in hand, plus
+    /// every import its `gather` statements reach.
+    ///
+    /// `None` only when the blocking task itself could not run, which is when
+    /// nothing can be said about the document at all.
+    async fn load_config(
+        &self,
+        uri: &Url,
+        source: &Arc<SourceIndex>,
+        context: &GatherContext,
+    ) -> Option<Result<LoadedConfig, RuneError>> {
+        let text = source.text().to_string();
+        let base_dir = uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let overlay = context.overlay.clone();
+
+        tokio::task::spawn_blocking(move || {
+            RuneConfig::from_text_with_provider(&text, &base_dir, &mut |import| {
+                import_source(import, &overlay)
+            })
+        })
+        .await
+        .ok()
+    }
+
+    /// The diagnostic one failed `gather` produces on the open root.
+    ///
+    /// It is anchored on the root's own statement that led to the failing file,
+    /// which is the first hop for a failure anywhere down the chain. The
+    /// failing file is named in the message and linked through
+    /// `relatedInformation`.
+    async fn gather_failure_diagnostic(
+        &self,
+        source: &Arc<SourceIndex>,
+        context: &GatherContext,
+        failure: ImportFailure,
+    ) -> tower_lsp::lsp_types::Diagnostic {
+        let directive = gather_anchor(source, &context.view, &failure);
+        let display = failure.resolved_path.display();
+        let (detail, position) = error_detail(&failure.error);
+
+        let message = match position {
+            Some((line, column)) => format!(
+                "Gathered file '{}' has a syntax error: {} (line {}, column {})",
+                display, detail, line, column
+            ),
+            None => format!(
+                "Gathered file '{}' could not be loaded: {}",
+                display, detail
+            ),
+        };
+
+        let range = directive
+            .map(|directive| source.lines().range(directive.path_span))
+            .unwrap_or_else(default_range);
+
+        // The imported buffer answers the related range when the index holds it,
+        // which is where an editor sees the failing file itself.
+        let imported_uri = Url::from_file_path(&failure.resolved_path).ok();
+        let imported = match &imported_uri {
+            Some(uri) => self.index.read().await.source(uri),
+            None => None,
+        };
+        let related = imported_uri.map(|uri| {
+            vec![tower_lsp::lsp_types::DiagnosticRelatedInformation {
+                location: Location {
+                    uri,
+                    range: error_range(imported.as_deref(), position),
+                },
+                message: format!("'{}' is gathered here", failure.raw_path),
+            }]
+        });
+
+        tower_lsp::lsp_types::Diagnostic {
+            range,
+            severity: Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+            code: Some(tower_lsp::lsp_types::NumberOrString::Number(
+                GATHER_LOAD_CODE,
+            )),
+            code_description: None,
+            source: Some("rune-cfg".into()),
+            message,
+            related_information: related,
+            tags: None,
+            data: None,
+        }
     }
 
     /// The diagnostics a config gets when its schema did not resolve: a
@@ -796,6 +1082,253 @@ impl RuneLanguageServer {
         }
     }
 
+    /// The effective sources of one document, which is what tells a local field
+    /// from one a `gather` supplies.
+    async fn effective_sources_for(&self, uri: &Url) -> Vec<EffectiveSource> {
+        let index = self.index.read().await;
+        let view = gather_view(&index, uri);
+
+        effective_sources(&index, &view)
+    }
+
+    /// What one completion needs from a document's gather view: the children of
+    /// an alias prefix, and the keys the unaliased gathers already supply.
+    async fn gather_completion(
+        &self,
+        uri: &Url,
+        source: &Arc<SourceIndex>,
+        position: Position,
+    ) -> Option<GatherCompletion> {
+        self.ensure_gather_closures(std::slice::from_ref(uri)).await;
+
+        let index = self.index.read().await;
+        let view = gather_view(&index, uri);
+        if view.direct.is_empty() {
+            return None;
+        }
+        let sources = effective_sources(&index, &view);
+
+        // `alias.` and `alias.object.` complete from the imported document the
+        // alias resolves to.
+        let prefix_keys = source.reference_prefix_at(position).and_then(|prefix| {
+            let (alias, rest) = prefix.split_first()?;
+            let binding = view.alias(alias)?;
+            let imported = index.source(&binding.uri)?;
+
+            Some(child_keys(&imported, rest))
+        });
+
+        let supplied = gathered_scope_keys(&sources, &source.scope_at(position));
+        let reference_position = source.assignment_before_cursor(position).is_some()
+            || source.reference_at(position).is_some();
+
+        Some(GatherCompletion {
+            prefix_keys,
+            supplied,
+            reference_position,
+        })
+    }
+
+    /// The definition of a `gather` statement: the file it names, when that
+    /// file is really there.
+    async fn gather_target_definition(
+        &self,
+        uri: &Url,
+        source: &Arc<SourceIndex>,
+        directive: &GatherDirective,
+    ) -> Option<GotoDefinitionResponse> {
+        self.ensure_gather_closures(std::slice::from_ref(uri)).await;
+
+        let index = self.index.read().await;
+        let view = gather_view(&index, uri);
+        let edge =
+            gather_position(source, directive).and_then(|position| view.direct.get(position))?;
+        let target = edge.uri.clone()?;
+
+        // A target that is not there, or cannot be read, is not a link.
+        index.entry(&target)?;
+
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: target,
+            range: zero_range(),
+        }))
+    }
+
+    /// The hover of one `gather` statement: what it resolves to, the alias it
+    /// binds, and whether it includes or namespaces the file.
+    async fn gather_hover(
+        &self,
+        uri: &Url,
+        source: &Arc<SourceIndex>,
+        directive: &GatherDirective,
+    ) -> Option<Hover> {
+        self.ensure_gather_closures(std::slice::from_ref(uri)).await;
+
+        let index = self.index.read().await;
+        let view = gather_view(&index, uri);
+        let edge =
+            gather_position(source, directive).and_then(|position| view.direct.get(position))?;
+        let resolved = edge
+            .uri
+            .as_ref()
+            .is_some_and(|target| index.entry(target).is_some());
+
+        Some(Hover {
+            contents: HoverContents::Scalar(MarkedString::String(gather_hover_text(
+                edge, resolved,
+            ))),
+            range: None,
+        })
+    }
+
+    /// Resolve the plain reference the cursor is on through the root's own
+    /// gather view.
+    async fn resolve_reference_at(&self, root: &Url, run: &ReferenceRun) -> Option<ResolvedSite> {
+        let index = self.index.read().await;
+        let view = gather_view(&index, root);
+        let sources = effective_sources(&index, &view);
+        let resolved = resolve_reference(&index, &view, &sources, &run.names())?;
+        let target = index.source(&resolved.uri);
+
+        Some(ResolvedSite {
+            range: resolved
+                .declaration
+                .and_then(|(span, _)| target.as_ref().map(|source| source.lines().range(span))),
+            key: resolved.declaration.map(|(span, _)| DeclarationKey {
+                uri: resolved.uri.clone(),
+                span,
+            }),
+            path: resolved.path,
+            kind: resolved.declaration.map(|(_, kind)| kind),
+            imported: resolved.imported,
+            uri: resolved.uri,
+        })
+    }
+
+    /// The gather-aware uses of the field under the cursor, when the file the
+    /// cursor is in is itself gathered by another root.
+    ///
+    /// The declaration is the key itself, and its uses are the references that
+    /// resolve to it, in every workspace-member or open config that reaches this
+    /// file.
+    async fn imported_uses(
+        &self,
+        uri: &Url,
+        source: &Arc<SourceIndex>,
+        position: Position,
+        include_declaration: bool,
+    ) -> Vec<Location> {
+        let Some(entry) = source.field_key_at(position) else {
+            return Vec::new();
+        };
+        let key = DeclarationKey {
+            uri: uri.clone(),
+            span: entry.key_span,
+        };
+        let declaration = source.key_range(entry);
+
+        self.ensure_gather_closures(std::slice::from_ref(uri)).await;
+        let index = self.index.read().await;
+        let mut locations: Vec<Location> = Vec::new();
+
+        if include_declaration {
+            locations.push(Location {
+                uri: uri.clone(),
+                range: declaration,
+            });
+        }
+
+        for root in index.roots_depending_on(uri) {
+            let Some(root_source) = index.source(&root) else {
+                continue;
+            };
+            for span in references_to(&index, &root, &key) {
+                locations.push(Location {
+                    uri: root.clone(),
+                    range: root_source.lines().range(span),
+                });
+            }
+        }
+
+        locations
+    }
+
+    /// The references of a `gather` link or of a plain reference, or `None`
+    /// when the cursor is on neither.
+    ///
+    /// A gather statement's link is identified by the file it names, so two
+    /// statements that write the same alias for different files are never
+    /// conflated. A reference is identified by the declaration it resolves to,
+    /// exactly where that declaration is written, and its uses are searched for
+    /// in the configs that reach that file.
+    async fn gather_references(
+        &self,
+        uri: &Url,
+        source: &Arc<SourceIndex>,
+        position: Position,
+        include_declaration: bool,
+    ) -> Option<Vec<Location>> {
+        self.ensure_gather_closures(std::slice::from_ref(uri)).await;
+
+        if let Some(directive) = source.gather_at(position) {
+            let index = self.index.read().await;
+            let view = gather_view(&index, uri);
+            let statement = gather_position(source, directive)?;
+            let target = view.direct.get(statement)?.uri.clone()?;
+            let current = (uri.clone(), statement);
+
+            let locations = gather_occurrences(&index, &target)
+                .into_iter()
+                .filter(|(file, edge)| {
+                    include_declaration || (file.clone(), edge.directive) != current
+                })
+                .filter_map(|(file, edge)| {
+                    let source = index.source(&file)?;
+                    let directive = source.gathers().get(edge.directive)?;
+
+                    Some(Location {
+                        uri: file,
+                        range: source.lines().range(directive.path_span),
+                    })
+                })
+                .collect();
+
+            return Some(locations);
+        }
+
+        let run = source.reference_at(position)?;
+        let site = self.resolve_reference_at(uri, run).await?;
+
+        // A reference that names a whole imported file has no declaration to
+        // search uses of.
+        let key = site.key.clone()?;
+        let index = self.index.read().await;
+        let mut locations: Vec<Location> = Vec::new();
+
+        if include_declaration && let Some(declaration) = index.source(&key.uri) {
+            locations.push(Location {
+                uri: key.uri.clone(),
+                range: declaration.lines().range(key.span),
+            });
+        }
+
+        // A use can only live in a config that reaches the declaring file, or
+        // in the file itself.
+        for root in index.roots_depending_on(&key.uri) {
+            let Some(source) = index.source(&root) else {
+                continue;
+            };
+            for span in references_to(&index, &root, &key) {
+                locations.push(Location {
+                    uri: root.clone(),
+                    range: source.lines().range(span),
+                });
+            }
+        }
+
+        Some(locations)
+    }
+
     async fn document_source_for(&self, uri: &Url) -> Option<Arc<SourceIndex>> {
         if let Some(source) = self.index.read().await.source(uri) {
             return Some(source);
@@ -924,7 +1457,14 @@ impl LanguageServer for RuneLanguageServer {
             };
 
             let schema = self.schema_for(&uri).await;
-            config_completion_items(schema.as_ref(), &source, position, &schema_files)
+            let gather = self.gather_completion(&uri, &source, position).await;
+            config_completion_items(
+                schema.as_ref(),
+                &source,
+                position,
+                &schema_files,
+                gather.as_ref(),
+            )
         };
 
         Ok(Some(CompletionResponse::Array(items)))
@@ -940,6 +1480,28 @@ impl LanguageServer for RuneLanguageServer {
         }
 
         let position = params.text_document_position_params.position;
+
+        // A `gather` statement explains the link it declares, resolved or not.
+        if let Some(directive) = source.gather_at(position) {
+            return Ok(self.gather_hover(&uri, &source, directive).await);
+        }
+
+        // A plain reference explains where its value really comes from.
+        if let Some(run) = source.reference_at(position) {
+            self.ensure_gather_closures(std::slice::from_ref(&uri))
+                .await;
+
+            return Ok(self
+                .resolve_reference_at(&uri, run)
+                .await
+                .map(|site| Hover {
+                    contents: HoverContents::Scalar(MarkedString::String(reference_hover_text(
+                        &site,
+                    ))),
+                    range: None,
+                }));
+        }
+
         let Some(schema) = self.schema_for(&uri).await else {
             return Ok(None);
         };
@@ -983,8 +1545,17 @@ impl LanguageServer for RuneLanguageServer {
         let mut actions = Vec::new();
         let source = self.document_source_for(&uri).await;
         let schema = self.schema_for(&uri).await;
+        let sources = self.effective_sources_for(&uri).await;
 
         for diagnostic in params.context.diagnostics {
+            // A value that really lives in a gathered file is not edited by a
+            // fix that only writes this buffer.
+            if let Some(path) = diagnostic_path(&diagnostic.message)
+                && effective_origin(&sources, &path).is_some_and(|origin| origin.imported)
+            {
+                continue;
+            }
+
             if diagnostic.message.contains("Unclosed object block") {
                 // The fix belongs at the end of the buffer. A diagnostic may be
                 // anchored on the block's opening key, and inserting there
@@ -1147,9 +1718,30 @@ impl LanguageServer for RuneLanguageServer {
 
         let position = params.text_document_position_params.position;
 
-        // A `@schema "..."` directive jumps to the top of the schema file, but
-        // only from the quoted reference itself: the `@schema` keyword and the
-        // rest of that line are not the link.
+        // 1. A `gather` statement links to the file it names.
+        if let Some(directive) = source.gather_at(position) {
+            return Ok(self
+                .gather_target_definition(&uri, &source, directive)
+                .await);
+        }
+
+        // 2. A plain reference links to the declaration it resolves to,
+        // through the root's own gather view.
+        if let Some(run) = source.reference_at(position) {
+            self.ensure_gather_closures(std::slice::from_ref(&uri))
+                .await;
+
+            return Ok(self.resolve_reference_at(&uri, run).await.map(|site| {
+                GotoDefinitionResponse::Scalar(Location {
+                    uri: site.uri,
+                    range: site.range.unwrap_or_else(zero_range),
+                })
+            }));
+        }
+
+        // 3. A `@schema "..."` directive jumps to the top of the schema file,
+        // but only from the quoted reference itself: the `@schema` keyword and
+        // the rest of that line are not the link.
         if schema_directive(&source).is_some_and(|directive| {
             source
                 .offset_at(position)
@@ -1166,7 +1758,8 @@ impl LanguageServer for RuneLanguageServer {
                 }));
         }
 
-        // Otherwise jump from a config key to its schema field/block definition.
+        // 4. Otherwise jump from a config key to its schema field/block
+        // definition.
         let Some(path) = source
             .field_key_at(position)
             .map(|entry| entry.path.clone())
@@ -1198,26 +1791,42 @@ impl LanguageServer for RuneLanguageServer {
         let Some(source) = self.document_source_for(&uri).await else {
             return Ok(None);
         };
+
+        // A `gather` link or a plain reference is answered from the gather
+        // view, which is the only thing that knows what an alias resolves to.
+        if let Some(locations) = self
+            .gather_references(&uri, &source, position, include_declaration)
+            .await
+        {
+            return Ok(Some(locations));
+        }
+
         let Some((path, schema_uri)) = self.rename_target(&uri, &source, position).await else {
             return Ok(None);
         };
 
         // No schema: fall back to single-file references within this document.
         // Every indexed occurrence of the path is a usage, so
-        // `includeDeclaration` removes none of them.
+        // `includeDeclaration` removes none of them. A file that is itself
+        // gathered answers with the uses through those gathers as well.
         let Some(schema_uri) = schema_uri else {
-            let locations = references_in_document(&source, &path)
+            let mut locations: Vec<Location> = references_in_document(&source, &path)
                 .into_iter()
                 .map(|range| Location {
                     uri: uri.clone(),
                     range,
                 })
                 .collect();
-            return Ok(Some(locations));
+            locations.extend(
+                self.imported_uses(&uri, &source, position, include_declaration)
+                    .await,
+            );
+
+            return Ok(Some(dedupe_locations(locations)));
         };
 
         // Schema-scoped: declaration in the schema + usages across bound configs.
-        let locations = self
+        let mut locations: Vec<Location> = self
             .cross_file_occurrences(&schema_uri, &path)
             .await
             .into_iter()
@@ -1227,8 +1836,12 @@ impl LanguageServer for RuneLanguageServer {
                 range: occurrence.range,
             })
             .collect();
+        locations.extend(
+            self.imported_uses(&uri, &source, position, include_declaration)
+                .await,
+        );
 
-        Ok(Some(locations))
+        Ok(Some(dedupe_locations(locations)))
     }
 
     async fn prepare_rename(
@@ -1372,6 +1985,11 @@ impl LanguageServer for RuneLanguageServer {
             self.reresolve_dependents(std::slice::from_ref(&uri)).await;
         }
 
+        // The opened buffer may be what its own imports load, so its closure is
+        // established before it is validated.
+        self.ensure_gather_closures(std::slice::from_ref(&uri))
+            .await;
+
         // The opened document is the one that changed.
         let changed = std::slice::from_ref(&uri);
         let affected = self
@@ -1395,6 +2013,8 @@ impl LanguageServer for RuneLanguageServer {
                 .await;
             self.reresolve_dependents(std::slice::from_ref(&uri)).await;
         }
+        self.ensure_gather_closures(std::slice::from_ref(&uri))
+            .await;
 
         let changed = std::slice::from_ref(&uri);
         let affected = self
@@ -1412,14 +2032,19 @@ impl LanguageServer for RuneLanguageServer {
             self.close_document(&uri).await;
             self.reresolve_dependents(std::slice::from_ref(&uri)).await;
         }
-        self.schema_dependencies.write().await.remove(&uri);
+        self.document_dependencies.write().await.remove(&uri);
 
         self.client
             .publish_diagnostics(uri.clone(), Vec::new(), None)
             .await;
 
-        // Dependents now fall back to the on-disk schema, the next candidate,
-        // or none at all. No other document is revalidated.
+        // The buffer that is gone was the text its importers loaded, so their
+        // own closures are refreshed before they are revalidated.
+        let dependents = self.open_dependents_of(std::slice::from_ref(&uri)).await;
+        self.ensure_gather_closures(&dependents).await;
+
+        // Dependents now fall back to the on-disk text, the next candidate, or
+        // none at all. No other document is revalidated.
         let affected = self
             .refresh_dependencies_and_collect_affected(std::slice::from_ref(&uri), &[])
             .await;
@@ -1499,6 +2124,9 @@ impl LanguageServer for RuneLanguageServer {
         // One reconciliation against the final state, then only the open
         // configs the change affects. The unopened file publishes nothing
         // itself.
+        let dependents = self.open_dependents_of(&availability).await;
+        self.ensure_gather_closures(&dependents).await;
+
         let affected = self
             .refresh_dependencies_and_collect_affected(&availability, &[])
             .await;
@@ -1529,7 +2157,13 @@ impl LanguageServer for RuneLanguageServer {
             self.rebuild_index(excludes).await;
         }
 
-        // Only a config whose resolved schema URI changed is revalidated.
+        // A rebuild can drop a cached import a folder moved away from, so every
+        // open config re-establishes its own closure first.
+        let open: Vec<Url> = self.documents.read().await.keys().cloned().collect();
+        self.ensure_gather_closures(&open).await;
+
+        // Only a config whose resolved schema URI or gather view changed is
+        // revalidated.
         let affected = self
             .refresh_dependencies_and_collect_affected(&[], &[])
             .await;
@@ -1557,6 +2191,27 @@ fn union_of_targets(forced: &[Url], affected: &[Url]) -> Vec<Url> {
     }
 
     targets
+}
+
+/// One location per document and range, in the order they were discovered.
+fn dedupe_locations(locations: Vec<Location>) -> Vec<Location> {
+    let mut unique: Vec<Location> = Vec::new();
+
+    for location in locations {
+        let duplicate = unique.iter().any(|existing| {
+            existing.uri == location.uri && ranges_match(&existing.range, &location.range)
+        });
+        if !duplicate {
+            unique.push(location);
+        }
+    }
+
+    unique
+}
+
+/// True when two ranges cover the same text.
+fn ranges_match(left: &Range, right: &Range) -> bool {
+    left.start == right.start && left.end == right.end
 }
 
 /// Workspace folders from `initialize`, applying the LSP fallback rules.
@@ -2076,6 +2731,311 @@ fn lsp_diagnostic_from_rune(diagnostic: RuneDiagnostic) -> tower_lsp::lsp_types:
     }
 }
 
+/// The diagnostic code an import that could not be loaded is reported with.
+const GATHER_LOAD_CODE: i32 = 702;
+
+/// Everything one root document's diagnostics and requests need about its
+/// `gather` statements.
+struct GatherContext {
+    /// The view the root's own buffer produces, root-relative as the loader is.
+    view: GatherView,
+    /// The files that merge into the root's effective document, lowest
+    /// precedence first.
+    sources: Vec<EffectiveSource>,
+    /// The buffers a config load prefers over disk.
+    overlay: Vec<(PathBuf, Arc<SourceIndex>)>,
+}
+
+/// The range a diagnostic without an anchor gets, which is the shape the server
+/// has always used.
+fn default_range() -> Range {
+    Range::new(Position::new(0, 0), Position::new(0, 1))
+}
+
+/// The message and the parser position of an error, when it has one.
+fn error_detail(error: &RuneError) -> (String, Option<(usize, usize)>) {
+    match error {
+        RuneError::SyntaxError {
+            message,
+            line,
+            column,
+            ..
+        }
+        | RuneError::InvalidToken {
+            token: message,
+            line,
+            column,
+            ..
+        }
+        | RuneError::UnexpectedEof {
+            message,
+            line,
+            column,
+            ..
+        }
+        | RuneError::TypeError {
+            message,
+            line,
+            column,
+            ..
+        }
+        | RuneError::ValidationError {
+            message,
+            line,
+            column,
+            ..
+        } => (message.clone(), Some((*line, *column))),
+        RuneError::UnclosedString { line, column, .. } => {
+            ("Unclosed string literal".into(), Some((*line, *column)))
+        }
+        RuneError::UnexpectedCharacter {
+            character,
+            line,
+            column,
+            ..
+        } => (
+            format!("Unexpected character '{}'", character),
+            Some((*line, *column)),
+        ),
+        RuneError::FileError { message, .. } => (message.clone(), None),
+        RuneError::RuntimeError { message, .. } => (message.clone(), None),
+    }
+}
+
+/// The range of a parser position inside an imported file.
+///
+/// The position is 1-based and `char`-counted, as the lexer and parser report
+/// it, so the imported buffer is what converts it when it is known.
+fn error_range(source: Option<&SourceIndex>, position: Option<(usize, usize)>) -> Range {
+    let Some((line, column)) = position else {
+        return Range::new(Position::new(0, 0), Position::new(0, 0));
+    };
+
+    let character = match source {
+        Some(source) => source.lines().utf16_column(line, column),
+        None => column,
+    };
+    let line = line.saturating_sub(1) as u32;
+    let start = character.saturating_sub(1) as u32;
+
+    Range::new(Position::new(line, start), Position::new(line, start + 1))
+}
+
+/// The root's own `gather` statement a failure on the imported side belongs to:
+/// the first hop that reached the failing file, or, when the failure came from
+/// the path itself, the statement that wrote it.
+fn gather_anchor<'a>(
+    source: &'a SourceIndex,
+    view: &GatherView,
+    failure: &ImportFailure,
+) -> Option<&'a GatherDirective> {
+    let target = Url::from_file_path(&failure.resolved_path).ok();
+    let hop = target
+        .as_ref()
+        .and_then(|target| view.first_hop.get(target))
+        .copied();
+    let edge = hop.and_then(|hop| view.direct.get(hop)).or_else(|| {
+        view.direct
+            .iter()
+            .find(|edge| edge.raw_path == failure.raw_path)
+    });
+
+    match edge {
+        Some(edge) => source.gathers().get(edge.directive),
+        // A failure the view cannot attribute still belongs to a `gather`
+        // statement, and the first one is the closest anchor there is.
+        None => source.gathers().first(),
+    }
+}
+
+/// Re-anchor a schema diagnostic whose effective value lives in a gathered
+/// file, and link the imported declaration it really describes.
+///
+/// A diagnostic about the root's own fields keeps exactly the range, hint and
+/// quick fixes it always had.
+fn import_aware_diagnostic(
+    source: &SourceIndex,
+    context: &GatherContext,
+    diagnostic: RuneDiagnostic,
+) -> tower_lsp::lsp_types::Diagnostic {
+    let Some(origin) = diagnostic_path(&diagnostic.message)
+        .and_then(|path| effective_origin(&context.sources, &path))
+        .filter(|origin| origin.imported)
+    else {
+        return lsp_diagnostic_from_rune(diagnostic);
+    };
+
+    let mut rune_diagnostic = diagnostic;
+
+    // The value is not written in this buffer, so the statement that brought it
+    // in is what the diagnostic belongs to, and the marker keeps a quick fix
+    // from editing the root for a field it does not own.
+    if let Some(statement) = origin
+        .first_hop
+        .and_then(|hop| context.view.direct.get(hop))
+        .and_then(|edge| source.gathers().get(edge.directive))
+    {
+        let range = source.lines().rune_range(statement.path_span);
+        rune_diagnostic =
+            rune_diagnostic.with_range(range.start.line, range.start.column, range.end.column);
+
+        let marker = format!("Provided by gather \"{}\"", statement.raw_path);
+        rune_diagnostic.hint = Some(match rune_diagnostic.hint.take() {
+            Some(hint) => format!("{hint}\n{marker}"),
+            None => marker,
+        });
+    }
+
+    let related = imported_source(&context.sources, &origin.uri).map(|imported| {
+        vec![tower_lsp::lsp_types::DiagnosticRelatedInformation {
+            location: Location {
+                uri: origin.uri.clone(),
+                range: imported.lines().range(origin.key_span),
+            },
+            message: format!("'{}' is declared here", origin.path.join(".")),
+        }]
+    });
+
+    let mut diagnostic = lsp_diagnostic_from_rune(rune_diagnostic);
+    diagnostic.related_information = related;
+    diagnostic
+}
+
+/// The source of one effective file, when it takes part in the merge.
+fn imported_source<'a>(sources: &'a [EffectiveSource], uri: &Url) -> Option<&'a Arc<SourceIndex>> {
+    sources
+        .iter()
+        .find(|source| source.uri == *uri)
+        .map(|source| &source.source)
+}
+
+/// The config path a validation message is about.
+///
+/// The messages are the ones `validate_schema_with_source` produces, read the
+/// same way the quick-fix parsers already read them.
+fn diagnostic_path(message: &str) -> Option<Vec<String>> {
+    if let Some(rest) = message.strip_prefix('\'') {
+        let end = rest.find('\'')?;
+        return Some(split_path(&rest[..end]));
+    }
+
+    if let Some((parent, field)) = missing_required_field_from_message(message) {
+        let mut path = split_path(&parent);
+        path.push(field);
+        return Some(path);
+    }
+
+    let rest = message.strip_prefix("Missing required config path '")?;
+    let end = rest.find('\'')?;
+    Some(split_path(&rest[..end]))
+}
+
+/// What a document's gather view adds to one completion.
+struct GatherCompletion {
+    /// Direct child keys of the reference prefix, when the cursor follows the
+    /// `.` of an alias-qualified reference.
+    prefix_keys: Option<Vec<(String, SourceEntryKind)>>,
+    /// The keys the unaliased gathers supply at the cursor's scope, which the
+    /// document has even though it does not write them.
+    supplied: Vec<String>,
+    /// True when the cursor sits where a reference is being typed.
+    reference_position: bool,
+}
+
+/// A reference the cursor is on, resolved through a root's gather view.
+struct ResolvedSite {
+    uri: Url,
+    /// Where the declaration is written, when the reference points at a field.
+    key: Option<DeclarationKey>,
+    /// Range of that declaration inside `uri`.
+    range: Option<Range>,
+    /// The key path inside `uri`; empty for a whole imported file.
+    path: Vec<String>,
+    /// What kind of entry declares the value.
+    kind: Option<SourceEntryKind>,
+    /// True when the declaration lives in a gathered file.
+    imported: bool,
+}
+
+/// The zero-width range at the top of a file.
+fn zero_range() -> Range {
+    Range::new(Position::new(0, 0), Position::new(0, 0))
+}
+
+/// The position of one gather statement among its own file's statements.
+fn gather_position(source: &SourceIndex, directive: &GatherDirective) -> Option<usize> {
+    source
+        .gathers()
+        .iter()
+        .position(|gather| gather.path_span == directive.path_span)
+}
+
+/// The hover text of one `gather` statement: what it resolves to, the alias it
+/// binds, and whether it includes or namespaces the file.
+fn gather_hover_text(edge: &GatherEdge, resolved: bool) -> String {
+    let target = match &edge.uri {
+        Some(uri) => uri.to_string(),
+        None => edge.path.display().to_string(),
+    };
+    let alias = if edge.explicit_alias {
+        "explicit"
+    } else {
+        "default"
+    };
+    let mode = if edge.explicit_alias {
+        "namespaced import"
+    } else {
+        "include"
+    };
+
+    let mut lines = vec![
+        format!("gather: {}", target),
+        format!("alias: {} ({})", edge.alias, alias),
+        format!("mode: {}", mode),
+    ];
+
+    if !resolved {
+        lines.push("The gathered file is not there, or cannot be read".into());
+    }
+
+    lines.join("\n")
+}
+
+/// The hover text of one resolved reference: where the value comes from and
+/// what kind of entry declares it. A value is never shown.
+fn reference_hover_text(site: &ResolvedSite) -> String {
+    let key = if site.path.is_empty() {
+        "(the file itself)".to_string()
+    } else {
+        site.path.join(".")
+    };
+
+    let mut lines = vec![format!("reference: {}", site.uri), format!("key: {}", key)];
+
+    if let Some(kind) = site.kind {
+        lines.push(format!("kind: {}", entry_kind_label(kind)));
+    }
+    lines.push(if site.imported {
+        "mode: gathered".into()
+    } else {
+        "mode: local".into()
+    });
+
+    lines.join("\n")
+}
+
+/// How one structural entry kind is described in a hover.
+fn entry_kind_label(kind: SourceEntryKind) -> &'static str {
+    match kind {
+        SourceEntryKind::Assignment => "field",
+        SourceEntryKind::Object => "object",
+        SourceEntryKind::Gather => "gather",
+        SourceEntryKind::Metadata => "metadata",
+        SourceEntryKind::ConditionalHeader | SourceEntryKind::ConditionalBranch => "conditional",
+        SourceEntryKind::ConditionalEnd => "conditional end",
+    }
+}
+
 fn lsp_range(range: crate::SourceRange) -> Range {
     Range {
         start: lsp_position(range.start.line, range.start.column),
@@ -2116,6 +3076,7 @@ fn config_completion_items(
     source: &SourceIndex,
     position: Position,
     schema_files: &[(String, PathBuf)],
+    gather: Option<&GatherCompletion>,
 ) -> Vec<CompletionItem> {
     // Only a positively special context replaces the normal completion: a
     // cursor on a `$...` reference run, or inside the quoted value of the
@@ -2126,6 +3087,15 @@ fn config_completion_items(
 
     if source.dollar_reference_context(position) {
         return dollar_reference_completion_items();
+    }
+
+    // Right after the `.` of an alias-qualified reference the answer is the
+    // imported document's own children, and nothing else is suggested.
+    if let Some(keys) = gather.and_then(|gather| gather.prefix_keys.as_ref()) {
+        return keys
+            .iter()
+            .map(|(name, kind)| child_completion_item(name, *kind))
+            .collect();
     }
 
     let scope = source.scope_at(position);
@@ -2149,12 +3119,35 @@ fn config_completion_items(
             .collect();
     }
 
-    let used = source.used_keys_in_scope(&scope, position.line);
+    // A key an unaliased gather already supplies is present in this document,
+    // so the schema fields it satisfies are not offered a second time.
+    let mut used = source.used_keys_in_scope(&scope, position.line);
+    if let Some(gather) = gather {
+        for name in &gather.supplied {
+            if !used.contains(name) {
+                used.push(name.clone());
+            }
+        }
+    }
+
     let mut items = if let Some(schema) = schema {
         schema_field_completion_items(schema, &scope, &used)
     } else {
         Vec::new()
     };
+
+    // A reference is completed with the keys the gathers supply, which the
+    // schema never names.
+    if let Some(gather) = gather
+        && gather.reference_position
+    {
+        items.extend(
+            gather
+                .supplied
+                .iter()
+                .map(|name| child_completion_item(name, SourceEntryKind::Assignment)),
+        );
+    }
 
     items.extend(
         ["end", "if", "else", "endif", "gather"]
@@ -2163,6 +3156,20 @@ fn config_completion_items(
     );
 
     items
+}
+
+/// One completion of a key a gathered document declares.
+fn child_completion_item(name: &str, kind: SourceEntryKind) -> CompletionItem {
+    CompletionItem {
+        label: name.to_string(),
+        kind: Some(if kind == SourceEntryKind::Object {
+            CompletionItemKind::STRUCT
+        } else {
+            CompletionItemKind::FIELD
+        }),
+        detail: Some("gathered".into()),
+        ..CompletionItem::default()
+    }
 }
 
 fn schema_field_completion_items(
@@ -2375,10 +3382,34 @@ fn is_identifier(value: &str) -> bool {
 }
 
 /// Document symbols come straight from the indexed entries: objects are
-/// containers, assignments are fields, and conditional or metadata entries are
-/// layout and therefore never symbols.
+/// containers, assignments are fields, a `gather` is a module of its own, and
+/// conditional or metadata entries are layout and therefore never symbols.
+///
+/// A gathered file's own fields are never inlined: the importer shows the
+/// statement that brings them in, and nothing else.
+#[allow(deprecated)]
 fn document_symbols(source: &SourceIndex) -> Vec<DocumentSymbol> {
-    let mut symbols = Vec::new();
+    let mut positioned: Vec<(usize, DocumentSymbol)> = Vec::new();
+
+    for gather in source.gathers() {
+        let selection = source
+            .lines()
+            .range(gather.alias_span.unwrap_or(gather.path_content_span));
+
+        positioned.push((
+            gather.statement_span.start,
+            DocumentSymbol {
+                name: gather.alias.clone(),
+                detail: Some(gather.raw_path.clone()),
+                kind: SymbolKind::MODULE,
+                tags: None,
+                deprecated: None,
+                range: source.lines().range(gather.statement_span),
+                selection_range: selection,
+                children: None,
+            },
+        ));
+    }
 
     for entry in source.entries() {
         let kind = match entry.kind {
@@ -2388,20 +3419,24 @@ fn document_symbols(source: &SourceIndex) -> Vec<DocumentSymbol> {
         };
         let key = source.key_range(entry);
 
-        #[allow(deprecated)]
-        symbols.push(DocumentSymbol {
-            name: entry.path.join("."),
-            detail: None,
-            kind,
-            tags: None,
-            deprecated: None,
-            range: Range::new(Position::new(key.start.line, 0), key.end),
-            selection_range: key,
-            children: None,
-        });
+        positioned.push((
+            entry.key_span.start,
+            DocumentSymbol {
+                name: entry.path.join("."),
+                detail: None,
+                kind,
+                tags: None,
+                deprecated: None,
+                range: Range::new(Position::new(key.start.line, 0), key.end),
+                selection_range: key,
+                children: None,
+            },
+        ));
     }
 
-    symbols
+    // One order for the whole document, however it is spelled.
+    positioned.sort_by_key(|(offset, _)| *offset);
+    positioned.into_iter().map(|(_, symbol)| symbol).collect()
 }
 
 /// Range of the schema field-name token at `position`, when the cursor is on
@@ -2652,6 +3687,7 @@ end
             &SourceIndex::new("app:\n  name \"RuneApp\"\n  "),
             Position::new(2, 2),
             &[],
+            None,
         );
 
         assert!(!completions.iter().any(|item| item.label == "name"));
@@ -2679,6 +3715,7 @@ end
             &SourceIndex::new("@schema \""),
             Position::new(0, 9),
             &[],
+            None,
         );
 
         assert!(completions.iter().any(|item| item.label == "./schema.rune"));
@@ -2699,7 +3736,7 @@ end
         .unwrap();
         let source = SourceIndex::new("app:\n  environment \"dev");
         let completions =
-            config_completion_items(Some(&schema), &source, Position::new(1, 16), &[]);
+            config_completion_items(Some(&schema), &source, Position::new(1, 16), &[], None);
 
         assert!(
             completions
@@ -2731,7 +3768,8 @@ end
         .unwrap();
         let source = SourceIndex::new("app:\n  if debug:\n    port 8080\n  endif\n  ");
 
-        let completions = config_completion_items(Some(&schema), &source, Position::new(4, 2), &[]);
+        let completions =
+            config_completion_items(Some(&schema), &source, Position::new(4, 2), &[], None);
         let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
 
         // `port` was written inside the conditional, so it counts as used at

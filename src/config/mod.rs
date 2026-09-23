@@ -1,6 +1,7 @@
 // Author: Dustin Pilgrim
 // License: MIT
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,60 @@ mod access;
 mod conversion;
 mod helpers;
 mod validation;
+
+/// What a provider knows about one `gather` target.
+///
+/// The provider is the only thing the loader asks about the outside world, so
+/// the same algorithm serves the runtime's filesystem reads and the language
+/// server's editor-buffer-over-disk snapshot.
+#[derive(Debug, Clone)]
+pub(crate) enum ImportSource {
+    /// The target's text.
+    Text(String),
+    /// The target is not there. The runtime skips it silently.
+    Missing,
+    /// The target is there but its text cannot be read.
+    Unreadable(String),
+}
+
+/// One `gather` that could not be loaded, in runtime traversal order.
+#[derive(Debug)]
+pub(crate) struct ImportFailure {
+    /// The path exactly as the statement wrote it.
+    pub(crate) raw_path: String,
+    /// The path the loader resolved it to, which is the file the error names.
+    pub(crate) resolved_path: PathBuf,
+    /// The error `RuneConfig::from_file_with_base` reports for it.
+    pub(crate) error: RuneError,
+}
+
+impl ImportFailure {
+    fn new(raw_path: &str, resolved_path: Option<PathBuf>, error: RuneError) -> Self {
+        Self {
+            raw_path: raw_path.to_string(),
+            resolved_path: resolved_path.unwrap_or_else(|| PathBuf::from(raw_path)),
+            error,
+        }
+    }
+}
+
+/// A config, plus every import that failed while it was loaded.
+///
+/// The runtime treats a failure as fatal and the language server reports it as
+/// a diagnostic, so the failure is carried out of the loader rather than
+/// turned into a partial config on the inside.
+pub(crate) struct LoadedConfig {
+    pub(crate) config: RuneConfig,
+    /// Empty for a config whose imports all loaded.
+    pub(crate) failures: Vec<ImportFailure>,
+}
+
+/// Whether one `gather` target contributed a document.
+enum GatherLoad {
+    Loaded,
+    /// The target is not there, which is not an error.
+    Missing,
+}
 
 /// Main configuration struct that holds parsed RUNE documents and handles resolution
 pub struct RuneConfig {
@@ -90,8 +145,6 @@ impl RuneConfig {
     ///     - and the gathered file is also available under its default alias (file stem)
     /// - `gather "file.rune" as alias` behaves like a **namespaced import** only
     pub fn from_file_with_base<P: AsRef<Path>>(path: P, base_dir: P) -> Result<Self, RuneError> {
-        use std::collections::HashSet;
-
         let content = fs::read_to_string(&path).map_err(|e| RuneError::FileError {
             message: format!("Failed to read file: {}", e),
             path: path.as_ref().to_string_lossy().to_string(),
@@ -99,8 +152,35 @@ impl RuneConfig {
             code: Some(301),
         })?;
 
+        let loaded = Self::from_text_with_provider(&content, base_dir.as_ref(), &mut |import| {
+            filesystem_import(import)
+        })?;
+
+        // The runtime has always reported the first import that could not be
+        // loaded as an error, and it still does.
+        match loaded.failures.into_iter().next() {
+            Some(failure) => Err(failure.error),
+            None => Ok(loaded.config),
+        }
+    }
+
+    /// Build a config from `content` and the imports a provider resolves.
+    ///
+    /// This is the only implementation of gather loading. The public
+    /// filesystem-backed constructor is a wrapper over it, and the language
+    /// server calls it with its own snapshot, so the editor's view of a
+    /// config cannot drift from the runtime's.
+    ///
+    /// Loading stops at the first failure, exactly as the runtime does: the
+    /// config is then as far as the loader got, and `failures` names the
+    /// import that stopped it. A root that does not parse is still `Err`.
+    pub(crate) fn from_text_with_provider(
+        content: &str,
+        base_dir: &Path,
+        provider: &mut dyn FnMut(&Path) -> ImportSource,
+    ) -> Result<LoadedConfig, RuneError> {
         // Parse main doc (gather statements are parsed for alias discovery, but loading is done here)
-        let mut main_parser = parser::Parser::new(&content)?;
+        let mut main_parser = parser::Parser::new(content)?;
         let main_doc = main_parser.parse_document()?;
 
         // Start documents with the main doc
@@ -109,40 +189,53 @@ impl RuneConfig {
         documents.insert(main_key.clone(), main_doc);
 
         // Parse gather specs (alias + path + whether alias was explicit)
-        let gather_specs = helpers::parse_gather_specs(&content);
+        let gather_specs = helpers::parse_gather_specs(content);
 
         // Prevent import cycles / repeated loads (by absolute import path string)
         let mut visited: HashSet<String> = HashSet::new();
 
         // Load each gathered file, recursively resolving nested gathers
+        let mut failures = Vec::new();
+
         for spec in gather_specs.iter() {
-            let import_path = resolve_gather_path(&spec.raw_path, base_dir.as_ref())?;
+            let import_path = match resolve_gather_path(&spec.raw_path, base_dir) {
+                Ok(path) => path,
+                Err(error) => {
+                    failures.push(ImportFailure::new(&spec.raw_path, None, error));
+                    break;
+                }
+            };
 
-            // Keep existing behavior: silently skip missing imports
-            if !import_path.exists() {
-                continue;
-            }
-
-            // Load under its alias (overwrites placeholder)
-            load_import_recursive(&mut documents, &spec.alias, &import_path, &mut visited)?;
-
-            // If no explicit `as`, treat as include: merge into main doc too.
-            if !spec.explicit_alias {
-                // Clone after load to avoid borrow issues (and keep ordering predictable)
-                let imported = documents.get(&spec.alias).cloned();
-                if let Some(import_doc) = imported
-                    && let Some(main_doc_mut) = documents.get_mut(&main_key)
-                {
-                    merge_overrides_into_document(main_doc_mut, &import_doc);
+            match load_gather(&mut documents, spec, &import_path, &mut visited, provider) {
+                Ok(GatherLoad::Loaded) => {
+                    // If no explicit `as`, treat as include: merge into main doc too.
+                    if !spec.explicit_alias {
+                        // Clone after load to avoid borrow issues (and keep ordering predictable)
+                        let imported = documents.get(&spec.alias).cloned();
+                        if let Some(import_doc) = imported
+                            && let Some(main_doc_mut) = documents.get_mut(&main_key)
+                        {
+                            merge_overrides_into_document(main_doc_mut, &import_doc);
+                        }
+                    }
+                }
+                // Keep existing behavior: silently skip missing imports
+                Ok(GatherLoad::Missing) => {}
+                Err(failure) => {
+                    failures.push(*failure);
+                    break;
                 }
             }
         }
 
-        Ok(Self {
-            documents,
-            main_doc_key: main_key,
-            raw_content: content,
-            resolved_root: std::sync::OnceLock::new(),
+        Ok(LoadedConfig {
+            config: Self {
+                documents,
+                main_doc_key: main_key,
+                raw_content: content.to_string(),
+                resolved_root: std::sync::OnceLock::new(),
+            },
+            failures,
         })
     }
 
@@ -301,51 +394,79 @@ fn home_dir_fallback() -> Option<PathBuf> {
     }
 }
 
-/// Load an import file, parse its doc, inject into `documents` under `alias`,
-/// then recursively load that file’s gathers.
+/// The runtime's own import provider: the filesystem.
+///
+/// A path that is not there is `Missing` and gets skipped, which is the
+/// behavior the loader has always had; a path that is there but whose text
+/// cannot be read is an error.
+fn filesystem_import(path: &Path) -> ImportSource {
+    match fs::read_to_string(path) {
+        Ok(text) => ImportSource::Text(text),
+        Err(_) if !path.exists() => ImportSource::Missing,
+        Err(error) => ImportSource::Unreadable(error.to_string()),
+    }
+}
+
+/// Load one gathered file through `provider`, parse it, inject it under its
+/// alias, then recursively load that file’s gathers.
 ///
 /// NOTE: this always loads nested gathers as *namespaced imports* (per their alias).
 /// Include/merge semantics are handled only at the top-level loader.
-fn load_import_recursive(
+fn load_gather(
     documents: &mut IndexMap<String, Document>,
-    alias: &str,
+    spec: &helpers::GatherSpec,
     import_path: &Path,
-    visited: &mut std::collections::HashSet<String>,
-) -> Result<(), RuneError> {
+    visited: &mut HashSet<String>,
+    provider: &mut dyn FnMut(&Path) -> ImportSource,
+) -> Result<GatherLoad, Box<ImportFailure>> {
     let key = import_path.to_string_lossy().to_string();
     if visited.contains(&key) {
-        return Ok(());
+        return Ok(GatherLoad::Loaded);
     }
     visited.insert(key);
 
-    let import_content = fs::read_to_string(import_path).map_err(|e| RuneError::FileError {
-        message: format!("Failed to read import file: {}", e),
-        path: import_path.to_string_lossy().to_string(),
-        hint: Some("Check that the imported file exists".into()),
-        code: Some(302),
-    })?;
+    let import_content = match provider(import_path) {
+        ImportSource::Text(text) => text,
+        ImportSource::Missing => return Ok(GatherLoad::Missing),
+        ImportSource::Unreadable(message) => {
+            return Err(Box::new(ImportFailure::new(
+                &spec.raw_path,
+                Some(import_path.to_path_buf()),
+                RuneError::FileError {
+                    message: format!("Failed to read import file: {}", message),
+                    path: import_path.to_string_lossy().to_string(),
+                    hint: Some("Check that the imported file exists".into()),
+                    code: Some(302),
+                },
+            )));
+        }
+    };
 
-    let mut import_parser = parser::Parser::new(&import_content)?;
-    let import_doc = import_parser.parse_document()?;
+    let failure = |error| {
+        Box::new(ImportFailure::new(
+            &spec.raw_path,
+            Some(import_path.to_path_buf()),
+            error,
+        ))
+    };
+    let mut import_parser = parser::Parser::new(&import_content).map_err(failure)?;
+    let import_doc = import_parser.parse_document().map_err(failure)?;
 
     // Overwrite any placeholder and/or previous doc with the real parsed doc
-    documents.insert(alias.to_string(), import_doc);
+    documents.insert(spec.alias.clone(), import_doc);
 
     // Recurse into nested gathers
     let nested_specs = helpers::parse_gather_specs(&import_content);
     let nested_base = import_path.parent().unwrap_or_else(|| Path::new("."));
 
-    for spec in nested_specs.iter() {
-        let nested_path = resolve_gather_path(&spec.raw_path, nested_base)?;
-        if !nested_path.exists() {
-            continue;
-        }
+    for nested in nested_specs.iter() {
+        let nested_path = resolve_gather_path(&nested.raw_path, nested_base).map_err(failure)?;
 
         // Nested gathers: keep them as namespaced imports only.
-        load_import_recursive(documents, &spec.alias, &nested_path, visited)?;
+        load_gather(documents, nested, &nested_path, visited, provider)?;
     }
 
-    Ok(())
+    Ok(GatherLoad::Loaded)
 }
 
 #[cfg(test)]

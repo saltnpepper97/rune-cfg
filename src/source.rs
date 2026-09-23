@@ -22,7 +22,7 @@ use crate::diagnostic::{SourcePosition, SourceRange};
 use crate::lexer::{Lexer, SpannedToken, Token};
 
 /// Half-open UTF-8 byte range into a source buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord, Hash)]
 pub(crate) struct Span {
     pub(crate) start: usize,
     pub(crate) end: usize,
@@ -305,6 +305,75 @@ pub(crate) struct SourceEntry {
     pub(crate) close_span: Option<Span>,
 }
 
+/// One `gather` statement: the file it names, the alias it binds, and the two
+/// token spans an editor can put a cursor on.
+///
+/// The path and the alias are read from real lexer tokens, so the decoded path
+/// here is the same text the strict parser hands the loader, and a path holding
+/// an escaped quote or a `#` is exactly what the statement wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GatherDirective {
+    /// The path text between the quotes, decoded the way the parser decodes it.
+    pub(crate) raw_path: String,
+    /// The explicit `as` alias, or the default alias: the path's file stem,
+    /// else `imported`.
+    pub(crate) alias: String,
+    /// True when the statement wrote `as alias` instead of relying on the
+    /// default.
+    pub(crate) explicit_alias: bool,
+    /// The whole statement, from `gather` through its last token.
+    pub(crate) statement_span: Span,
+    /// The quoted path token, quotes included.
+    pub(crate) path_span: Span,
+    /// The path text between the quotes: the link an editor jumps from.
+    pub(crate) path_content_span: Span,
+    /// The alias token of an explicit `as alias`.
+    pub(crate) alias_span: Option<Span>,
+}
+
+impl GatherDirective {
+    /// True when the cursor touches the quoted path, its quotes included.
+    pub(crate) fn path_touches(&self, offset: usize) -> bool {
+        self.path_span.touches(offset)
+    }
+
+    /// True when the cursor touches the alias of an explicit `as alias`.
+    pub(crate) fn alias_touches(&self, offset: usize) -> bool {
+        self.alias_span.is_some_and(|span| span.touches(offset))
+    }
+}
+
+/// One segment of a plain reference run, with the span of its identifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReferenceSegment {
+    pub(crate) name: String,
+    pub(crate) span: Span,
+}
+
+/// An `Ident(.Ident)*` run written in value or condition position, which is
+/// the shape the strict parser reads as a reference.
+///
+/// The index is tolerant: a run is recorded from real tokens whether or not it
+/// resolves to anything, so a half-typed reference still answers a cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReferenceRun {
+    /// Bytes of the whole run. A trailing `.` with nothing after it is part of
+    /// the run, which is what keeps a cursor typing `alias.` on it.
+    pub(crate) span: Span,
+    /// The identifier segments, in order.
+    pub(crate) segments: Vec<ReferenceSegment>,
+}
+
+impl ReferenceRun {
+    /// The segment names of the run, in order.
+    pub(crate) fn names(&self) -> Vec<String> {
+        self.segments
+            .iter()
+            .map(|segment| segment.name.clone())
+            .collect()
+    }
+}
+
 /// A tolerant, span-aware view of one RUNE buffer.
 ///
 /// The token stream the index was built from is kept, because a cursor question
@@ -317,19 +386,24 @@ pub(crate) struct SourceIndex {
     tokens: Vec<SpannedToken>,
     entries: Vec<SourceEntry>,
     stray_closers: Vec<StrayCloserSpan>,
+    gathers: Vec<GatherDirective>,
+    references: Vec<ReferenceRun>,
 }
 
 impl SourceIndex {
     pub(crate) fn new(text: &str) -> Self {
         let lines = LineIndex::new(text);
         let tokens = spanned_tokens(lines.text());
-        let (entries, stray_closers) = IndexBuilder::new(&tokens).build();
+        let (entries, stray_closers, gathers) = IndexBuilder::new(&tokens).build();
+        let references = reference_runs(&tokens, &entries);
 
         Self {
             lines,
             tokens,
             entries,
             stray_closers,
+            gathers,
+            references,
         }
     }
 
@@ -347,6 +421,73 @@ impl SourceIndex {
 
     pub(crate) fn stray_closers(&self) -> &[StrayCloserSpan] {
         &self.stray_closers
+    }
+
+    /// Every `gather` statement of the buffer, in source order.
+    pub(crate) fn gathers(&self) -> &[GatherDirective] {
+        &self.gathers
+    }
+
+    /// Every plain reference run of the buffer, in source order.
+    pub(crate) fn references(&self) -> &[ReferenceRun] {
+        &self.references
+    }
+
+    /// The gather statement whose quoted path the cursor touches.
+    pub(crate) fn gather_path_at(&self, position: Position) -> Option<&GatherDirective> {
+        let offset = self.offset_at(position)?;
+        self.gathers
+            .iter()
+            .find(|gather| gather.path_touches(offset))
+    }
+
+    /// The gather statement whose explicit alias the cursor touches.
+    pub(crate) fn gather_alias_at(&self, position: Position) -> Option<&GatherDirective> {
+        let offset = self.offset_at(position)?;
+        self.gathers
+            .iter()
+            .find(|gather| gather.alias_touches(offset))
+    }
+
+    /// The gather statement the cursor touches, at its path or at an explicit
+    /// alias.
+    pub(crate) fn gather_at(&self, position: Position) -> Option<&GatherDirective> {
+        self.gather_path_at(position)
+            .or_else(|| self.gather_alias_at(position))
+    }
+
+    /// The plain reference run the cursor touches, anywhere on the run.
+    pub(crate) fn reference_at(&self, position: Position) -> Option<&ReferenceRun> {
+        let offset = self.offset_at(position)?;
+        self.references.iter().find(|run| run.span.touches(offset))
+    }
+
+    /// The segments of a reference already completed before a cursor that sits
+    /// directly after a `.`, which is the prefix completion narrows to.
+    ///
+    /// `Some(vec!["shared"])` for a cursor right after `shared.`, and
+    /// `Some(vec!["shared", "server"])` for one after `shared.server.`.
+    /// A cursor that is not after a `.` has no prefix context at all.
+    pub(crate) fn reference_prefix_at(&self, position: Position) -> Option<Vec<String>> {
+        let offset = self.offset_at(position)?;
+        if !self
+            .text()
+            .as_bytes()
+            .get(offset.checked_sub(1)?)
+            .eq(&Some(&b'.'))
+        {
+            return None;
+        }
+
+        let run = self.reference_at(position)?;
+        let prefix: Vec<String> = run
+            .segments
+            .iter()
+            .filter(|segment| segment.span.end <= offset)
+            .map(|segment| segment.name.clone())
+            .collect();
+
+        (!prefix.is_empty()).then_some(prefix)
     }
 
     /// Byte offset of an LSP position.
@@ -455,33 +596,7 @@ impl SourceIndex {
 
     /// Byte spans of the `$...` reference runs of the buffer.
     fn dollar_reference_spans(&self) -> Vec<Span> {
-        let mut spans = Vec::new();
-        let mut index = 0;
-
-        while let Some(token) = self.tokens.get(index) {
-            if token.token != Token::Dollar {
-                index += 1;
-                continue;
-            }
-
-            let start = token.span.start;
-            let mut end = token.span.end;
-            let mut next = index + 1;
-
-            while let Some(component) = self.tokens.get(next) {
-                let is_component = matches!(component.token, Token::Ident(_) | Token::Dot);
-                if !is_component || component.span.start != end {
-                    break;
-                }
-                end = component.span.end;
-                next += 1;
-            }
-
-            spans.push(Span::new(start, end));
-            index = next;
-        }
-
-        spans
+        dollar_reference_spans(&self.tokens)
     }
 
     /// The assignment on the cursor's line once its key is complete and the
@@ -675,6 +790,38 @@ fn field_path(scope: &[String], name: &str) -> Vec<String> {
     path
 }
 
+/// Byte spans of the `$...` reference runs of a token stream: a `Dollar` token
+/// followed by the contiguous components of the same reference.
+fn dollar_reference_spans(tokens: &[SpannedToken]) -> Vec<Span> {
+    let mut spans = Vec::new();
+    let mut index = 0;
+
+    while let Some(token) = tokens.get(index) {
+        if token.token != Token::Dollar {
+            index += 1;
+            continue;
+        }
+
+        let start = token.span.start;
+        let mut end = token.span.end;
+        let mut next = index + 1;
+
+        while let Some(component) = tokens.get(next) {
+            let is_component = matches!(component.token, Token::Ident(_) | Token::Dot);
+            if !is_component || component.span.start != end {
+                break;
+            }
+            end = component.span.end;
+            next += 1;
+        }
+
+        spans.push(Span::new(start, end));
+        index = next;
+    }
+
+    spans
+}
+
 /// Every token of `text`, stopped at the first lexical error so an incomplete
 /// buffer still yields the tokens that are complete.
 fn spanned_tokens(text: &str) -> Vec<SpannedToken> {
@@ -693,6 +840,107 @@ fn next_token_or_stop(lexer: &mut Lexer) -> Option<SpannedToken> {
     }
 }
 
+/// The `Ident(.Ident)*` runs written in value or condition position.
+///
+/// A run is read from real tokens and only from the value or condition span of
+/// an assignment, a conditional header, or a conditional branch, so a key, a
+/// `$...` reference, a metadata value and a lone `if`/`else` keyword are never
+/// part of one. A trailing `.` with no segment after it stays inside the run,
+/// which is what keeps a cursor typing `alias.` on it.
+fn reference_runs(tokens: &[SpannedToken], entries: &[SourceEntry]) -> Vec<ReferenceRun> {
+    // An assignment keeps its value tokens in `value_span`; a conditional keeps
+    // its condition in `header_span`, because it has no value of its own. The
+    // `if`/`else` keyword inside those spans lexes to a keyword token, so it
+    // can never become a run itself.
+    let spans: Vec<Span> = entries
+        .iter()
+        .filter_map(|entry| match entry.kind {
+            SourceEntryKind::Assignment => entry.value_span,
+            SourceEntryKind::ConditionalHeader | SourceEntryKind::ConditionalBranch => {
+                Some(entry.header_span)
+            }
+            _ => None,
+        })
+        .collect();
+
+    let is_value = |span: Span| {
+        spans
+            .iter()
+            .any(|value| value.start <= span.start && value.end >= span.end)
+    };
+
+    // A `$env.USER` is one `$...` reference, so none of its identifiers is a
+    // plain reference of its own.
+    let dollars = dollar_reference_spans(tokens);
+    let in_dollar = |span: Span| {
+        dollars
+            .iter()
+            .any(|dollar| dollar.start <= span.start && dollar.end >= span.end)
+    };
+
+    let mut runs = Vec::new();
+    let mut index = 0;
+
+    while let Some(token) = tokens.get(index) {
+        let Token::Ident(name) = &token.token else {
+            index += 1;
+            continue;
+        };
+
+        if in_dollar(token.span) || !is_value(token.span) {
+            index += 1;
+            continue;
+        }
+
+        let start = token.span.start;
+        let mut end = token.span.end;
+        let mut segments = vec![ReferenceSegment {
+            name: name.clone(),
+            span: token.span,
+        }];
+        let mut next = index + 1;
+
+        while let Some(dot) = tokens.get(next) {
+            if dot.token != Token::Dot || dot.span.start != end {
+                break;
+            }
+
+            match tokens.get(next + 1) {
+                Some(component)
+                    if matches!(component.token, Token::Ident(_))
+                        && component.span.start == dot.span.end
+                        && is_value(component.span) =>
+                {
+                    let Token::Ident(name) = &component.token else {
+                        break;
+                    };
+                    segments.push(ReferenceSegment {
+                        name: name.clone(),
+                        span: component.span,
+                    });
+                    end = component.span.end;
+                    next += 2;
+                }
+                // A dot with no segment after it is still part of the run, so
+                // the cursor that just typed it is on the reference.
+                _ => {
+                    end = dot.span.end;
+                    next += 1;
+                    break;
+                }
+            }
+        }
+
+        runs.push(ReferenceRun {
+            span: Span::new(start, end),
+            segments,
+        });
+        index = next;
+    }
+
+    runs
+}
+
 /// A block that is open while the indexer walks the token stream.
 enum Frame {
     Object { entry: usize },
@@ -709,6 +957,7 @@ struct IndexBuilder<'a> {
     entries: Vec<SourceEntry>,
     frames: Vec<Frame>,
     stray_closers: Vec<StrayCloserSpan>,
+    gathers: Vec<GatherDirective>,
 }
 
 impl<'a> IndexBuilder<'a> {
@@ -719,12 +968,13 @@ impl<'a> IndexBuilder<'a> {
             entries: Vec::new(),
             frames: Vec::new(),
             stray_closers: Vec::new(),
+            gathers: Vec::new(),
         }
     }
 
-    fn build(mut self) -> (Vec<SourceEntry>, Vec<StrayCloserSpan>) {
+    fn build(mut self) -> (Vec<SourceEntry>, Vec<StrayCloserSpan>, Vec<GatherDirective>) {
         self.run();
-        (self.entries, self.stray_closers)
+        (self.entries, self.stray_closers, self.gathers)
     }
 
     fn run(&mut self) {
@@ -933,17 +1183,77 @@ impl<'a> IndexBuilder<'a> {
         });
     }
 
+    /// `gather "path"` or `gather "path" as alias`.
+    ///
+    /// The path and alias tokens are consumed explicitly, because they are what
+    /// an editor asks about; anything after them is scanned as the rest of the
+    /// statement so the entry keeps the span it always had.
     fn gather_statement(&mut self) {
         let Some(keyword) = self.bump() else {
             return;
         };
 
         let scope = self.current_scope();
-        let value_span = self.scan_statement();
-        let header_span = match value_span {
+
+        let path = match self.peek_token() {
+            Some(Token::String(_)) => self.bump().cloned(),
+            _ => None,
+        };
+
+        let alias = if path.is_some() && matches!(self.peek_token(), Some(Token::As)) {
+            self.bump();
+            match self.peek_token() {
+                Some(Token::Ident(_)) => self.bump().cloned().map(|token| match token.token {
+                    Token::Ident(name) => (name, token.span),
+                    _ => unreachable!("peeked an identifier"),
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let rest = self.scan_statement();
+        let value_span = [
+            path.as_ref().map(|token| token.span),
+            alias.as_ref().map(|(_, span)| *span),
+            rest,
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(Span::merge);
+        let statement_span = match value_span {
             Some(value) => keyword.span.merge(value),
             None => keyword.span,
         };
+
+        if let Some(path) = &path {
+            let raw_path = match &path.token {
+                Token::String(path) => path.clone(),
+                _ => String::new(),
+            };
+            // The default alias is the explicit one, else the file stem, else
+            // `imported`, exactly as the strict parser chooses it.
+            let default_alias = std::path::Path::new(&raw_path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("imported")
+                .to_string();
+            let (alias_name, alias_span) = match &alias {
+                Some((name, span)) => (name.clone(), Some(*span)),
+                None => (default_alias, None),
+            };
+
+            self.gathers.push(GatherDirective {
+                raw_path,
+                alias: alias_name,
+                explicit_alias: alias.is_some(),
+                statement_span,
+                path_span: path.span,
+                path_content_span: path.span.inner(),
+                alias_span,
+            });
+        }
 
         self.push_entry(SourceEntry {
             kind: SourceEntryKind::Gather,
@@ -951,7 +1261,7 @@ impl<'a> IndexBuilder<'a> {
             path: scope,
             name: None,
             key_span: keyword.span,
-            header_span,
+            header_span: statement_span,
             value_span,
             close_span: None,
         });
@@ -1403,6 +1713,198 @@ mod tests {
         // Before the first object opens, statements are at top level.
         assert!(index.scope_at(position(1, 0)).is_empty());
         assert_eq!(index.scope_at(position(3, 2)), vec!["app"]);
+    }
+
+    #[test]
+    fn gather_directives_carry_path_and_alias_spans() {
+        let text = "gather \"defaults.rune\"\ngather \"shared.rune\" as shared\n";
+        let index = SourceIndex::new(text);
+        let gathers = index.gathers();
+
+        assert_eq!(gathers.len(), 2);
+
+        let default = &gathers[0];
+        assert_eq!(default.raw_path, "defaults.rune");
+        assert_eq!(default.alias, "defaults", "the default alias is the stem");
+        assert!(!default.explicit_alias);
+        assert_eq!(default.alias_span, None);
+        assert_eq!(default.path_span.start, 7);
+        assert_eq!(
+            &text[default.path_content_span.start..default.path_content_span.end],
+            "defaults.rune"
+        );
+        assert_eq!(
+            &text[default.statement_span.start..default.statement_span.end],
+            "gather \"defaults.rune\""
+        );
+
+        let explicit = &gathers[1];
+        assert_eq!(explicit.raw_path, "shared.rune");
+        assert_eq!(explicit.alias, "shared");
+        assert!(explicit.explicit_alias);
+        let alias_span = explicit.alias_span.expect("the explicit alias token");
+        assert_eq!(&text[alias_span.start..alias_span.end], "shared");
+        assert_eq!(
+            &text[explicit.statement_span.start..explicit.statement_span.end],
+            "gather \"shared.rune\" as shared"
+        );
+
+        // The path token is what a cursor on the link touches, quotes included.
+        let path_line = index.lines().line_of(default.path_span.start) as u32;
+        assert!(
+            index
+                .gather_path_at(position(path_line, 8))
+                .is_some_and(|gather| gather.raw_path == "defaults.rune")
+        );
+        assert!(index.gather_path_at(position(path_line, 3)).is_none());
+    }
+
+    #[test]
+    fn gather_directives_use_default_aliases_and_skip_comments() {
+        let index = SourceIndex::new(
+            "# gather \"commented.rune\"\ngather \"a/b/theme.rune\"\ngather \"weird\"\n",
+        );
+        let aliases: Vec<&str> = index
+            .gathers()
+            .iter()
+            .map(|gather| gather.alias.as_str())
+            .collect();
+
+        assert_eq!(aliases, vec!["theme", "weird"]);
+        assert!(
+            index
+                .gathers()
+                .iter()
+                .all(|gather| gather.raw_path != "commented.rune"),
+            "a commented-out gather must not be indexed"
+        );
+    }
+
+    #[test]
+    fn incomplete_gather_statements_keep_a_partial_index() {
+        // The string never closes, so the lexer stops before the path token.
+        let index = SourceIndex::new("gather \"defaults.rune\n");
+        assert!(index.gathers().is_empty());
+        assert!(
+            index
+                .entries()
+                .iter()
+                .any(|entry| entry.kind == SourceEntryKind::Gather),
+            "the gather statement still describes the layout"
+        );
+
+        // A bare `gather` with nothing after it records no directive either.
+        let bare = SourceIndex::new("gather\ngather \"x.rune\"\n");
+        assert_eq!(bare.gathers().len(), 1);
+        assert_eq!(bare.gathers()[0].raw_path, "x.rune");
+
+        // A malformed `as` records the path and falls back to the default
+        // alias rather than losing the statement.
+        let half = SourceIndex::new("gather \"x.rune\" as\n");
+        assert_eq!(half.gathers().len(), 1);
+        assert_eq!(half.gathers()[0].alias, "x");
+        assert!(!half.gathers()[0].explicit_alias);
+    }
+
+    #[test]
+    fn gather_tokens_decode_escapes_like_the_parser() {
+        let text = "gather \"a\\\"b.rune\" as aliased\n";
+        let index = SourceIndex::new(text);
+        let gather = &index.gathers()[0];
+
+        assert_eq!(gather.raw_path, "a\"b.rune");
+        assert_eq!(
+            &text[gather.path_content_span.start..gather.path_content_span.end],
+            "a\\\"b.rune"
+        );
+    }
+
+    #[test]
+    fn gather_token_ranges_are_counted_in_utf16_units() {
+        let text = "gather \"sh😀red.rune\" as shared\n";
+        let index = SourceIndex::new(text);
+        let gather = &index.gathers()[0];
+
+        let range = index.lines().range(gather.path_span);
+        assert_eq!(range.start, position(0, 7));
+        assert_eq!(
+            range.end,
+            position(0, 7 + "\"sh😀red.rune\"".encode_utf16().count() as u32),
+            "the emoji counts as two UTF-16 units"
+        );
+
+        // The alias is the token after `as`, and only it answers an alias
+        // cursor.
+        let alias = gather.alias_span.expect("an alias token");
+        assert_eq!(&text[alias.start..alias.end], "shared");
+        let start = index.lines().byte_to_position(alias.start);
+        assert!(index.gather_alias_at(start).is_some());
+        assert!(index.gather_path_at(start).is_none());
+    }
+
+    #[test]
+    fn reference_runs_cover_dotted_values() {
+        let text = "gather \"shared.rune\" as shared\napp:\n  name shared.app.name\nend\n";
+        let index = SourceIndex::new(text);
+        let runs = index.references();
+
+        assert_eq!(runs.len(), 1, "{runs:#?}");
+        let run = &runs[0];
+        assert_eq!(run.names(), vec!["shared", "app", "name"]);
+        assert_eq!(
+            &text[run.span.start..run.span.end],
+            "shared.app.name",
+            "the run span covers the whole dotted value"
+        );
+        assert_eq!(
+            &text[run.segments[1].span.start..run.segments[1].span.end],
+            "app"
+        );
+
+        // A cursor anywhere on the run is on the reference, including its two
+        // ends; the key on the same line is not.
+        assert!(index.reference_at(position(2, 7)).is_some());
+        assert!(index.reference_at(position(2, 9)).is_some());
+        assert!(index.reference_at(position(2, 21)).is_some());
+        assert!(index.reference_at(position(2, 4)).is_none());
+    }
+
+    #[test]
+    fn reference_runs_skip_keys_dollars_and_metadata() {
+        let index = SourceIndex::new(
+            "@author rune\napp:\n  user $env.USER\n  hostname local\n  if debug:\n    level 1\n  endif\nend\n",
+        );
+        let runs: Vec<Vec<String>> = index.references().iter().map(|run| run.names()).collect();
+
+        assert_eq!(
+            runs,
+            vec![vec!["local"], vec!["debug"]],
+            "a key, a metadata value and a `$...` run are not plain references"
+        );
+    }
+
+    #[test]
+    fn reference_runs_keep_a_trailing_dot_for_prefix_completion() {
+        let text = "app:\n  name shared.server.\n  port 1\nend\n";
+        let index = SourceIndex::new(text);
+
+        // The cursor sits right after the trailing dot (column 21 on line 1).
+        assert_eq!(
+            index.reference_prefix_at(position(1, 21)),
+            Some(vec!["shared".to_string(), "server".to_string()])
+        );
+        // A cursor in the middle of a segment is not a prefix context.
+        assert_eq!(index.reference_prefix_at(position(1, 10)), None);
+        // Neither is one on a value with no dot at all.
+        assert_eq!(index.reference_prefix_at(position(2, 9)), None);
+
+        let inline = SourceIndex::new("app:\n  level if shared.debug \"high\" else \"low\"\nend\n");
+        let names: Vec<Vec<String>> = inline.references().iter().map(|run| run.names()).collect();
+        assert_eq!(names, vec![vec!["shared", "debug"]]);
+
+        let unfinished = SourceIndex::new("app:\n  name shared\n");
+        assert_eq!(unfinished.references().len(), 1);
+        assert_eq!(unfinished.references()[0].names(), vec!["shared"]);
     }
 
     #[test]

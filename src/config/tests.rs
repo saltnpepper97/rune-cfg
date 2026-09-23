@@ -1358,3 +1358,194 @@ end
         Some("Check around: server $var.other")
     );
 }
+
+/// Load `root` through an in-memory snapshot of `files`, keyed by file name.
+///
+/// Every fixture lives in one directory, so the loader resolves the same
+/// absolute paths a filesystem-backed load would.
+fn load_from_snapshot(
+    dir: &Path,
+    root: &str,
+    files: &[(&str, &str)],
+) -> Result<LoadedConfig, RuneError> {
+    let snapshot: Vec<(String, String)> = files
+        .iter()
+        .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
+        .collect();
+
+    RuneConfig::from_text_with_provider(root, dir, &mut |path: &Path| {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        match snapshot.iter().find(|(file, _)| file == name) {
+            Some((_, text)) => ImportSource::Text(text.clone()),
+            None => ImportSource::Missing,
+        }
+    })
+}
+
+const GATHER_ROOT: &str = "gather \"defaults.rune\"\ngather \"shared.rune\" as shared\nchosen defaults.theme\napp:\n  name shared.name\n  theme chosen\nend\n";
+const GATHER_DEFAULTS: &str = "theme \"dark\"\n";
+const GATHER_SHARED: &str = "name \"Rune\"\n";
+
+/// The filesystem wrapper and the snapshot provider are two callers of one
+/// loader, so an include, an alias and the reference resolution that depends on
+/// them must come out identical.
+#[test]
+fn provider_loader_matches_the_filesystem_for_includes_and_aliases() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("defaults.rune"), GATHER_DEFAULTS).expect("write defaults");
+    std::fs::write(dir.path().join("shared.rune"), GATHER_SHARED).expect("write shared");
+    let root_path = dir.path().join("config.rune");
+    std::fs::write(&root_path, GATHER_ROOT).expect("write config");
+
+    let filesystem = RuneConfig::from_file(&root_path).expect("loads");
+    let memory = load_from_snapshot(
+        dir.path(),
+        GATHER_ROOT,
+        &[
+            ("defaults.rune", GATHER_DEFAULTS),
+            ("shared.rune", GATHER_SHARED),
+        ],
+    )
+    .expect("loads")
+    .config;
+
+    assert_eq!(filesystem.all_documents(), memory.all_documents());
+    assert_eq!(filesystem.import_aliases(), memory.import_aliases());
+
+    // The aliased reference and the unaliased include both resolve, and the
+    // include is reachable under its default alias as well.
+    assert_eq!(filesystem.get::<String>("app.name").expect("alias"), "Rune");
+    assert_eq!(memory.get::<String>("app.name").expect("alias"), "Rune");
+    assert_eq!(
+        filesystem.get::<String>("app.theme").expect("include"),
+        "dark"
+    );
+    assert_eq!(
+        memory.get::<String>("chosen").expect("default alias"),
+        "dark"
+    );
+    assert!(memory.get_document("defaults").is_some());
+}
+
+/// A missing gather is skipped by both loaders, and a target that is there but
+/// cannot be read stops both of them with the runtime's own error.
+#[test]
+fn missing_imports_are_skipped_and_unreadable_ones_are_reported() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("kept.rune"), "kept \"yes\"\n").expect("write kept");
+    // A directory carrying the gathered name: the path is there, so neither
+    // loader may skip it.
+    std::fs::create_dir(dir.path().join("broken.rune")).expect("create broken");
+
+    let root = "gather \"absent.rune\"\ngather \"kept.rune\"\n";
+    let root_path = dir.path().join("config.rune");
+    std::fs::write(&root_path, root).expect("write config");
+
+    let filesystem = RuneConfig::from_file(&root_path).expect("missing is skipped");
+    let memory = load_from_snapshot(dir.path(), root, &[("kept.rune", "kept \"yes\"\n")])
+        .expect("missing is skipped")
+        .config;
+
+    assert_eq!(filesystem.all_documents(), memory.all_documents());
+    assert_eq!(filesystem.import_aliases(), memory.import_aliases());
+    assert_eq!(filesystem.get::<String>("kept").expect("include"), "yes");
+    assert!(!filesystem.has_document("absent"));
+
+    let broken_root = "gather \"broken.rune\"\n";
+    std::fs::write(&root_path, broken_root).expect("write config");
+
+    match RuneConfig::from_file(&root_path) {
+        Err(RuneError::FileError {
+            code: Some(302), ..
+        }) => {}
+        Err(other) => panic!("an unreadable gather must be a load error, got {other:?}"),
+        Ok(_) => panic!("an unreadable gather must not load"),
+    }
+
+    // The same root through the loader's own provider reports the same failure
+    // without leaving the process.
+    let loaded = RuneConfig::from_text_with_provider(broken_root, dir.path(), &mut |import| {
+        filesystem_import(import)
+    })
+    .expect("the root itself parses");
+    assert_eq!(loaded.failures.len(), 1);
+    let failure = &loaded.failures[0];
+    assert_eq!(failure.raw_path, "broken.rune");
+    assert!(failure.resolved_path.ends_with("broken.rune"));
+    assert!(
+        matches!(
+            failure.error,
+            RuneError::FileError {
+                code: Some(302),
+                ..
+            }
+        ),
+        "{:?}",
+        failure.error
+    );
+
+    // A snapshot that reports the same target as unreadable agrees on the
+    // failure shape, which is all the language server needs.
+    let snapshot = load_from_unreadable(dir.path(), broken_root, "broken.rune");
+    let failure = snapshot.failures.first().expect("a failure");
+    assert_eq!(failure.raw_path, "broken.rune");
+    assert!(matches!(
+        failure.error,
+        RuneError::FileError {
+            code: Some(302),
+            ..
+        }
+    ));
+}
+
+/// Load `root` with `unreadable` reported as an existing but unreadable target.
+fn load_from_unreadable(dir: &Path, root: &str, unreadable: &str) -> LoadedConfig {
+    RuneConfig::from_text_with_provider(root, dir, &mut |path: &Path| {
+        if path.ends_with(unreadable) {
+            ImportSource::Unreadable("Is a directory (os error 21)".into())
+        } else {
+            ImportSource::Missing
+        }
+    })
+    .expect("the root itself parses")
+}
+
+/// Nested gathers stay namespaced, resolve relative to the file that declares
+/// them, and a cycle terminates without an error.
+#[test]
+fn nested_imports_and_cycles_load_the_same_through_both_paths() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = "gather \"a.rune\"\ngather \"loop.rune\"\nroot_marker \"root\"\n";
+    let a = "gather \"b.rune\"\na \"1\"\n";
+    let b = "gather \"loop.rune\"\nb \"2\"\n";
+    let loop_file = "gather \"loop.rune\"\nlooped \"3\"\n";
+
+    for (name, text) in [("a.rune", a), ("b.rune", b), ("loop.rune", loop_file)] {
+        std::fs::write(dir.path().join(name), text).expect("write fixture");
+    }
+    let root_path = dir.path().join("config.rune");
+    std::fs::write(&root_path, root).expect("write config");
+
+    let filesystem = RuneConfig::from_file(&root_path).expect("loads");
+    let memory = load_from_snapshot(
+        dir.path(),
+        root,
+        &[("a.rune", a), ("b.rune", b), ("loop.rune", loop_file)],
+    )
+    .expect("loads")
+    .config;
+
+    assert_eq!(filesystem.all_documents(), memory.all_documents());
+    assert_eq!(filesystem.import_aliases(), memory.import_aliases());
+
+    // A nested gather is a namespace of its own, so `a` did not pull `b` into
+    // the merged root, while an unaliased top-level include did.
+    let nested = memory.get_document("b").expect("the nested alias");
+    assert!(nested.globals.iter().any(|(key, _)| key == "b"));
+    assert_eq!(memory.get::<String>("a").expect("include"), "1");
+    assert_eq!(memory.get::<String>("looped").expect("include"), "3");
+    assert_eq!(memory.get::<String>("root_marker").expect("root"), "root");
+}

@@ -32,7 +32,8 @@ use std::sync::Arc;
 use serde_json::Value;
 use tower_lsp::lsp_types::Url;
 
-use crate::source::{SourceIndex, Span, starts_with_schema_block};
+use crate::config::ImportSource;
+use crate::source::{SourceEntryKind, SourceIndex, Span, starts_with_schema_block};
 
 /// Directory basenames that are never bulk-scanned, whatever the client asks
 /// for. Every hidden directory is excluded as well.
@@ -101,6 +102,139 @@ pub(crate) struct IndexedFile {
     pub(crate) workspace_member: bool,
     /// True while an editor buffer overlays whatever is on disk.
     pub(crate) open: bool,
+    /// The `gather` statements this file declares, resolved against its own
+    /// directory the way the runtime resolves them, including targets that are
+    /// not there.
+    pub(crate) gathers: Vec<GatherEdge>,
+}
+
+/// One `gather` statement of one indexed file, resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GatherEdge {
+    /// The path as the statement wrote it.
+    pub(crate) raw_path: String,
+    /// The resolved path: `~/` expanded and anything relative joined to the
+    /// directory of the file that wrote the statement.
+    pub(crate) path: PathBuf,
+    /// The target's URI, or `None` when the resolved path is not a plain
+    /// absolute path.
+    pub(crate) uri: Option<Url>,
+    /// The explicit `as` alias, or the default alias the runtime computes.
+    pub(crate) alias: String,
+    pub(crate) explicit_alias: bool,
+    /// Index into the declaring file's `SourceIndex::gathers()`, which is where
+    /// the statement's own spans are read from.
+    pub(crate) directive: usize,
+}
+
+/// One alias a root's gather view binds, in the order the runtime binds them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AliasBinding {
+    pub(crate) alias: String,
+    pub(crate) uri: Url,
+    pub(crate) explicit_alias: bool,
+    /// Index into [`GatherView::direct`] of the statement that pulled this
+    /// binding in.
+    pub(crate) first_hop: usize,
+}
+
+/// The gather view of one root document: everything a root reaches through its
+/// `gather` statements, transitively.
+///
+/// This mirrors what `RuneConfig::from_file_with_base` loads for the same root:
+/// direct statements resolve against the root's directory, nested ones against
+/// the file that declares them, an explicit alias is a namespace while an
+/// unaliased direct gather is also an include, and a missing target is simply
+/// skipped.
+#[derive(Debug, Clone)]
+pub(crate) struct GatherView {
+    pub(crate) root: Url,
+    /// The root's own `gather` statements, in source order.
+    pub(crate) direct: Vec<GatherEdge>,
+    /// Alias bindings, in the order the runtime binds them, a later statement
+    /// overwriting an earlier one without changing its position.
+    pub(crate) aliases: Vec<AliasBinding>,
+    /// Every reachable target URI, transitive and including candidates that are
+    /// not there, sorted.
+    pub(crate) reachable: Vec<Url>,
+    /// The direct statement that first reached each target.
+    pub(crate) first_hop: HashMap<Url, usize>,
+    /// Reachable targets the index holds no text for. Some are missing, some
+    /// exist but cannot be read, and only a read can tell them apart.
+    pub(crate) unresolved: Vec<Url>,
+}
+
+impl GatherView {
+    fn bind(&mut self, edge: &GatherEdge, target: Url, first_hop: usize) {
+        let binding = AliasBinding {
+            alias: edge.alias.clone(),
+            uri: target,
+            explicit_alias: edge.explicit_alias,
+            first_hop,
+        };
+
+        match self
+            .aliases
+            .iter_mut()
+            .find(|existing| existing.alias == binding.alias)
+        {
+            Some(existing) => *existing = binding,
+            None => self.aliases.push(binding),
+        }
+    }
+
+    pub(crate) fn alias(&self, name: &str) -> Option<&AliasBinding> {
+        self.aliases.iter().find(|binding| binding.alias == name)
+    }
+}
+
+/// One file whose fields take part in a root's effective merged document.
+#[derive(Debug, Clone)]
+pub(crate) struct EffectiveSource {
+    pub(crate) uri: Url,
+    pub(crate) source: Arc<SourceIndex>,
+    /// Index into [`GatherView::direct`], or `None` for the root itself.
+    pub(crate) first_hop: Option<usize>,
+}
+
+/// Where one field of an effective merged document is really declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Declaration {
+    pub(crate) uri: Url,
+    /// The full path of the declaration inside `uri`.
+    pub(crate) path: Vec<String>,
+    /// The key token of the leaf in that file.
+    pub(crate) key_span: Span,
+    /// What kind of entry declares it.
+    pub(crate) kind: crate::source::SourceEntryKind,
+    /// True when the field comes from a gathered file rather than the root.
+    pub(crate) imported: bool,
+    /// The root's direct statement that brought the field in, when it is
+    /// imported.
+    pub(crate) first_hop: Option<usize>,
+}
+
+/// What one plain reference resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedReference {
+    pub(crate) uri: Url,
+    /// The key path inside the target document; empty when the reference names
+    /// a whole imported file.
+    pub(crate) path: Vec<String>,
+    /// The declaration's key token and kind; `None` for a whole-file target.
+    pub(crate) declaration: Option<(Span, crate::source::SourceEntryKind)>,
+    /// True when the declaration is in a gathered file.
+    pub(crate) imported: bool,
+}
+
+/// The identity of one declaration: exactly where it is written.
+///
+/// Comparing this instead of the reference text is what keeps two configs that
+/// write the same alias for different files apart.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct DeclarationKey {
+    pub(crate) uri: Url,
+    pub(crate) span: Span,
 }
 
 /// A file whose text is known and whose candidates are planned, ready to be
@@ -148,6 +282,21 @@ impl WorkspaceFileIndex {
 
     pub(crate) fn entry(&self, uri: &Url) -> Option<&IndexedFile> {
         self.files.get(uri)
+    }
+
+    /// Every indexed file, for the reverse queries a gather search needs.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&Url, &IndexedFile)> {
+        self.files.iter()
+    }
+
+    /// True when an indexed `gather` statement names this path, whatever
+    /// spelling of the location the event reports.
+    pub(crate) fn gathers_target(&self, path: &Path) -> bool {
+        let path = normalize_path(path);
+
+        self.files
+            .values()
+            .any(|file| file.gathers.iter().any(|edge| edge.path == path))
     }
 
     /// The exclusions this index was built with, so a rebuild carries them on.
@@ -210,14 +359,18 @@ impl WorkspaceFileIndex {
     }
 
     /// True when a watched path may take part in bulk indexing: a `.rune` file
-    /// inside a workspace folder and below no excluded directory. A file the
-    /// index already holds is always eligible, so a schema the editor named
-    /// from outside the workspace still refreshes.
+    /// inside a workspace folder and below no excluded directory, or a file a
+    /// `gather` statement names.
+    ///
+    /// A file the index already holds is always eligible, so a schema the
+    /// editor named from outside the workspace still refreshes. So is a file an
+    /// indexed gather names, wherever it lives: the import is what makes it part
+    /// of the project, and no directory is scanned because of it.
     pub(crate) fn indexes_event(&self, path: &Path, folders: &[PathBuf]) -> bool {
         if !is_rune_path(path) {
             return false;
         }
-        if self.contains_path(path) {
+        if self.contains_path(path) || self.gathers_target(path) {
             return true;
         }
 
@@ -407,6 +560,557 @@ pub(crate) fn resolve_all(resolutions: Vec<Resolution>) -> Vec<(Url, Option<Url>
             let resolved = resolve_candidates(&resolution.candidates, &resolution.indexed);
             (resolution.uri, resolved)
         })
+        .collect()
+}
+
+/// The index entry of one file whose text is already parsed.
+fn entry_from_source(
+    uri: &Url,
+    source: Arc<SourceIndex>,
+    candidates: Vec<PathBuf>,
+    indexed: &[bool],
+    workspace_member: bool,
+    open: bool,
+) -> IndexedFile {
+    let is_schema = is_schema_document(uri, &source);
+    let candidates = if is_schema { Vec::new() } else { candidates };
+    let resolved = resolve_candidates(&candidates, indexed);
+    let gathers = gather_edges(uri, &source);
+
+    IndexedFile {
+        source,
+        candidates,
+        resolved,
+        is_schema,
+        workspace_member,
+        open,
+        gathers,
+    }
+}
+
+/// The path one `gather` statement names, resolved the way the runtime
+/// resolves it: `~/` expands to the home directory, and a relative path joins
+/// the directory of the file that wrote the statement.
+///
+/// The result is normalized lexically, so `../shared.rune` and `./x.rune` name
+/// the same file whatever directory they are written from. The runtime hands
+/// the path to the operating system, which resolves it to the same file.
+///
+/// A `~/` path with no home directory is an error for the runtime; the index
+/// keeps the unresolved path, which simply never matches a readable file.
+pub(crate) fn gather_path(raw_path: &str, from: &Path) -> PathBuf {
+    let mut path = match raw_path.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) if !home.is_empty() => PathBuf::from(home).join(rest),
+            _ => PathBuf::from(raw_path),
+        },
+        None => PathBuf::from(raw_path),
+    };
+
+    if path.is_relative() {
+        path = from.join(path);
+    }
+    normalize_path(&path)
+}
+
+/// A path with its `.` and `..` components resolved lexically.
+///
+/// Nothing is read and no symlink is followed: this only makes two spellings of
+/// one location compare equal, which is what a link between two files needs.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        return PathBuf::from(".");
+    }
+
+    normalized
+}
+
+/// The resolved `gather` edges of one indexed file.
+///
+/// The edges are planned from the same parse the entry is built from, so one
+/// tokenization serves the file's structure, its schema candidates and its
+/// imports.
+pub(crate) fn gather_edges(uri: &Url, source: &SourceIndex) -> Vec<GatherEdge> {
+    let Some(directory) = uri
+        .to_file_path()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+    else {
+        return Vec::new();
+    };
+
+    source
+        .gathers()
+        .iter()
+        .enumerate()
+        .map(|(directive, gather)| {
+            let path = gather_path(&gather.raw_path, &directory);
+
+            GatherEdge {
+                raw_path: gather.raw_path.clone(),
+                uri: candidate_uri(&path),
+                path,
+                alias: gather.alias.clone(),
+                explicit_alias: gather.explicit_alias,
+                directive,
+            }
+        })
+        .collect()
+}
+
+/// The gather view of one root document.
+///
+/// Nothing here reads or writes a file: a target that is not in the index is
+/// simply a target the caller may still want to read.
+pub(crate) fn gather_view(index: &WorkspaceFileIndex, root: &Url) -> GatherView {
+    let mut view = GatherView {
+        root: root.clone(),
+        direct: index
+            .entry(root)
+            .map(|file| file.gathers.clone())
+            .unwrap_or_default(),
+        aliases: Vec::new(),
+        reachable: Vec::new(),
+        first_hop: HashMap::new(),
+        unresolved: Vec::new(),
+    };
+    let mut reachable: HashSet<Url> = HashSet::new();
+    let mut unresolved: HashSet<Url> = HashSet::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+
+    // Every direct statement is a first hop of its own, in source order.
+    let hops: Vec<usize> = (0..view.direct.len()).collect();
+    for hop in hops {
+        let edge = view.direct[hop].clone();
+        walk_edge(
+            index,
+            &edge,
+            hop,
+            &mut visited,
+            &mut view,
+            &mut reachable,
+            &mut unresolved,
+        );
+    }
+
+    view.reachable
+        .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    view.unresolved
+        .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+
+    view
+}
+
+/// Follow one edge: record the target, bind its alias once, and walk what the
+/// target itself gathers.
+///
+/// The first hop is carried down the whole walk, because that is the statement
+/// a diagnostic about anything reached through it belongs to.
+#[allow(clippy::too_many_arguments)]
+fn walk_edge(
+    index: &WorkspaceFileIndex,
+    edge: &GatherEdge,
+    hop: usize,
+    visited: &mut HashSet<PathBuf>,
+    view: &mut GatherView,
+    reachable: &mut HashSet<Url>,
+    unresolved: &mut HashSet<Url>,
+) {
+    let Some(target) = edge.uri.clone() else {
+        return;
+    };
+
+    if reachable.insert(target.clone()) {
+        view.reachable.push(target.clone());
+    }
+    view.first_hop.entry(target.clone()).or_insert(hop);
+
+    if !index.contains_path(&edge.path) && unresolved.insert(target.clone()) {
+        view.unresolved.push(target.clone());
+    }
+
+    // The runtime loads each resolved path once, which is what terminates a
+    // cycle and what keeps a repeated import from re-binding its alias.
+    if !visited.insert(edge.path.clone()) {
+        return;
+    }
+
+    // Only a target that could really be loaded binds an alias, because only
+    // then does the runtime get a document for it.
+    if index.entry(&target).is_none() {
+        return;
+    }
+
+    view.bind(edge, target.clone(), hop);
+    walk_gathers(index, &target, hop, visited, view, reachable, unresolved);
+}
+
+fn walk_gathers(
+    index: &WorkspaceFileIndex,
+    file: &Url,
+    hop: usize,
+    visited: &mut HashSet<PathBuf>,
+    view: &mut GatherView,
+    reachable: &mut HashSet<Url>,
+    unresolved: &mut HashSet<Url>,
+) {
+    let Some(entry) = index.entry(file) else {
+        return;
+    };
+
+    for edge in &entry.gathers {
+        walk_edge(index, edge, hop, visited, view, reachable, unresolved);
+    }
+}
+
+impl WorkspaceFileIndex {
+    /// Workspace-member or open configs whose own gather view, or the root
+    /// itself, reaches `uri`.
+    ///
+    /// This is what turns a file's change into the open configs that must be
+    /// revalidated: nothing is walked and nothing is read, because every
+    /// reachable path is already recorded on the index entries.
+    pub(crate) fn roots_depending_on(&self, uri: &Url) -> Vec<Url> {
+        let mut roots: Vec<Url> = self
+            .files
+            .iter()
+            .filter(|(candidate, file)| {
+                !file.is_schema
+                    && (file.workspace_member || file.open)
+                    && (*candidate == uri || gather_view(self, candidate).reachable.contains(uri))
+            })
+            .map(|(candidate, _)| candidate.clone())
+            .collect();
+        roots.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+
+        roots
+    }
+}
+
+/// The files whose fields merge into a root's effective document, lowest
+/// precedence first: the root itself, then every unaliased direct gather in
+/// source order, each of which overrides what came before it.
+///
+/// An explicit alias is a namespace only, so it contributes no fields, and a
+/// gather the index holds no text for was skipped by the runtime as well.
+pub(crate) fn effective_sources(
+    index: &WorkspaceFileIndex,
+    view: &GatherView,
+) -> Vec<EffectiveSource> {
+    let mut sources = Vec::new();
+
+    if let Some(root) = index.entry(&view.root) {
+        sources.push(EffectiveSource {
+            uri: view.root.clone(),
+            source: Arc::clone(&root.source),
+            first_hop: None,
+        });
+    }
+
+    for (hop, edge) in view.direct.iter().enumerate() {
+        if edge.explicit_alias {
+            continue;
+        }
+        let Some(uri) = &edge.uri else {
+            continue;
+        };
+        let Some(file) = index.entry(uri) else {
+            continue;
+        };
+
+        sources.push(EffectiveSource {
+            uri: uri.clone(),
+            source: Arc::clone(&file.source),
+            first_hop: Some(hop),
+        });
+    }
+
+    sources
+}
+
+/// Where `path` is really declared in an effective merged document.
+///
+/// The last file that declares the path wins, which is the merge order the
+/// runtime applies, and the first occurrence of a key inside one file wins,
+/// which is what resolution does there.
+pub(crate) fn effective_declaration(
+    sources: &[EffectiveSource],
+    path: &[String],
+) -> Option<Declaration> {
+    if path.is_empty() {
+        return None;
+    }
+
+    sources.iter().rev().find_map(|source| {
+        let entry = source
+            .source
+            .entries()
+            .iter()
+            .find(|entry| entry.kind.is_field() && entry.path == path)?;
+
+        Some(Declaration {
+            uri: source.uri.clone(),
+            path: path.to_vec(),
+            key_span: entry.key_span,
+            kind: entry.kind,
+            imported: source.first_hop.is_some(),
+            first_hop: source.first_hop,
+        })
+    })
+}
+
+/// The declaration a diagnostic about `path` belongs to: the field itself, or
+/// the deepest ancestor the effective document really declares, which is where
+/// a missing field should have lived.
+pub(crate) fn effective_origin(
+    sources: &[EffectiveSource],
+    path: &[String],
+) -> Option<Declaration> {
+    (0..=path.len())
+        .rev()
+        .find_map(|length| effective_declaration(sources, &path[..length]))
+}
+
+/// Resolve one plain reference against a root's gather view.
+///
+/// The first segment is tried as a binding first, exactly as
+/// `parser::reference::resolve_reference` does, and everything else resolves in
+/// the effective merged document. A binding whose target the index holds no
+/// text for resolves to nothing at all.
+pub(crate) fn resolve_reference(
+    index: &WorkspaceFileIndex,
+    view: &GatherView,
+    sources: &[EffectiveSource],
+    segments: &[String],
+) -> Option<ResolvedReference> {
+    let (first, rest) = segments.split_first()?;
+
+    if let Some(binding) = view.alias(first) {
+        let uri = binding.uri.clone();
+        let source = index.source(&uri)?;
+
+        return Some(ResolvedReference {
+            uri,
+            path: rest.to_vec(),
+            declaration: find_declaration(&source, rest),
+            imported: true,
+        });
+    }
+
+    let declaration = effective_declaration(sources, segments)?;
+    Some(ResolvedReference {
+        uri: declaration.uri,
+        path: segments.to_vec(),
+        declaration: Some((declaration.key_span, declaration.kind)),
+        imported: declaration.imported,
+    })
+}
+
+/// The first field entry of `source` whose full path is `path`.
+fn find_declaration(
+    source: &SourceIndex,
+    path: &[String],
+) -> Option<(Span, crate::source::SourceEntryKind)> {
+    if path.is_empty() {
+        return None;
+    }
+
+    source
+        .entries()
+        .iter()
+        .find(|entry| entry.kind.is_field() && entry.path == path)
+        .map(|entry| (entry.key_span, entry.kind))
+}
+
+/// Every indexed `gather` statement that names `target`, sorted by file and
+/// statement order.
+///
+/// Two statements naming the same file are the same link, however differently
+/// they are written, because the target URI is what is compared.
+pub(crate) fn gather_occurrences(
+    index: &WorkspaceFileIndex,
+    target: &Url,
+) -> Vec<(Url, GatherEdge)> {
+    let mut found: Vec<(Url, GatherEdge)> = index
+        .entries()
+        .flat_map(|(uri, file)| {
+            file.gathers
+                .iter()
+                .filter(|edge| edge.uri.as_ref() == Some(target))
+                .map(|edge| (uri.clone(), edge.clone()))
+        })
+        .collect();
+
+    found.sort_by(|(left, left_edge), (right, right_edge)| {
+        left.as_str()
+            .cmp(right.as_str())
+            .then(left_edge.directive.cmp(&right_edge.directive))
+    });
+
+    found
+}
+
+/// The spans of the reference runs of one root document that resolve to the
+/// given declaration.
+pub(crate) fn references_to(
+    index: &WorkspaceFileIndex,
+    root: &Url,
+    key: &DeclarationKey,
+) -> Vec<Span> {
+    let Some(source) = index.source(root) else {
+        return Vec::new();
+    };
+    let view = gather_view(index, root);
+    let sources = effective_sources(index, &view);
+
+    source
+        .references()
+        .iter()
+        .filter(|run| {
+            resolve_reference(index, &view, &sources, &run.names()).is_some_and(|resolved| {
+                resolved
+                    .declaration
+                    .is_some_and(|(span, _)| resolved.uri == key.uri && span == key.span)
+            })
+        })
+        .map(|run| run.span)
+        .collect()
+}
+
+/// The direct child keys of `scope` in one document, first occurrence first.
+pub(crate) fn child_keys(source: &SourceIndex, scope: &[String]) -> Vec<(String, SourceEntryKind)> {
+    let mut keys: Vec<(String, SourceEntryKind)> = Vec::new();
+
+    for entry in source.entries() {
+        if !entry.kind.is_field() || entry.scope.as_slice() != scope {
+            continue;
+        }
+        let Some(name) = &entry.name else {
+            continue;
+        };
+        if keys.iter().any(|(existing, _)| existing == name) {
+            continue;
+        }
+
+        keys.push((name.clone(), entry.kind));
+    }
+
+    keys
+}
+
+/// The field names the gathered files supply at `scope`, which are the keys a
+/// config already has through an include.
+pub(crate) fn gathered_scope_keys(sources: &[EffectiveSource], scope: &[String]) -> Vec<String> {
+    let mut names = Vec::new();
+
+    for source in sources.iter().filter(|source| source.first_hop.is_some()) {
+        for (name, _) in child_keys(&source.source, scope) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+
+    names
+}
+
+/// The overlay a config load prefers over disk: one entry per path an editor
+/// buffer covers, plus the canonical form of a path whose text lives at a
+/// different spelling of the same location.
+///
+/// The callers pass the buffers the editor holds, so this is the only place
+/// that has to know a buffer's location on disk.
+pub(crate) fn buffer_overlay(
+    buffers: &[(Url, Arc<SourceIndex>)],
+) -> Vec<(PathBuf, Arc<SourceIndex>)> {
+    let mut overlay: Vec<(PathBuf, Arc<SourceIndex>)> = Vec::new();
+
+    for (uri, source) in buffers {
+        let Ok(path) = uri.to_file_path() else {
+            continue;
+        };
+
+        if !overlay.iter().any(|(candidate, _)| *candidate == path) {
+            overlay.push((path.clone(), Arc::clone(source)));
+        }
+        if let Ok(canonical) = std::fs::canonicalize(&path)
+            && !overlay.iter().any(|(candidate, _)| *candidate == canonical)
+        {
+            overlay.push((canonical, Arc::clone(source)));
+        }
+    }
+
+    overlay
+}
+
+/// The text of one gathered file, preferring a buffer over disk.
+///
+/// This is the language server's import provider: an open editor buffer always
+/// wins, and everything else is read the way the runtime reads it, which is
+/// what keeps "not there" (skipped) apart from "there but unreadable"
+/// (reported).
+pub(crate) fn import_source(path: &Path, overlay: &[(PathBuf, Arc<SourceIndex>)]) -> ImportSource {
+    if let Some(source) = overlay_source(overlay, path) {
+        return ImportSource::Text(source.text().to_string());
+    }
+
+    match std::fs::read_to_string(path) {
+        Ok(text) => ImportSource::Text(text),
+        Err(_) if !path.exists() => ImportSource::Missing,
+        Err(error) => ImportSource::Unreadable(error.to_string()),
+    }
+}
+
+fn overlay_source<'a>(
+    overlay: &'a [(PathBuf, Arc<SourceIndex>)],
+    path: &Path,
+) -> Option<&'a Arc<SourceIndex>> {
+    if let Some((_, source)) = overlay.iter().find(|(candidate, _)| candidate == path) {
+        return Some(source);
+    }
+    if overlay.is_empty() {
+        return None;
+    }
+
+    // A buffer may be keyed by another spelling of the same location: a `..`
+    // path, or a directory reached through a link.
+    let normalized = normalize_path(path);
+    if let Some((_, source)) = overlay
+        .iter()
+        .find(|(candidate, _)| *candidate == normalized)
+    {
+        return Some(source);
+    }
+
+    let canonical = std::fs::canonicalize(path).ok()?;
+    overlay
+        .iter()
+        .find(|(candidate, _)| *candidate == canonical)
+        .map(|(_, source)| source)
+}
+
+/// Read the files a gather closure needs, skipping everything unreadable.
+///
+/// A path that cannot be read stays unresolved, which is how a missing import
+/// and an unreadable one are both left for the caller to judge.
+pub(crate) fn read_texts(paths: Vec<(Url, PathBuf)>) -> Vec<(Url, String)> {
+    paths
+        .into_iter()
+        .filter_map(|(uri, path)| read_text(&path).map(|text| (uri, text)))
         .collect()
 }
 
@@ -602,29 +1306,6 @@ fn is_indexed_candidate(
     candidate_uri(candidate).is_some_and(|uri| {
         members.contains(&uri) || buffers.contains_key(&uri) || index.entry(&uri).is_some()
     })
-}
-
-/// The index entry of one file whose text is already parsed.
-fn entry_from_source(
-    uri: &Url,
-    source: Arc<SourceIndex>,
-    candidates: Vec<PathBuf>,
-    indexed: &[bool],
-    workspace_member: bool,
-    open: bool,
-) -> IndexedFile {
-    let is_schema = is_schema_document(uri, &source);
-    let candidates = if is_schema { Vec::new() } else { candidates };
-    let resolved = resolve_candidates(&candidates, indexed);
-
-    IndexedFile {
-        source,
-        candidates,
-        resolved,
-        is_schema,
-        workspace_member,
-        open,
-    }
 }
 
 /// Ordered schema candidates of one document.
@@ -1089,5 +1770,425 @@ end
             assert!(excludes.excludes_dir("target"), "{options:?}");
             assert!(!excludes.excludes_dir("vendor"), "{options:?}");
         }
+    }
+
+    /// An index built from in-memory text, so every gather rule can be tested
+    /// without touching the filesystem.
+    fn memory_index(files: &[(&str, &str)]) -> (WorkspaceFileIndex, PathBuf) {
+        let root = PathBuf::from("/tmp/rune-gather-tests");
+        let mut index = WorkspaceFileIndex::new(ScanExcludes::default());
+
+        for (name, text) in files {
+            let uri = Url::from_file_path(root.join(name)).expect("file uri");
+            let source = Arc::new(SourceIndex::new(text));
+            let file = entry_from_source(&uri, source, Vec::new(), &[], true, false);
+            index.insert(uri, file);
+        }
+
+        (index, root)
+    }
+
+    fn uri_of(root: &Path, name: &str) -> Url {
+        Url::from_file_path(root.join(name)).expect("file uri")
+    }
+
+    #[test]
+    fn gather_paths_resolve_like_the_runtime() {
+        let base = Path::new("/tmp/rune-project");
+
+        assert_eq!(
+            gather_path("defaults.rune", base),
+            base.join("defaults.rune")
+        );
+        assert_eq!(
+            gather_path("nested/defaults.rune", base),
+            base.join("nested/defaults.rune")
+        );
+        assert_eq!(
+            gather_path("/etc/rune/defaults.rune", base),
+            PathBuf::from("/etc/rune/defaults.rune")
+        );
+
+        // A `~/` path expands, and nothing else treats `~` as special.
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(
+                gather_path("~/rune/defaults.rune", base),
+                PathBuf::from(home).join("rune/defaults.rune")
+            );
+        }
+        assert_eq!(
+            gather_path("~other/x.rune", base),
+            base.join("~other/x.rune")
+        );
+    }
+
+    #[test]
+    fn gather_edges_use_tokens_for_paths_and_aliases() {
+        let root = PathBuf::from("/tmp/rune-gather-tests");
+        let uri = uri_of(&root, "config.rune");
+        let source = SourceIndex::new(
+            "gather \"defaults.rune\"\ngather \"./shared.rune\" as shared\n# gather \"commented.rune\"\n",
+        );
+        let edges = gather_edges(&uri, &source);
+
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].raw_path, "defaults.rune");
+        assert_eq!(edges[0].alias, "defaults");
+        assert!(!edges[0].explicit_alias);
+        assert_eq!(edges[0].path, root.join("defaults.rune"));
+        assert_eq!(edges[0].directive, 0);
+
+        assert_eq!(edges[1].alias, "shared");
+        assert!(edges[1].explicit_alias);
+        assert_eq!(edges[1].directive, 1);
+        // A leading `./` names the same file, and the same URI, as the bare
+        // name would.
+        assert_eq!(
+            edges[1].uri,
+            Some(Url::from_file_path(root.join("shared.rune")).expect("file uri"))
+        );
+    }
+
+    /// The walk mirrors the runtime: direct statements in source order, nested
+    /// gathers as namespaces, a missing target skipped but still tracked, and a
+    /// cycle terminated by the visited set.
+    #[test]
+    fn gather_view_follows_includes_aliases_missing_targets_and_cycles() {
+        let (index, root) = memory_index(&[
+            (
+                "config.rune",
+                "gather \"defaults.rune\"\ngather \"shared.rune\" as shared\ngather \"missing.rune\"\n",
+            ),
+            (
+                "defaults.rune",
+                "gather \"nested.rune\"\ntheme \"include\"\n",
+            ),
+            ("shared.rune", "gather \"config.rune\"\nname \"Rune\"\n"),
+            ("nested.rune", "deep \"1\"\n"),
+        ]);
+
+        let view = gather_view(&index, &uri_of(&root, "config.rune"));
+
+        assert_eq!(view.direct.len(), 3);
+        let aliases: Vec<&str> = view
+            .aliases
+            .iter()
+            .map(|alias| alias.alias.as_str())
+            .collect();
+        assert_eq!(
+            aliases,
+            vec!["defaults", "nested", "shared", "config"],
+            "the walk binds each loaded target once, depth first"
+        );
+
+        // A missing target is reachable and unresolved, but binds nothing.
+        let missing = uri_of(&root, "missing.rune");
+        assert!(view.reachable.contains(&missing));
+        assert_eq!(view.unresolved, vec![missing.clone()]);
+        assert!(view.alias("missing").is_none());
+
+        // Every first hop is the root's own statement that led to the target.
+        assert_eq!(view.first_hop[&uri_of(&root, "defaults.rune")], 0);
+        assert_eq!(view.first_hop[&uri_of(&root, "nested.rune")], 0);
+        assert_eq!(view.first_hop[&uri_of(&root, "shared.rune")], 1);
+        assert_eq!(view.first_hop[&uri_of(&root, "config.rune")], 1);
+        assert_eq!(view.first_hop[&missing], 1);
+
+        // The cycle is walked once: a config reached through its own gather is
+        // still one target.
+        assert_eq!(
+            view.reachable
+                .iter()
+                .filter(|uri| **uri == uri_of(&root, "config.rune"))
+                .count(),
+            1
+        );
+        assert!(
+            view.alias("shared")
+                .is_some_and(|alias| alias.explicit_alias)
+        );
+        assert!(
+            view.alias("defaults")
+                .is_some_and(|alias| !alias.explicit_alias),
+            "an unaliased gather takes its default alias"
+        );
+    }
+
+    /// The effective document is the root plus its unaliased direct gathers, in
+    /// precedence order, and an explicit alias contributes nothing.
+    #[test]
+    fn effective_sources_merge_includes_but_not_namespaces() {
+        let (index, root) = memory_index(&[
+            (
+                "config.rune",
+                "gather \"defaults.rune\"\ngather \"shared.rune\" as shared\ntheme \"root\"\nlocal \"1\"\n",
+            ),
+            ("defaults.rune", "theme \"include\"\nshared_only \"2\"\n"),
+            ("shared.rune", "name \"Rune\"\n"),
+        ]);
+
+        let root_uri = uri_of(&root, "config.rune");
+        let view = gather_view(&index, &root_uri);
+        let sources = effective_sources(&index, &view);
+
+        assert_eq!(sources.len(), 2, "the root and its one include");
+        assert_eq!(sources[0].uri, root_uri);
+        assert_eq!(sources[0].first_hop, None);
+        assert_eq!(sources[1].uri, uri_of(&root, "defaults.rune"));
+        assert_eq!(sources[1].first_hop, Some(0));
+
+        // The include overrides the root, and a key only the root has stays
+        // local.
+        let theme = effective_declaration(&sources, &["theme".to_string()]).expect("theme");
+        assert!(theme.imported);
+        assert_eq!(theme.uri, uri_of(&root, "defaults.rune"));
+        let local = effective_declaration(&sources, &["local".to_string()]).expect("local");
+        assert!(!local.imported);
+        assert_eq!(local.uri, root_uri);
+
+        // A field of an explicitly aliased gather is not part of the merged
+        // document, however reachable it is through the alias.
+        assert!(effective_declaration(&sources, &["name".to_string()]).is_none());
+
+        // A key no file declares has no origin, but its nearest effective
+        // ancestor does.
+        assert!(effective_origin(&sources, &["app".to_string(), "name".to_string()]).is_none());
+        let branch = effective_declaration(&sources, &["shared_only".to_string()])
+            .expect("the include's own key");
+        assert!(branch.imported);
+    }
+
+    #[test]
+    fn references_resolve_alias_first_and_fall_back_to_the_include() {
+        let (index, root) = memory_index(&[
+            (
+                "config.rune",
+                "gather \"defaults.rune\"\ngather \"shared.rune\" as shared\ncopy shared.name\nalias_theme defaults.theme\napp:\n  name copy\nend\n",
+            ),
+            ("defaults.rune", "theme \"include\"\n"),
+            ("shared.rune", "name \"Rune\"\n"),
+        ]);
+
+        let root_uri = uri_of(&root, "config.rune");
+        let view = gather_view(&index, &root_uri);
+        let sources = effective_sources(&index, &view);
+
+        let alias_resolved = resolve_reference(
+            &index,
+            &view,
+            &sources,
+            &["shared".to_string(), "name".to_string()],
+        )
+        .expect("an alias-qualified reference");
+        assert_eq!(alias_resolved.uri, uri_of(&root, "shared.rune"));
+        assert_eq!(alias_resolved.path, vec!["name".to_string()]);
+        assert!(alias_resolved.declaration.is_some());
+        assert!(alias_resolved.imported);
+
+        // A bare reference resolves in the merged document, through the include
+        // that supplied the key.
+        let bare = resolve_reference(
+            &index,
+            &view,
+            &sources,
+            &["defaults".to_string(), "theme".to_string()],
+        )
+        .expect("the default alias of the include");
+        assert_eq!(bare.uri, uri_of(&root, "defaults.rune"));
+
+        let included = resolve_reference(&index, &view, &sources, &["theme".to_string()])
+            .expect("a bare include-resolved reference");
+        assert_eq!(included.uri, uri_of(&root, "defaults.rune"));
+        assert!(included.imported);
+
+        assert!(
+            resolve_reference(&index, &view, &sources, &["nowhere".to_string()]).is_none(),
+            "an unresolvable reference resolves to nothing"
+        );
+    }
+
+    #[test]
+    fn reference_searches_compare_declarations_not_text() {
+        let (index, root) = memory_index(&[
+            (
+                "config.rune",
+                "gather \"shared.rune\" as shared\nfirst shared.name\nsecond shared.name\n",
+            ),
+            (
+                "other.rune",
+                "gather \"other_shared.rune\" as shared\nvalue shared.name\n",
+            ),
+            ("shared.rune", "name \"Rune\"\n"),
+            ("other_shared.rune", "name \"Other\"\n"),
+        ]);
+
+        let config_uri = uri_of(&root, "config.rune");
+        let shared_uri = uri_of(&root, "shared.rune");
+        let shared_source = index.source(&shared_uri).expect("the imported file");
+        let name_span = shared_source
+            .entries()
+            .iter()
+            .find(|entry| entry.path == vec!["name".to_string()])
+            .expect("the imported declaration")
+            .key_span;
+
+        let key = DeclarationKey {
+            uri: shared_uri.clone(),
+            span: name_span,
+        };
+        let spans = references_to(&index, &config_uri, &key);
+        assert_eq!(spans.len(), 2, "both uses in the importing config");
+
+        // The other config writes the same alias text for a different file, so
+        // none of its references are the same declaration.
+        let other_spans = references_to(&index, &uri_of(&root, "other.rune"), &key);
+        assert!(other_spans.is_empty());
+
+        let other_uri = uri_of(&root, "other_shared.rune");
+        let other_source = index.source(&other_uri).expect("the other import");
+        let other_span = other_source
+            .entries()
+            .iter()
+            .find(|entry| entry.path == vec!["name".to_string()])
+            .expect("the other declaration")
+            .key_span;
+        assert_eq!(
+            references_to(
+                &index,
+                &uri_of(&root, "other.rune"),
+                &DeclarationKey {
+                    uri: other_uri,
+                    span: other_span,
+                }
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn gather_occurrences_and_dependents_compare_target_uris() {
+        let (index, root) = memory_index(&[
+            ("config.rune", "gather \"shared.rune\"\n"),
+            ("other.rune", "gather \"./shared.rune\" as shared\n"),
+            ("shared.rune", "name \"Rune\"\n"),
+        ]);
+
+        let shared = uri_of(&root, "shared.rune");
+        let occurrences = gather_occurrences(&index, &shared);
+        assert_eq!(
+            occurrences.len(),
+            2,
+            "`shared.rune` and `./shared.rune` name the same target"
+        );
+        assert_eq!(occurrences[0].0, uri_of(&root, "config.rune"));
+        assert_eq!(occurrences[1].0, uri_of(&root, "other.rune"));
+
+        let dependents = index.roots_depending_on(&shared);
+        assert_eq!(
+            dependents,
+            vec![
+                uri_of(&root, "config.rune"),
+                uri_of(&root, "other.rune"),
+                shared.clone(),
+            ],
+            "both importers depend on the file, and the file is a root of its own"
+        );
+        assert!(
+            index
+                .roots_depending_on(&uri_of(&root, "nowhere.rune"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn completion_reads_child_keys_of_gathered_documents() {
+        let (index, root) = memory_index(&[
+            (
+                "config.rune",
+                "gather \"defaults.rune\"\ngather \"shared.rune\" as shared\n",
+            ),
+            (
+                "defaults.rune",
+                "theme \"include\"\nserver:\n  port 8080\nend\n",
+            ),
+            ("shared.rune", "name \"Rune\"\napp:\n  debug true\nend\n"),
+        ]);
+
+        let root_uri = uri_of(&root, "config.rune");
+        let view = gather_view(&index, &root_uri);
+        let sources = effective_sources(&index, &view);
+
+        let shared = index
+            .source(&uri_of(&root, "shared.rune"))
+            .expect("the aliased file");
+        let top: Vec<String> = child_keys(&shared, &[])
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(top, vec!["name", "app"]);
+        let nested: Vec<String> = child_keys(&shared, &["app".to_string()])
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(nested, vec!["debug"]);
+
+        // Only the include supplies keys to the config's own completion, and
+        // its object's children are supplied at that object's scope.
+        let mut supplied = gathered_scope_keys(&sources, &[]);
+        supplied.sort();
+        assert_eq!(supplied, vec!["server", "theme"]);
+        assert_eq!(
+            gathered_scope_keys(&sources, &["server".to_string()]),
+            vec!["port"]
+        );
+    }
+
+    #[test]
+    fn buffer_overlays_win_over_disk_and_missing_paths_stay_missing() {
+        let root = Path::new("/tmp/rune-gather-tests-missing");
+        let uri = Url::from_file_path(root.join("broken.rune")).expect("file uri");
+        let mut index = WorkspaceFileIndex::new(ScanExcludes::default());
+        let source = Arc::new(SourceIndex::new("name \"buffer\"\n"));
+        let file = entry_from_source(&uri, Arc::clone(&source), Vec::new(), &[], false, true);
+        index.insert(uri.clone(), file);
+
+        let overlay = buffer_overlay(&[(uri.clone(), Arc::clone(&source))]);
+        assert_eq!(overlay.len(), 1);
+        let path = uri.to_file_path().expect("a file path");
+        match import_source(&path, &overlay) {
+            ImportSource::Text(text) => assert_eq!(text, "name \"buffer\"\n"),
+            other => panic!("an open buffer must win over disk, got {other:?}"),
+        }
+
+        // Without the overlay the same path is simply not there.
+        match import_source(&path, &[]) {
+            ImportSource::Missing => {}
+            other => panic!("a path that does not exist is missing, got {other:?}"),
+        }
+
+        // A path nobody named is not a gather target, whatever it is called.
+        assert!(!index.gathers_target(Path::new("/etc/rune/extra.rune")));
+    }
+
+    #[test]
+    fn watcher_eligibility_includes_gather_targets_outside_the_workspace() {
+        let (index, root) = memory_index(&[("config.rune", "gather \"../shared/theme.rune\"\n")]);
+
+        let outside = root.join("../shared/theme.rune");
+        let folders = vec![root.clone()];
+        assert!(index.gathers_target(&outside));
+        assert!(
+            index.indexes_event(&outside, &folders),
+            "a file an indexed gather names is eligible wherever it lives"
+        );
+
+        // The spelling the event uses does not matter: `..` names the same
+        // location however it is written.
+        assert!(index.gathers_target(&root.join(".././shared/theme.rune")));
+
+        // A `.rune` file nobody named and no folder contains stays invisible.
+        assert!(!index.indexes_event(Path::new("/elsewhere/random.rune"), &folders));
+        assert!(!index.indexes_event(&outside.join("theme.txt"), &folders));
     }
 }

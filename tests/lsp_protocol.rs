@@ -3915,3 +3915,970 @@ async fn same_named_keys_in_different_objects_do_not_cross_scopes() {
         "renaming `first.name` leaves `second.name` untouched: {rename}"
     );
 }
+
+// --- `gather` imports -------------------------------------------------------
+//
+// A config's `gather` statements are what the runtime loads beside it, and the
+// server builds the same view: the root buffer plus every file it reaches,
+// transitively, with open editor buffers winning over disk. Everything below
+// drives that view through the protocol only.
+
+/// The reference locations the server reports at one position.
+async fn reference_locations(
+    harness: &mut LspHarness,
+    uri: &Url,
+    line: u32,
+    character: u32,
+    include_declaration: bool,
+) -> Vec<Value> {
+    let result = harness
+        .request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+                "context": { "includeDeclaration": include_declaration },
+            }),
+        )
+        .await;
+
+    result
+        .as_array()
+        .unwrap_or_else(|| panic!("references must be an array: {result}"))
+        .clone()
+}
+
+/// A schema whose `app.name` an include supplies and whose `app.theme` is only
+/// ever written in the importing config.
+const SCHEMA_NAME_AND_INT_THEME: &str = "schema app:\n  name string\n  theme int\nend\n";
+
+/// A config that gets `app.name` from the include and writes its own
+/// `app.theme`.
+const CONFIG_INCLUDE_WITH_LOCAL_THEME: &str = "gather \"defaults.rune\"\napp:\n  theme 1\nend\n";
+
+/// An included file supplying the whole `app` object the schema requires.
+const GATHERED_DEFAULTS: &str = "app:\n  name \"Rune\"\nend\n";
+
+/// The same include with a value the schema rejects.
+const GATHERED_DEFAULTS_INT: &str = "app:\n  name 42\nend\n";
+
+/// A config that only includes `defaults.rune` beside it.
+const CONFIG_INCLUDING_DEFAULTS: &str = "gather \"defaults.rune\"\n";
+
+/// A schema with a required second field, used to prove an explicit alias is a
+/// namespace rather than an include.
+const SCHEMA_NAME_AND_THEME: &str = "schema app:\n  name string\n  theme string\nend\n";
+
+/// A config whose `app.name` comes from an aliased gather.
+const CONFIG_GATHERING_SHARED: &str =
+    "gather \"shared.rune\" as shared\napp:\n  name shared.name\nend\n";
+
+/// An unaliased include is the closest candidate for a bare reference.
+const CONFIG_WITH_BARE_REFERENCE: &str =
+    "gather \"defaults.rune\"\ncopy server.port\napp:\n  name \"Rune\"\nend\n";
+
+/// The file a `gather` names, one directory away from the config that gathers
+/// it, so the watcher has to attribute it to its importer.
+#[tokio::test]
+async fn an_unaliased_gather_satisfies_the_schema() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    harness.write_file("defaults.rune", GATHERED_DEFAULTS);
+
+    harness
+        .did_open(&config_uri, CONFIG_INCLUDING_DEFAULTS)
+        .await;
+    let published = harness.collect_diagnostics().await;
+
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert!(
+        config.diagnostics.is_empty(),
+        "the fields an unaliased gather includes satisfy the schema: {published:#?}"
+    );
+}
+
+/// A gathered file changing on disk is a change to the config that gathers it,
+/// and to nothing else.
+#[tokio::test]
+async fn a_watched_gather_change_republishes_only_the_importer() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let defaults_uri = harness.document_uri("defaults.rune");
+    let other_uri = harness.document_uri("other.rune");
+
+    harness.write_file("schema.rune", SCHEMA_NAME_AND_INT_THEME);
+    harness.write_file("defaults.rune", GATHERED_DEFAULTS);
+    harness.write_file("other.rune", CONFIG_STRING_VALUE);
+
+    harness
+        .did_open(&config_uri, CONFIG_INCLUDE_WITH_LOCAL_THEME)
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert!(
+        diagnostics_for(&published, &config_uri, Some(1))
+            .diagnostics
+            .is_empty(),
+        "the include plus the local key validate before the change: {published:#?}"
+    );
+
+    harness.did_open(&other_uri, CONFIG_STRING_VALUE).await;
+    let published = harness.collect_diagnostics().await;
+    assert!(
+        diagnostics_for(&published, &other_uri, Some(1))
+            .diagnostics
+            .is_empty(),
+        "the unrelated config validates: {published:#?}"
+    );
+
+    // The gathered value becomes one the schema rejects.
+    harness.write_file("defaults.rune", GATHERED_DEFAULTS_INT);
+    harness
+        .did_change_watched_files(&[(defaults_uri.clone(), 2)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+
+    assert_eq!(
+        published.len(),
+        1,
+        "only the importer is republished: {published:#?}"
+    );
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(config.diagnostics.len(), 1, "{published:#?}");
+
+    let diagnostic = &config.diagnostics[0];
+    let message = diagnostic["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("'app.name' expected string, got int"),
+        "unexpected diagnostic: {message}"
+    );
+    // The value lives in the gathered file, so the diagnostic belongs to the
+    // statement that brought it in, not to a key this buffer does not write.
+    assert_eq!(
+        diagnostic["range"],
+        json!({ "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 22 } }),
+        "the diagnostic must underline the gather path: {published:#?}"
+    );
+    assert!(
+        message.contains("Provided by gather \"defaults.rune\""),
+        "the imported origin must be marked: {message}"
+    );
+    assert!(
+        !published
+            .iter()
+            .any(|notification| notification.uri == other_uri),
+        "the unrelated config is not republished: {published:#?}"
+    );
+
+    // A key no gather supplies is the buffer's own, so its diagnostic keeps the
+    // range and the quick-fix context it always had.
+    harness.write_file("defaults.rune", GATHERED_DEFAULTS);
+    harness
+        .did_change_watched_files(&[(defaults_uri.clone(), 2)])
+        .await;
+    harness.discard_server_messages().await;
+
+    harness
+        .replace_document(
+            &config_uri,
+            2,
+            "gather \"defaults.rune\"\napp:\n  theme \"dark\"\nend\n",
+        )
+        .await;
+    let published = harness.collect_diagnostics().await;
+    let config = diagnostics_for(&published, &config_uri, Some(2));
+    assert_eq!(config.diagnostics.len(), 1, "{published:#?}");
+
+    let diagnostic = &config.diagnostics[0];
+    let message = diagnostic["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("'app.theme' expected int, got string"),
+        "unexpected diagnostic: {message}"
+    );
+    assert!(
+        !message.contains("Provided by gather"),
+        "a locally written key is not marked as imported: {message}"
+    );
+    assert_eq!(
+        diagnostic["range"],
+        json!({ "start": { "line": 2, "character": 2 }, "end": { "line": 2, "character": 7 } }),
+        "a key this buffer writes keeps its own range: {published:#?}"
+    );
+}
+
+/// A gathered file that is not there is skipped, exactly as the runtime skips
+/// it, and its downstream schema consequences are all that is reported.
+#[tokio::test]
+async fn deleting_and_recreating_a_gather_reports_no_load_error() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let defaults_uri = harness.document_uri("defaults.rune");
+
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    harness.write_file("defaults.rune", GATHERED_DEFAULTS);
+    harness
+        .did_open(&config_uri, CONFIG_INCLUDING_DEFAULTS)
+        .await;
+    harness.discard_server_messages().await;
+
+    harness.remove_file("defaults.rune");
+    harness
+        .did_change_watched_files(&[(defaults_uri.clone(), 3)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(config.diagnostics.len(), 1, "{published:#?}");
+    let message = config.diagnostics[0]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("Required schema root 'app' is missing"),
+        "the schema consequence is what remains: {message}"
+    );
+    assert!(
+        !message.contains("could not be loaded") && !message.contains("not found"),
+        "a missing gather is not an error: {message}"
+    );
+
+    // Recreating it clears the consequence again.
+    harness.write_file("defaults.rune", GATHERED_DEFAULTS);
+    harness
+        .did_change_watched_files(&[(defaults_uri.clone(), 1)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert!(
+        diagnostics_for(&published, &config_uri, Some(1))
+            .diagnostics
+            .is_empty(),
+        "the recreated include validates again: {published:#?}"
+    );
+}
+
+/// `name shared.name` resolves through an aliased gather, so the reference is
+/// validated, while a bare `theme` shows that the namespace was not merged.
+#[tokio::test]
+async fn an_aliased_gather_resolves_references_without_merging_keys() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+
+    harness.write_file("schema.rune", SCHEMA_NAME_AND_THEME);
+    harness.write_file("shared.rune", "name \"Rune\"\ntheme \"dark\"\n");
+
+    harness
+        .did_open(
+            &config_uri,
+            "gather \"shared.rune\" as shared\napp:\n  name shared.name\n  theme theme\nend\n",
+        )
+        .await;
+    let published = harness.collect_diagnostics().await;
+
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(config.diagnostics.len(), 1, "{published:#?}");
+    let message = config.diagnostics[0]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("'app.theme' expected string, got reference"),
+        "an explicitly aliased gather is not an include: {message}"
+    );
+    assert!(
+        !message.contains("app.name"),
+        "the aliased reference resolved and was not reported: {message}"
+    );
+}
+
+/// The first import that cannot be loaded is reported on the root's own
+/// statement, with the failing file and its parser position.
+#[tokio::test]
+async fn an_imported_syntax_error_is_reported_on_the_root_gather_path() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let defaults_uri = harness.document_uri("defaults.rune");
+
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    harness.write_file("defaults.rune", GATHERED_DEFAULTS);
+    harness
+        .did_open(&config_uri, CONFIG_INCLUDING_DEFAULTS)
+        .await;
+    harness.discard_server_messages().await;
+
+    // The gathered file stops parsing, and a watched change says so.
+    harness.write_file("defaults.rune", "app:\n  name \"Rune\"\nend\nend\n");
+    harness
+        .did_change_watched_files(&[(defaults_uri.clone(), 2)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(config.diagnostics.len(), 1, "{published:#?}");
+
+    let diagnostic = &config.diagnostics[0];
+    let message = diagnostic["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("defaults.rune") && message.contains("has a syntax error"),
+        "the failing file must be named: {message}"
+    );
+    assert_eq!(
+        diagnostic["code"],
+        json!(702),
+        "a failed import has its own code: {published:#?}"
+    );
+    assert_eq!(
+        diagnostic["range"],
+        json!({ "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 22 } }),
+        "the diagnostic is anchored on the gather path: {published:#?}"
+    );
+    let related = diagnostic["relatedInformation"]
+        .as_array()
+        .expect("related information");
+    assert!(
+        related[0]["location"]["uri"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("defaults.rune"),
+        "related information points at the failing file: {diagnostic:#?}"
+    );
+    assert!(
+        message.contains("(line 4"),
+        "the parser position is part of the message: {message}"
+    );
+
+    // Fixing it and reporting a watched change clears the diagnostic.
+    harness.write_file("defaults.rune", GATHERED_DEFAULTS);
+    harness
+        .did_change_watched_files(&[(defaults_uri.clone(), 2)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert!(
+        diagnostics_for(&published, &config_uri, Some(1))
+            .diagnostics
+            .is_empty(),
+        "the fixed import validates again: {published:#?}"
+    );
+}
+
+/// A missing target stays silent; a target that is there but is not a readable
+/// file is the runtime's load error.
+#[tokio::test]
+async fn a_missing_gather_is_silent_and_an_unreadable_one_is_reported() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    std::fs::create_dir_all(harness.workspace_path().join("broken.rune"))
+        .expect("a directory carrying the gathered name");
+
+    harness
+        .did_open(&config_uri, "gather \"absent.rune\"\n")
+        .await;
+    let published = harness.collect_diagnostics().await;
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    let messages: Vec<&str> = config
+        .diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic["message"].as_str())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .all(|message| !message.contains("could not be loaded")),
+        "a missing gather produces no load error: {messages:?}"
+    );
+
+    harness
+        .replace_document(&config_uri, 2, "gather \"broken.rune\"\n")
+        .await;
+    let published = harness.collect_diagnostics().await;
+    let config = diagnostics_for(&published, &config_uri, Some(2));
+    assert_eq!(config.diagnostics.len(), 1, "{published:#?}");
+
+    let diagnostic = &config.diagnostics[0];
+    assert_eq!(diagnostic["code"], json!(702), "{published:#?}");
+    let message = diagnostic["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("broken.rune") && message.contains("could not be loaded"),
+        "an existing but unreadable target is reported: {message}"
+    );
+}
+
+/// A change two hops down republishes the root that reaches it, and a cycle
+/// terminates without a diagnostic.
+#[tokio::test]
+async fn a_transitive_gather_change_republishes_the_root() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let c_uri = harness.document_uri("c.rune");
+    let other_uri = harness.document_uri("other.rune");
+
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    // config -> b -> c, with b and c gathering their way back: a cycle.
+    harness.write_file(
+        "config.rune",
+        "gather \"b.rune\"\napp:\n  name \"Rune\"\nend\n",
+    );
+    harness.write_file("b.rune", "gather \"c.rune\"\ngather \"config.rune\"\n");
+    harness.write_file("c.rune", "gather \"b.rune\"\ndeep \"1\"\n");
+    harness.write_file("other.rune", CONFIG_STRING_VALUE);
+
+    harness
+        .did_open(
+            &config_uri,
+            "gather \"b.rune\"\napp:\n  name \"Rune\"\nend\n",
+        )
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert!(
+        diagnostics_for(&published, &config_uri, Some(1))
+            .diagnostics
+            .is_empty(),
+        "a cycle terminates without a diagnostic: {published:#?}"
+    );
+
+    harness.did_open(&other_uri, CONFIG_STRING_VALUE).await;
+    harness.discard_server_messages().await;
+
+    // The far end of the chain becomes unloadable.
+    harness.write_file("c.rune", "gather \"b.rune\"\ndeep \"1\n");
+    harness
+        .did_change_watched_files(&[(c_uri.clone(), 2)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+
+    assert_eq!(
+        published.len(),
+        1,
+        "only the root that reaches the changed file is republished: {published:#?}"
+    );
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    let message = config.diagnostics[0]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("c.rune") && message.contains("has a syntax error"),
+        "the failing file at the end of the chain is named: {message}"
+    );
+    // The first hop is what the root owns, so that is the anchor.
+    assert_eq!(
+        config.diagnostics[0]["range"],
+        json!({ "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 15 } }),
+        "the anchor is the root's own first hop: {published:#?}"
+    );
+}
+
+/// The editor's buffer of a gathered file wins over the disk copy, and its own
+/// events are its own business.
+#[tokio::test]
+async fn an_open_gather_buffer_wins_over_the_disk_copy() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let defaults_uri = harness.document_uri("defaults.rune");
+
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    harness.write_file("defaults.rune", GATHERED_DEFAULTS_INT);
+
+    harness
+        .did_open(&config_uri, CONFIG_INCLUDING_DEFAULTS)
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert_eq!(
+        diagnostics_for(&published, &config_uri, Some(1))
+            .diagnostics
+            .len(),
+        1,
+        "the invalid copy on disk is what the root starts with: {published:#?}"
+    );
+
+    // The buffer of the gathered file is valid, and wins.
+    harness.did_open(&defaults_uri, GATHERED_DEFAULTS).await;
+    let published = harness.collect_diagnostics().await;
+    assert!(
+        diagnostics_for(&published, &config_uri, Some(1))
+            .diagnostics
+            .is_empty(),
+        "the open buffer of the import revalidates its importer: {published:#?}"
+    );
+
+    // Changing that buffer revalidates the importer again.
+    harness
+        .replace_document(&defaults_uri, 2, GATHERED_DEFAULTS_INT)
+        .await;
+    let published = harness.collect_diagnostics().await;
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(config.diagnostics.len(), 1, "{published:#?}");
+    assert!(
+        config.diagnostics[0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("'app.name' expected string, got int"),
+        "{published:#?}"
+    );
+
+    // A watched event for the open file is the editor's business alone.
+    harness.write_file("defaults.rune", GATHERED_DEFAULTS);
+    harness
+        .did_change_watched_files(&[(defaults_uri.clone(), 2)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+    assert!(
+        published.is_empty(),
+        "an event for an open buffer publishes nothing: {published:#?}"
+    );
+
+    // The disk copy changes while the buffer is open, and closing the buffer is
+    // what hands the file back to disk.
+    harness.write_file("defaults.rune", GATHERED_DEFAULTS_INT);
+    harness.did_close(&defaults_uri).await;
+    let published = harness.collect_diagnostics().await;
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(
+        config.diagnostics.len(),
+        1,
+        "closing the buffer restores the disk text and revalidates the importer: {published:#?}"
+    );
+}
+
+/// A `gather` path links to the file it names.
+#[tokio::test]
+async fn a_gather_path_definition_targets_the_imported_file() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let defaults_uri = harness.document_uri("defaults.rune");
+
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    harness.write_file("defaults.rune", GATHERED_DEFAULTS);
+    harness
+        .did_open(&config_uri, CONFIG_INCLUDING_DEFAULTS)
+        .await;
+    harness.discard_server_messages().await;
+
+    let result = harness
+        .request(
+            "textDocument/definition",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 0, "character": 10 },
+            }),
+        )
+        .await;
+
+    assert_eq!(result["uri"], json!(defaults_uri.as_str()), "{result}");
+    assert_eq!(
+        result["range"],
+        json!({ "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }),
+        "{result}"
+    );
+}
+
+/// An alias-qualified reference jumps to the exact key inside the gathered
+/// file, including through an object.
+#[tokio::test]
+async fn alias_qualified_references_target_the_imported_keys() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let shared_uri = harness.document_uri("shared.rune");
+
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    harness.write_file("shared.rune", "name \"Rune\"\napp:\n  debug true\nend\n");
+    harness
+        .did_open(
+            &config_uri,
+            "gather \"shared.rune\" as shared\napp:\n  name shared.name\n  debug shared.app.debug\nend\n",
+        )
+        .await;
+    harness.discard_server_messages().await;
+
+    let definition = |line: u32, character: u32| {
+        json!({
+            "textDocument": { "uri": config_uri.as_str() },
+            "position": { "line": line, "character": character },
+        })
+    };
+
+    // `  name shared.name`.
+    let name = harness
+        .request("textDocument/definition", definition(2, 12))
+        .await;
+    assert_eq!(name["uri"], json!(shared_uri.as_str()), "{name}");
+    assert_eq!(
+        name["range"],
+        json!({ "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 4 } }),
+        "{name}"
+    );
+
+    // `  debug shared.app.debug`, whose key is nested inside `shared.app`.
+    let nested = harness
+        .request("textDocument/definition", definition(3, 21))
+        .await;
+    assert_eq!(nested["uri"], json!(shared_uri.as_str()), "{nested}");
+    assert_eq!(
+        nested["range"],
+        json!({ "start": { "line": 2, "character": 2 }, "end": { "line": 2, "character": 7 } }),
+        "{nested}"
+    );
+}
+
+/// A bare reference is answered by the include that supplies the key.
+#[tokio::test]
+async fn a_bare_reference_targets_the_include_that_supplies_it() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let defaults_uri = harness.document_uri("defaults.rune");
+
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    harness.write_file("defaults.rune", "server:\n  port 8080\nend\n");
+    harness
+        .did_open(&config_uri, CONFIG_WITH_BARE_REFERENCE)
+        .await;
+    harness.discard_server_messages().await;
+
+    let result = harness
+        .request(
+            "textDocument/definition",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 1, "character": 9 },
+            }),
+        )
+        .await;
+
+    assert_eq!(result["uri"], json!(defaults_uri.as_str()), "{result}");
+    assert_eq!(
+        result["range"],
+        json!({ "start": { "line": 1, "character": 2 }, "end": { "line": 1, "character": 6 } }),
+        "{result}"
+    );
+}
+
+/// Two configs that write the same alias for different files are two different
+/// declarations.
+#[tokio::test]
+async fn gather_references_do_not_conflate_equal_alias_text() {
+    let mut harness = LspHarness::start().await;
+    let config_a = harness.document_uri("a/config.rune");
+    let config_b = harness.document_uri("b/config.rune");
+    let a_uri = harness.document_uri("a/shared.rune");
+    let b_uri = harness.document_uri("b/shared.rune");
+
+    harness.write_file("a/shared.rune", "name \"A\"\n");
+    harness.write_file("b/shared.rune", "name \"B\"\n");
+
+    harness
+        .did_open(
+            &config_a,
+            "gather \"shared.rune\" as shared\nfirst shared.name\nsecond shared.name\n",
+        )
+        .await;
+    harness.discard_server_messages().await;
+    harness
+        .did_open(
+            &config_b,
+            "gather \"shared.rune\" as shared\nother shared.name\n",
+        )
+        .await;
+    harness.discard_server_messages().await;
+
+    let with_declaration = reference_locations(&mut harness, &config_a, 1, 8, true).await;
+    assert_eq!(with_declaration.len(), 3, "{with_declaration:#?}");
+    assert!(
+        with_declaration
+            .iter()
+            .any(|location| location["uri"] == json!(a_uri.as_str())),
+        "the declaration in the gathered file is included: {with_declaration:#?}"
+    );
+    assert!(
+        !with_declaration
+            .iter()
+            .any(|location| location["uri"] == json!(b_uri.as_str())
+                || location["uri"] == json!(config_b.as_str())),
+        "the other config's identically spelled alias is a different file: {with_declaration:#?}"
+    );
+
+    let without_declaration = reference_locations(&mut harness, &config_a, 1, 8, false).await;
+    assert_eq!(without_declaration.len(), 2, "{without_declaration:#?}");
+    assert!(
+        without_declaration
+            .iter()
+            .all(|location| location["uri"] == json!(config_a.as_str())),
+        "both uses are in the importing config: {without_declaration:#?}"
+    );
+}
+
+/// A hover over a gather statement reports the link, and a hover over an
+/// imported reference reports where the value comes from without showing it.
+#[tokio::test]
+async fn hover_reports_gather_links_and_imported_references() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let shared_uri = harness.document_uri("shared.rune");
+
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    harness.write_file("shared.rune", "name \"Rune\"\n");
+    harness.did_open(&config_uri, CONFIG_GATHERING_SHARED).await;
+    harness.discard_server_messages().await;
+
+    let hover = |character: u32, line: u32| {
+        json!({
+            "textDocument": { "uri": config_uri.as_str() },
+            "position": { "line": line, "character": character },
+        })
+    };
+
+    let link = harness.request("textDocument/hover", hover(10, 0)).await;
+    let text = link["contents"].as_str().unwrap_or_default();
+    assert!(text.contains(shared_uri.as_str()), "{link}");
+    assert!(text.contains("alias: shared (explicit)"), "{link}");
+    assert!(text.contains("mode: namespaced import"), "{link}");
+
+    let reference = harness.request("textDocument/hover", hover(12, 2)).await;
+    let text = reference["contents"].as_str().unwrap_or_default();
+    assert!(text.contains(shared_uri.as_str()), "{reference}");
+    assert!(text.contains("key: name"), "{reference}");
+    assert!(text.contains("kind: field"), "{reference}");
+    assert!(text.contains("mode: gathered"), "{reference}");
+    assert!(
+        !text.contains("Rune"),
+        "an imported value is never displayed: {reference}"
+    );
+}
+
+/// Completion after an alias dot lists the gathered file's children, and
+/// follows what happens to that file.
+#[tokio::test]
+async fn completion_after_an_alias_lists_imported_children() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let shared_uri = harness.document_uri("shared.rune");
+
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    harness.write_file("shared.rune", "name \"Rune\"\ntheme \"dark\"\n");
+    harness
+        .did_open(
+            &config_uri,
+            "gather \"shared.rune\" as shared\napp:\n  name shared.name\nend\n",
+        )
+        .await;
+    harness.discard_server_messages().await;
+
+    let items = completion_labels(&mut harness, &config_uri, 2, 14).await;
+    assert!(items.contains(&"name".to_string()), "{items:?}");
+    assert!(items.contains(&"theme".to_string()), "{items:?}");
+
+    // A watched change adds a key to the gathered file.
+    harness.write_file(
+        "shared.rune",
+        "name \"Rune\"\ntheme \"dark\"\naccent \"#fff\"\n",
+    );
+    harness
+        .did_change_watched_files(&[(shared_uri.clone(), 2)])
+        .await;
+    harness.discard_server_messages().await;
+    let items = completion_labels(&mut harness, &config_uri, 2, 14).await;
+    assert!(items.contains(&"accent".to_string()), "{items:?}");
+
+    // Deleting it leaves nothing to complete from.
+    harness.remove_file("shared.rune");
+    harness
+        .did_change_watched_files(&[(shared_uri.clone(), 3)])
+        .await;
+    harness.discard_server_messages().await;
+    let items = completion_labels(&mut harness, &config_uri, 2, 14).await;
+    assert!(
+        !items.contains(&"accent".to_string()) && !items.contains(&"theme".to_string()),
+        "a gather that resolves to nothing completes nothing: {items:?}"
+    );
+
+    // Recreating it brings the children back.
+    harness.write_file("shared.rune", "name \"Rune\"\ntheme \"dark\"\n");
+    harness
+        .did_change_watched_files(&[(shared_uri.clone(), 1)])
+        .await;
+    harness.discard_server_messages().await;
+    let items = completion_labels(&mut harness, &config_uri, 2, 14).await;
+    assert!(items.contains(&"theme".to_string()), "{items:?}");
+}
+
+/// A gather statement is a module symbol of the importing document, and the
+/// gathered file's own keys are never inlined into it.
+#[tokio::test]
+async fn document_symbols_show_the_gather_statement_only() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+
+    harness.write_file("shared.rune", "imported_key \"x\"\n");
+    harness
+        .did_open(
+            &config_uri,
+            "gather \"shared.rune\" as shared\napp:\n  name \"Rune\"\nend\n",
+        )
+        .await;
+    harness.discard_server_messages().await;
+
+    let result = harness
+        .request(
+            "textDocument/documentSymbol",
+            json!({ "textDocument": { "uri": config_uri } }),
+        )
+        .await;
+    let names = symbol_names(&result);
+
+    assert_eq!(
+        names,
+        vec!["shared", "app", "app.name"],
+        "the gather is one symbol of its own: {result:#?}"
+    );
+
+    let symbols = result.as_array().expect("a symbol array");
+    let gather = symbols
+        .iter()
+        .find(|symbol| symbol["name"] == json!("shared"))
+        .expect("the gather symbol");
+    assert_eq!(gather["kind"], json!(2), "a module: {gather:#?}");
+    assert_eq!(gather["detail"], json!("shared.rune"), "{gather:#?}");
+}
+
+/// Navigation answers from the editor's buffer of a gathered file, not from the
+/// copy that is on disk.
+#[tokio::test]
+async fn gather_navigation_uses_the_open_buffer_over_stale_disk_text() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let shared_uri = harness.document_uri("shared.rune");
+
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    harness.write_file("shared.rune", "name \"disk\"\n");
+    harness.did_open(&config_uri, CONFIG_GATHERING_SHARED).await;
+    harness.discard_server_messages().await;
+
+    let definition = json!({
+        "textDocument": { "uri": config_uri.as_str() },
+        "position": { "line": 2, "character": 12 },
+    });
+
+    let disk = harness
+        .request("textDocument/definition", definition.clone())
+        .await;
+    assert_eq!(
+        disk["range"],
+        json!({ "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 4 } }),
+        "{disk}"
+    );
+
+    // The buffer moves the declaration down a line and two columns.
+    harness
+        .did_open(&shared_uri, "# the gathered file\n\n  name \"buffer\"\n")
+        .await;
+    harness.discard_server_messages().await;
+
+    let buffered = harness.request("textDocument/definition", definition).await;
+    assert_eq!(buffered["uri"], json!(shared_uri.as_str()), "{buffered}");
+    assert_eq!(
+        buffered["range"],
+        json!({ "start": { "line": 2, "character": 2 }, "end": { "line": 2, "character": 6 } }),
+        "the open buffer's own range is the answer: {buffered}"
+    );
+}
+
+/// A schema diagnostic about an included field is marked so a local quick fix
+/// never edits the root for a value it does not own.
+#[tokio::test]
+async fn an_imported_field_offers_no_local_quick_fix() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let defaults_uri = harness.document_uri("defaults.rune");
+
+    harness.write_file("schema.rune", SCHEMA_STRING_FIELD);
+    harness.write_file("defaults.rune", GATHERED_DEFAULTS);
+    harness
+        .did_open(&config_uri, CONFIG_INCLUDING_DEFAULTS)
+        .await;
+    harness.discard_server_messages().await;
+
+    // The included value becomes one a "make it a string" fix would rewrite.
+    harness.write_file("defaults.rune", "app:\n  name 42\nend\n");
+    harness
+        .did_change_watched_files(&[(defaults_uri.clone(), 2)])
+        .await;
+    let published = harness.collect_diagnostics().await;
+
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(config.diagnostics.len(), 1, "{published:#?}");
+
+    let actions = code_actions_for(&mut harness, &config_uri, &config.diagnostics[0]).await;
+    assert!(
+        actions.is_empty(),
+        "a value that lives in a gathered file is not edited here: {actions:#?}"
+    );
+}
+
+/// A `gather` path is a link to the file it names, from every statement that
+/// names it, and an imported declaration answers with the uses that reach it.
+#[tokio::test]
+async fn gather_references_span_statements_and_imported_declarations() {
+    let mut harness = LspHarness::start().await;
+    let config_a = harness.document_uri("a/config.rune");
+    let config_b = harness.document_uri("b/config.rune");
+    let shared_uri = harness.document_uri("shared.rune");
+
+    // One file, named two ways, gathered by two configs. The gathered file
+    // writes a plain key, so nothing but the gathers relates the three.
+    harness.write_file("shared.rune", "name \"Rune\"\n");
+    harness.write_file(
+        "a/config.rune",
+        "gather \"../shared.rune\"\napp:\n  name \"A\"\nend\n",
+    );
+    harness.write_file(
+        "b/config.rune",
+        "gather \"../shared.rune\" as shared\napp:\n  name shared.name\nend\n",
+    );
+
+    harness
+        .did_open(
+            &config_a,
+            "gather \"../shared.rune\"\napp:\n  name \"A\"\nend\n",
+        )
+        .await;
+    harness.discard_server_messages().await;
+    harness
+        .did_open(
+            &config_b,
+            "gather \"../shared.rune\" as shared\napp:\n  name shared.name\nend\n",
+        )
+        .await;
+    harness.discard_server_messages().await;
+
+    // Every statement naming the file, whichever way it spells the path.
+    let occurrences = reference_locations(&mut harness, &config_a, 0, 12, true).await;
+    assert_eq!(occurrences.len(), 2, "{occurrences:#?}");
+    assert!(
+        occurrences
+            .iter()
+            .any(|location| location["uri"] == json!(config_b.as_str())),
+        "the other statement naming the same file is a reference: {occurrences:#?}"
+    );
+
+    // Without the declaration the statement the request came from is left out.
+    let uses_only = reference_locations(&mut harness, &config_a, 0, 12, false).await;
+    assert_eq!(uses_only.len(), 1, "{uses_only:#?}");
+    assert_eq!(uses_only[0]["uri"], json!(config_b.as_str()));
+
+    // The gathered file's own declaration answers with the use that reaches it.
+    harness.did_open(&shared_uri, "name \"Rune\"\n").await;
+    harness.discard_server_messages().await;
+
+    let declaration = reference_locations(&mut harness, &shared_uri, 0, 2, true).await;
+    assert!(
+        declaration
+            .iter()
+            .any(|location| location["uri"] == json!(shared_uri.as_str())
+                && location["range"]["start"]["character"] == json!(0)),
+        "the declaration itself is included: {declaration:#?}"
+    );
+    assert!(
+        declaration
+            .iter()
+            .any(|location| location["uri"] == json!(config_b.as_str())),
+        "the aliased use in the importing config is included: {declaration:#?}"
+    );
+}
