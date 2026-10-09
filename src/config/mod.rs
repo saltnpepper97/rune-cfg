@@ -1,5 +1,5 @@
 // Author: Dustin Pilgrim
-// License: MIT
+// License: GPL-3.0-or-later
 
 use std::collections::HashSet;
 use std::fs;
@@ -13,6 +13,7 @@ use crate::parser;
 
 mod access;
 mod conversion;
+mod duplicates;
 mod helpers;
 mod validation;
 
@@ -75,6 +76,7 @@ pub struct RuneConfig {
     documents: IndexMap<String, Document>,
     main_doc_key: String,
     raw_content: String, // Store for error reporting
+    options: crate::ParseOptions,
     /// Memoized fully-resolved root object (references, conditionals, `$env`/`$sys`/`var`,
     /// and inline/block `if` all flattened). Built lazily on first value access and reused
     /// for every subsequent lookup, since `documents` is immutable for an instance except
@@ -94,12 +96,20 @@ impl RuneConfig {
     /// let config = RuneConfig::from_file("config.rune")?;
     /// ```
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, RuneError> {
+        Self::from_file_with_options(path, crate::ParseOptions::default())
+    }
+
+    /// Load a config and all its gathered files using the same resolution options.
+    pub fn from_file_with_options<P: AsRef<Path>>(
+        path: P,
+        options: crate::ParseOptions,
+    ) -> Result<Self, RuneError> {
         let path_ref = path.as_ref();
 
         // Auto-detect base directory for imports (same directory as the config file)
         let base_dir = path_ref.parent().unwrap_or_else(|| Path::new("."));
 
-        Self::from_file_with_base(path_ref, base_dir)
+        Self::from_file_with_base_and_options(path_ref, base_dir, options)
     }
 
     /// Load a RUNE config file with fallback support
@@ -145,6 +155,14 @@ impl RuneConfig {
     ///     - and the gathered file is also available under its default alias (file stem)
     /// - `gather "file.rune" as alias` behaves like a **namespaced import** only
     pub fn from_file_with_base<P: AsRef<Path>>(path: P, base_dir: P) -> Result<Self, RuneError> {
+        Self::from_file_with_base_and_options(path, base_dir, crate::ParseOptions::default())
+    }
+
+    pub fn from_file_with_base_and_options<P: AsRef<Path>>(
+        path: P,
+        base_dir: P,
+        options: crate::ParseOptions,
+    ) -> Result<Self, RuneError> {
         let content = fs::read_to_string(&path).map_err(|e| RuneError::FileError {
             message: format!("Failed to read file: {}", e),
             path: path.as_ref().to_string_lossy().to_string(),
@@ -152,9 +170,12 @@ impl RuneConfig {
             code: Some(301),
         })?;
 
-        let loaded = Self::from_text_with_provider(&content, base_dir.as_ref(), &mut |import| {
-            filesystem_import(import)
-        })?;
+        let loaded = Self::from_text_with_provider_and_options(
+            &content,
+            base_dir.as_ref(),
+            options,
+            &mut |import| filesystem_import(import),
+        )?;
 
         // The runtime has always reported the first import that could not be
         // loaded as an error, and it still does.
@@ -179,8 +200,21 @@ impl RuneConfig {
         base_dir: &Path,
         provider: &mut dyn FnMut(&Path) -> ImportSource,
     ) -> Result<LoadedConfig, RuneError> {
-        // Parse main doc (gather statements are parsed for alias discovery, but loading is done here)
-        let mut main_parser = parser::Parser::new(content)?;
+        Self::from_text_with_provider_and_options(
+            content,
+            base_dir,
+            crate::ParseOptions::default(),
+            provider,
+        )
+    }
+
+    pub(crate) fn from_text_with_provider_and_options(
+        content: &str,
+        base_dir: &Path,
+        options: crate::ParseOptions,
+        provider: &mut dyn FnMut(&Path) -> ImportSource,
+    ) -> Result<LoadedConfig, RuneError> {
+        let mut main_parser = parser::Parser::with_options(content, options)?;
         let main_doc = main_parser.parse_document()?;
 
         // Start documents with the main doc
@@ -206,7 +240,14 @@ impl RuneConfig {
                 }
             };
 
-            match load_gather(&mut documents, spec, &import_path, &mut visited, provider) {
+            match load_gather(
+                &mut documents,
+                spec,
+                &import_path,
+                &mut visited,
+                options,
+                provider,
+            ) {
                 Ok(GatherLoad::Loaded) => {
                     // If no explicit `as`, treat as include: merge into main doc too.
                     if !spec.explicit_alias {
@@ -233,6 +274,7 @@ impl RuneConfig {
                 documents,
                 main_doc_key: main_key,
                 raw_content: content.to_string(),
+                options,
                 resolved_root: std::sync::OnceLock::new(),
             },
             failures,
@@ -245,7 +287,15 @@ impl RuneConfig {
     /// implemented below for callers that prefer the standard trait.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(content: &str) -> Result<Self, RuneError> {
-        let mut parser = parser::Parser::new(content)?;
+        Self::from_str_with_options(content, crate::ParseOptions::default())
+    }
+
+    /// Parse text with explicit resolution options (no file I/O).
+    pub fn from_str_with_options(
+        content: &str,
+        options: crate::ParseOptions,
+    ) -> Result<Self, RuneError> {
+        let mut parser = parser::Parser::with_options(content, options)?;
         let main_doc = parser.parse_document()?;
 
         let mut documents = IndexMap::new();
@@ -256,6 +306,7 @@ impl RuneConfig {
             documents,
             main_doc_key: main_key,
             raw_content: content.to_string(),
+            options,
             resolved_root: std::sync::OnceLock::new(),
         })
     }
@@ -417,6 +468,7 @@ fn load_gather(
     spec: &helpers::GatherSpec,
     import_path: &Path,
     visited: &mut HashSet<String>,
+    options: crate::ParseOptions,
     provider: &mut dyn FnMut(&Path) -> ImportSource,
 ) -> Result<GatherLoad, Box<ImportFailure>> {
     let key = import_path.to_string_lossy().to_string();
@@ -449,7 +501,8 @@ fn load_gather(
             error,
         ))
     };
-    let mut import_parser = parser::Parser::new(&import_content).map_err(failure)?;
+    let mut import_parser =
+        parser::Parser::with_options(&import_content, options).map_err(failure)?;
     let import_doc = import_parser.parse_document().map_err(failure)?;
 
     // Overwrite any placeholder and/or previous doc with the real parsed doc
@@ -463,7 +516,7 @@ fn load_gather(
         let nested_path = resolve_gather_path(&nested.raw_path, nested_base).map_err(failure)?;
 
         // Nested gathers: keep them as namespaced imports only.
-        load_gather(documents, nested, &nested_path, visited, provider)?;
+        load_gather(documents, nested, &nested_path, visited, options, provider)?;
     }
 
     Ok(GatherLoad::Loaded)

@@ -1,5 +1,5 @@
 // Author: Dustin Pilgrim
-// License: MIT
+// License: GPL-3.0-or-later
 
 use super::*;
 use std::collections::HashMap;
@@ -117,7 +117,10 @@ impl RuneConfig {
         );
 
         let snapshot = ValidationSnapshot::build(self, source);
-        let mut diagnostics = Vec::new();
+        let mut diagnostics = self.duplicate_key_diagnostics_with_source(source);
+        for diagnostic in &mut diagnostics {
+            diagnostic.severity = crate::DiagnosticSeverity::Error;
+        }
 
         for block in &schema.blocks {
             let root = [block.root.clone()];

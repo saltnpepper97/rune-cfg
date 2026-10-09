@@ -1,5 +1,5 @@
 // Author: Dustin Pilgrim
-// License: MIT
+// License: GPL-3.0-or-later
 
 /// Severity values are intentionally LSP-shaped so diagnostics can be mapped
 /// directly when a language server is added.

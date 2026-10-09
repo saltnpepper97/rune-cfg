@@ -1,5 +1,5 @@
 // Author: Dustin Pilgrim
-// License: MIT
+// License: GPL-3.0-or-later
 
 pub fn format_uptime(seconds: u64) -> String {
     if seconds < 60 {

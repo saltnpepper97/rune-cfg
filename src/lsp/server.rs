@@ -1,5 +1,5 @@
 // Author: Dustin Pilgrim
-// License: MIT
+// License: GPL-3.0-or-later
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -720,9 +720,9 @@ impl RuneLanguageServer {
         let schema_source = match self.schema_source_for_document(uri, source).await {
             SchemaBinding::Found(schema_source) => schema_source,
             binding => {
-                return self
-                    .schema_binding_diagnostics(uri, source, &binding)
-                    .await
+                let mut diagnostics = self.schema_binding_diagnostics(uri, source, &binding).await;
+                diagnostics.extend(config.duplicate_key_diagnostics_with_source(source));
+                return diagnostics
                     .into_iter()
                     .map(lsp_diagnostic_from_rune)
                     .collect();

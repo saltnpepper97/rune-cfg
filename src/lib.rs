@@ -1,5 +1,5 @@
 // Author: Dustin
-// License: MIT
+// License: GPL-3.0-or-later
 
 //! # rune-cfg
 //!
@@ -165,3 +165,23 @@ pub use config::RuneConfig;
 pub use diagnostic::{DiagnosticSeverity, RuneDiagnostic, SourcePosition, SourceRange};
 pub use error::RuneError;
 pub use schema::{SchemaBlock, SchemaDocument, SchemaField, SchemaType};
+
+/// Controls string resolution without changing existing consumers' defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseOptions {
+    /// Legacy behavior: quoted "$name" references and "$var.name" interpolation.
+    /// When false, quoted references stay literal and `\$` prevents expansion.
+    /// Unescaped $env/$sys interpolation remains enabled.
+    pub quoted_references: bool,
+    /// Reject unset/non-Unicode $env variables instead of substituting empty text.
+    /// In strings, environment variable names stop at a hyphen in this mode.
+    pub strict_env: bool,
+}
+impl Default for ParseOptions {
+    fn default() -> Self {
+        Self {
+            quoted_references: true,
+            strict_env: false,
+        }
+    }
+}

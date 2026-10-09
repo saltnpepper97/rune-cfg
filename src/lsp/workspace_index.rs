@@ -1,5 +1,5 @@
 // Author: Dustin Pilgrim
-// License: MIT
+// License: GPL-3.0-or-later
 
 //! The workspace file index the language server answers cross-file questions
 //! from.

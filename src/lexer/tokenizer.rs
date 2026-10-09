@@ -1,5 +1,5 @@
 // Author: Dustin Pilgrim
-// License: MIT
+// License: GPL-3.0-or-later
 
 use super::scanner::{bump, skip_whitespace_and_comments};
 use super::*;
@@ -10,6 +10,7 @@ pub(super) fn next_token_with_flag(
     lexer: &mut Lexer,
     skip_newlines: bool,
 ) -> Result<SpannedToken, RuneError> {
+    lexer.escaped_dollars.clear();
     skip_whitespace_and_comments(lexer, skip_newlines);
     // A token starts after the whitespace and comments skipped above.
     let start = lexer.offset();
@@ -127,6 +128,9 @@ fn tokenize_string(lexer: &mut Lexer) -> Result<Token, RuneError> {
         if ch == '\\' {
             bump(lexer); // consume '\'
             if let Some(next_ch) = bump(lexer) {
+                if next_ch == '$' {
+                    lexer.escaped_dollars.push(content.chars().count());
+                }
                 let escaped = match next_ch {
                     'n' => '\n',
                     't' => '\t',

@@ -181,13 +181,14 @@ impl RuneConfig {
                 })?;
 
         // Build a temporary parser and inject imports (same as before).
-        let mut temp_parser = parser::Parser::new("").map_err(|_| RuneError::SyntaxError {
-            message: "Failed to create temporary parser".into(),
-            line: 0,
-            column: 0,
-            hint: None,
-            code: Some(303),
-        })?;
+        let mut temp_parser =
+            parser::Parser::with_options("", self.options).map_err(|_| RuneError::SyntaxError {
+                message: "Failed to create temporary parser".into(),
+                line: 0,
+                column: 0,
+                hint: None,
+                code: Some(303),
+            })?;
 
         for (alias, doc) in &self.documents {
             if alias != &self.main_doc_key {

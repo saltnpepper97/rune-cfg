@@ -34,7 +34,7 @@ Add `rune-cfg` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rune-cfg = "0.7.1"
+rune-cfg = "0.8.0"
 ```
 
 ## Quick Example
@@ -492,3 +492,50 @@ RUNE is production-ready and actively maintained. All core features are stable a
 ## License
 
 [GPLv3License](LICENSE)
+
+## Shell command strings and strict environment resolution
+
+Existing constructors keep legacy resolution: a quoted `"$name"` can be a Rune
+reference, and an unset `$env.NAME` substitutes empty text. Consumers storing
+shell commands can opt into literal quoted references and strict environment
+checks without changing other applications:
+
+```rust
+use rune_cfg::{ParseOptions, RuneConfig};
+
+let options = ParseOptions {
+    quoted_references: false,
+    strict_env: true,
+};
+let config = RuneConfig::from_str_with_options(
+    "rule:\n  run \"$EDITOR\"\nend\n",
+    options,
+)?;
+# Ok::<(), rune_cfg::RuneError>(())
+```
+
+`from_file_with_options` applies the same options to all gathered files.
+`Parser::with_options` is available for direct parser consumers. Bare references
+(`command_name`, `$var.command_name`) still resolve normally in either mode.
+`$env.NAME` and `$sys.name` still expand inside quoted strings; for commands,
+prefer shell `$HOME` over parse-time `$env.HOME`. A dot followed by punctuation
+or the end of the string is literal, so `"echo $NAME."` parses normally.
+
+With `strict_env: true`, unset or non-Unicode environment variables produce an
+error anchored at the start of the value. Within strings, a hyphen ends an
+environment variable name: `"$env.HOME-backup"` expands HOME and keeps `-backup`.
+Default mode retains the previous hyphen interpretation for compatibility.
+Single quotes have the same interpolation rules as double quotes. With
+`quoted_references: false`, `\$` prevents Rune expansion: `"\$env.HOME"` becomes
+literal `$env.HOME`. Quoted `$var.name` also remains literal in this mode;
+unquoted `$var.name` still resolves. Legacy mode retains its previous escape
+and `$var` interpolation behavior.
+
+## Duplicate keys
+
+`RuneConfig::duplicate_key_diagnostics()` returns warnings with the repeated
+key's range and a removal hint. The language server shows these warnings even
+without a schema; schema validation promotes them to errors. Existing parsing
+and first-key-wins lookup behavior remain unchanged. Duplicate checks are local
+to a document and object, and distinguish mutually exclusive conditional
+branches. Check gathered files individually to report duplicates in those files.

@@ -1,5 +1,5 @@
 // Author: Dustin Pilgrim
-// License MIT
+// License: GPL-3.0-or-later
 
 use std::path::PathBuf;
 
@@ -355,7 +355,10 @@ fn interpolate_var_refs_in_string(
         }
 
         let mut path = vec![ns.clone()];
-        while j < chars.len() && chars[j] == '.' {
+        while j + 1 < chars.len()
+            && chars[j] == '.'
+            && (chars[j + 1].is_alphanumeric() || chars[j + 1] == '_' || chars[j + 1] == '-')
+        {
             j += 1;
             let mut seg = String::new();
             while j < chars.len() {
@@ -433,6 +436,7 @@ pub(super) fn resolve_value_recursively(
             }
         }
 
+        Value::String(s) if !parser.options.quoted_references => Ok(Value::String(s.clone())),
         Value::String(s) => Ok(Value::String(interpolate_var_refs_in_string(
             s, parser, main_doc,
         )?)),

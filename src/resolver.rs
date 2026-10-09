@@ -1,5 +1,5 @@
 // Author: Dustin Pilgrim
-// License: MIT
+// License: GPL-3.0-or-later
 
 use std::env;
 use std::sync::{Mutex, OnceLock};
@@ -29,127 +29,93 @@ fn sys_cache() -> &'static Mutex<SysCache> {
     })
 }
 
-/// Expands a dollar if it refers to $env or $sys.
-/// Otherwise, keeps it as a Reference.
+/// Expand a quoted string with legacy options (quoted references remain enabled).
 pub fn expand_dollar_string(s: &str) -> Result<Value, RuneError> {
-    // Fast path: if no '$', return plain string
-    if !s.contains('$') {
-        return Ok(Value::String(s.to_string()));
-    }
+    expand_dollar_string_with_options(s, crate::ParseOptions::default())
+}
 
-    // If the whole string looks like just a single $reference
-    if s.starts_with('$') && !s[1..].contains(' ') && !s[1..].contains('/') {
-        // Parse it as a reference
-        let mut chars = s.chars().peekable();
-        chars.next(); // consume '$'
+/// Expand only Rune namespaces inside text; shell dollar expressions stay literal.
+pub fn expand_dollar_string_with_options(
+    s: &str,
+    options: crate::ParseOptions,
+) -> Result<Value, RuneError> {
+    expand_dollar_string_with_escapes(s, options, &[])
+}
 
-        let mut path = Vec::new();
-        let mut ns = String::new();
-        while let Some(&ch) = chars.peek() {
-            if ch.is_alphanumeric() || ch == '_' || ch == '-' {
-                ns.push(ch);
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        path.push(ns.clone());
-
-        while let Some(&ch) = chars.peek() {
-            if ch == '.' {
-                chars.next();
-                let mut seg = String::new();
-                while let Some(&ch2) = chars.peek() {
-                    if ch2.is_alphanumeric() || ch2 == '_' || ch2 == '-' {
-                        seg.push(ch2);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                if seg.is_empty() {
-                    return Err(RuneError::SyntaxError {
-                        message: "Expected identifier after '.'".into(),
-                        line: 0,
-                        column: 0,
-                        hint: None,
-                        code: Some(210),
-                    });
-                }
-                path.push(seg);
-            } else {
-                break;
-            }
-        }
-
-        // Only treat as pure reference when the whole string is exactly "$ns.path".
-        // Otherwise (e.g. "$var.mod+r"), fall through to inline interpolation logic.
-        if chars.peek().is_none() && !path.first().is_some_and(|p| p.is_empty()) {
-            return match path[0].as_str() {
-                "env" => Ok(Value::String(resolve_env(&path)?)),
-                "sys" => Ok(Value::String(resolve_sys(&path)?)),
-                _ => Ok(Value::Reference(path)),
-            };
-        }
-    }
-
-    // Otherwise: do inline interpolation → replace $env/$sys in string
+pub(crate) fn expand_dollar_string_with_escapes(
+    s: &str,
+    options: crate::ParseOptions,
+    escaped_dollars: &[usize],
+) -> Result<Value, RuneError> {
     let mut result = String::new();
     let mut chars = s.chars().peekable();
-
+    let mut offset = 0;
+    let mut whole_reference = None;
     while let Some(ch) = chars.next() {
-        if ch == '$' {
-            // Parse path after $
-            let mut ns = String::new();
-            while let Some(&c) = chars.peek() {
-                if c.is_alphanumeric() || c == '_' || c == '-' {
-                    ns.push(c);
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            let mut path = vec![ns.clone()];
-
-            while let Some(&c) = chars.peek() {
-                if c == '.' {
-                    chars.next();
-                    let mut seg = String::new();
-                    while let Some(&c2) = chars.peek() {
-                        if c2.is_alphanumeric() || c2 == '_' || c2 == '-' {
-                            seg.push(c2);
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    if seg.is_empty() {
-                        return Err(RuneError::SyntaxError {
-                            message: "Expected identifier after '.'".into(),
-                            line: 0,
-                            column: 0,
-                            hint: None,
-                            code: Some(210),
-                        });
-                    }
-                    path.push(seg);
-                } else {
-                    break;
-                }
-            }
-
-            let replacement = match path[0].as_str() {
-                "env" => resolve_env(&path)?,
-                "sys" => resolve_sys(&path)?,
-                _ => format!("${}", path.join(".")),
-            };
-            result.push_str(&replacement);
-        } else {
+        let escaped = escaped_dollars.contains(&offset);
+        offset += 1;
+        if ch != '$' || escaped {
             result.push(ch);
+            continue;
         }
+        let mut namespace = String::new();
+        while chars
+            .peek()
+            .is_some_and(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        {
+            namespace.push(chars.next().unwrap());
+            offset += 1;
+        }
+        let mut path = vec![namespace.clone()];
+        loop {
+            if chars.peek() != Some(&'.') {
+                break;
+            }
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            // A trailing dot or punctuation is ordinary text, not a broken reference.
+            if !lookahead
+                .peek()
+                .is_some_and(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            {
+                break;
+            }
+            chars.next();
+            offset += 1;
+            let mut segment = String::new();
+            while chars.peek().is_some_and(|c| {
+                c.is_alphanumeric()
+                    || *c == '_'
+                    || (*c == '-' && !(namespace == "env" && options.strict_env))
+            }) {
+                segment.push(chars.next().unwrap());
+                offset += 1;
+            }
+            if segment.is_empty() {
+                break;
+            }
+            path.push(segment);
+        }
+        let replacement = match namespace.as_str() {
+            "env" => resolve_env_with_options(&path, options)?,
+            "sys" => resolve_sys(&path)?,
+            _ => {
+                if options.quoted_references
+                    && s == format!("${}", path.join("."))
+                    && chars.peek().is_none()
+                    && !namespace.is_empty()
+                {
+                    whole_reference = Some(path.clone());
+                }
+                format!("${}", path.join("."))
+            }
+        };
+        result.push_str(&replacement);
     }
-
-    Ok(Value::String(result))
+    Ok(match whole_reference {
+        Some(path) => Value::Reference(path),
+        None => Value::String(result),
+    })
 }
 
 /// Resolve a `Value::Reference` during evaluation
@@ -167,12 +133,18 @@ pub fn resolve_reference_value(value: &Value) -> Result<Value, RuneError> {
 /// Parse $ references into a resolved value (for $env/$sys) or Reference (for others)
 /// This is called by the parser when it encounters a $ token outside of strings
 pub fn parse_dollar_reference(path: Vec<String>) -> Result<Value, RuneError> {
+    parse_dollar_reference_with_options(path, crate::ParseOptions::default())
+}
+
+pub fn parse_dollar_reference_with_options(
+    path: Vec<String>,
+    options: crate::ParseOptions,
+) -> Result<Value, RuneError> {
     if path.is_empty() {
         return Ok(Value::Reference(path));
     }
-
     match path[0].as_str() {
-        "env" => Ok(Value::String(resolve_env(&path)?)),
+        "env" => Ok(Value::String(resolve_env_with_options(&path, options)?)),
         "sys" => Ok(Value::String(resolve_sys(&path)?)),
         "runtime" => Ok(Value::Reference(path)), // runtime is resolved later
         _ => Ok(Value::Reference(path)),
@@ -181,6 +153,13 @@ pub fn parse_dollar_reference(path: Vec<String>) -> Result<Value, RuneError> {
 
 /// $env resolver
 fn resolve_env(path: &[String]) -> Result<String, RuneError> {
+    resolve_env_with_options(path, crate::ParseOptions::default())
+}
+
+fn resolve_env_with_options(
+    path: &[String],
+    options: crate::ParseOptions,
+) -> Result<String, RuneError> {
     if path.len() != 2 {
         return Err(RuneError::SyntaxError {
             message: format!("Invalid $env path: {}", path.join(".")),
@@ -190,7 +169,23 @@ fn resolve_env(path: &[String]) -> Result<String, RuneError> {
             code: Some(209),
         });
     }
-    Ok(env::var(&path[1]).unwrap_or_default())
+    match env::var(&path[1]) {
+        Ok(value) => Ok(value),
+        Err(_) if !options.strict_env => Ok(String::new()),
+        Err(_) => Err(RuneError::SyntaxError {
+            message: format!(
+                "Environment variable '{}' is unset or is not Unicode",
+                path[1]
+            ),
+            line: 0,
+            column: 0,
+            hint: Some(format!(
+                "Set {} before loading the config, or use a shell variable in commands",
+                path[1]
+            )),
+            code: Some(218),
+        }),
+    }
 }
 
 /// Helper: consistent "unresolved" error for $sys.<key>

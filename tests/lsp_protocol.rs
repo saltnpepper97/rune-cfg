@@ -1,5 +1,5 @@
 // Author: Dustin Pilgrim
-// License: MIT
+// License: GPL-3.0-or-later
 
 //! Black-box LSP regression tests for the `rune-lsp` language server.
 //!
@@ -4951,4 +4951,30 @@ async fn an_imported_array_item_error_is_anchored_on_its_gather_statement() {
         json!({ "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 22 } }),
         "the value is written in defaults.rune, so its gather statement is the anchor: {published:#?}"
     );
+}
+
+#[tokio::test]
+async fn duplicate_keys_warn_without_schema_and_error_with_schema() {
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    harness
+        .did_open(
+            &config_uri,
+            "app:\n  name \"first\"\n  name \"second\"\nend\n",
+        )
+        .await;
+    let published = harness.collect_diagnostics().await;
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(config.diagnostics.len(), 1, "{published:#?}");
+    assert_eq!(config.diagnostics[0]["code"], 660);
+    assert_eq!(config.diagnostics[0]["severity"], 2);
+    assert_eq!(config.diagnostics[0]["range"]["start"]["line"], 2);
+    harness.discard_server_messages().await;
+    let schema_uri = harness.document_uri("schema.rune");
+    harness.did_open(&schema_uri, SCHEMA_STRING_FIELD).await;
+    let published = harness.collect_diagnostics().await;
+    let config = diagnostics_for(&published, &config_uri, Some(1));
+    assert_eq!(config.diagnostics.len(), 1, "{published:#?}");
+    assert_eq!(config.diagnostics[0]["code"], 660);
+    assert_eq!(config.diagnostics[0]["severity"], 1);
 }

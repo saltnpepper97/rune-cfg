@@ -1,5 +1,5 @@
 // Author: Dustin Pilgrim
-// License: MIT
+// License: GPL-3.0-or-later
 
 use std::collections::HashMap;
 
@@ -15,16 +15,31 @@ mod value;
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
     peek: Option<Token>,
+    peek_start: usize,
+    peek_escaped_dollars: Vec<usize>,
+    lines: crate::source::LineIndex,
+    pub(crate) options: crate::ParseOptions,
     pub imports: HashMap<String, Document>,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(input: &'a str) -> Result<Self, RuneError> {
+        Self::with_options(input, crate::ParseOptions::default())
+    }
+
+    pub fn with_options(input: &'a str, options: crate::ParseOptions) -> Result<Self, RuneError> {
         let mut lexer = Lexer::new(input);
-        let peek = Some(lexer.next_token()?);
+        let token = lexer.next_token_spanned()?;
+        let peek_escaped_dollars = lexer.escaped_dollars.clone();
+        let peek_start = token.span.start;
+        let peek = Some(token.token);
         Ok(Self {
             lexer,
             peek,
+            peek_start,
+            peek_escaped_dollars,
+            lines: crate::source::LineIndex::new(input),
+            options,
             imports: HashMap::new(),
         })
     }
@@ -41,8 +56,16 @@ impl<'a> Parser<'a> {
             hint: None,
             code: Some(201),
         })?;
-        self.peek = Some(self.lexer.next_token()?);
+        let token = self.lexer.next_token_spanned()?;
+        self.peek_start = token.span.start;
+        self.peek_escaped_dollars = self.lexer.escaped_dollars.clone();
+        self.peek = Some(token.token);
         Ok(curr)
+    }
+
+    pub(crate) fn token_position(&self) -> (usize, usize) {
+        let position = self.lines.byte_to_position(self.peek_start);
+        (position.line as usize + 1, position.character as usize + 1)
     }
 
     pub(crate) fn peek(&self) -> Option<&Token> {

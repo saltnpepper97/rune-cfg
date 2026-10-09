@@ -1,5 +1,5 @@
 // Author: Dustin Pilgrim
-// License: MIT
+// License: GPL-3.0-or-later
 
 #[cfg(test)]
 use super::*;
@@ -1127,10 +1127,13 @@ end
         config.get_value("app.server.port").unwrap(),
         Value::String("8080".to_string())
     );
-    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-    assert_eq!(diagnostic_span(&diagnostics[0]), (3, 5, 9));
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    let duplicate = diagnostics.iter().find(|d| d.code == Some(660)).unwrap();
+    assert_eq!(diagnostic_span(duplicate), (5, 3, 9));
+    let type_error = diagnostic_containing(&diagnostics, "app.server.port");
+    assert_eq!(diagnostic_span(type_error), (3, 5, 9));
     assert_eq!(
-        diagnostics[0].message,
+        type_error.message,
         "'app.server.port' expected int, got string"
     );
 }
@@ -1288,7 +1291,11 @@ end
     );
 
     // ... which is exactly what the diagnostics say, in both message and range.
-    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    assert_eq!(diagnostics.len(), 3, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostic_span(diagnostics.iter().find(|d| d.code == Some(660)).unwrap()),
+        (14, 3, 9)
+    );
 
     let mode = diagnostic_containing(&diagnostics, "app.mode");
     assert_eq!(mode.message, "'app.mode' expected int, got string");

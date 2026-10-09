@@ -1,5 +1,5 @@
 // Author: Dustin Pilgrim
-// License: MIT
+// License: GPL-3.0-or-later
 
 //! Source coordinates and a tolerant structural index of RUNE buffers.
 //!
@@ -1036,6 +1036,83 @@ impl<'a> IndexBuilder<'a> {
         span
     }
 
+    /// Consume one value, leaving sibling assignments on the same line visible.
+    fn scan_value(&mut self) -> Option<Span> {
+        let start = self.cursor;
+        match self.peek_token()? {
+            Token::String(_)
+            | Token::Number(_)
+            | Token::Bool(_)
+            | Token::Regex(_)
+            | Token::Null => {
+                self.bump();
+            }
+            Token::Ident(_) | Token::Dollar => {
+                if self.peek_token() == Some(Token::Dollar) {
+                    self.bump();
+                }
+                if matches!(self.peek_token(), Some(Token::Ident(_))) {
+                    self.bump();
+                }
+                while self.peek_token() == Some(Token::Dot) {
+                    self.bump();
+                    if matches!(self.peek_token(), Some(Token::Ident(_))) {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Token::LBracket => {
+                let mut depth = 0usize;
+                while let Some(token) = self.peek_token() {
+                    if token == Token::Eof {
+                        break;
+                    }
+                    self.bump();
+                    match token {
+                        Token::LBracket => depth += 1,
+                        Token::RBracket => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Token::If => {
+                self.bump();
+                self.scan_value(); // condition path
+                if self.peek_token() == Some(Token::Equals) {
+                    self.bump();
+                    self.scan_value();
+                }
+                self.scan_value(); // then value
+                if self.peek_token() == Some(Token::Else) {
+                    self.bump();
+                    self.scan_value();
+                }
+            }
+            Token::Newline
+            | Token::End
+            | Token::EndIf
+            | Token::Else
+            | Token::ElseIf
+            | Token::Eof => return None,
+            _ => {
+                self.scan_statement();
+            }
+        }
+        if matches!(self.peek_token(), Some(Token::Ident(name)) if name == "with") {
+            self.scan_statement();
+        }
+        let first = self.tokens.get(start)?;
+        let last = self.tokens.get(self.cursor.checked_sub(1)?)?;
+        Some(first.span.merge(last.span))
+    }
+
     /// An `if` opens a conditional block when its line ends the header with a
     /// `:`; otherwise it is an inline value conditional and belongs to the
     /// statement it appears in.
@@ -1106,7 +1183,7 @@ impl<'a> IndexBuilder<'a> {
                 let Some(equals) = self.bump() else {
                     return;
                 };
-                let value_span = self.scan_statement();
+                let value_span = self.scan_value();
                 let header_span = match value_span {
                     Some(value) => key.span.merge(value),
                     None => key.span.merge(equals.span),
@@ -1114,7 +1191,7 @@ impl<'a> IndexBuilder<'a> {
                 self.push_assignment(scope, name, key_span, header_span, value_span);
             }
             _ => {
-                let value_span = self.scan_statement();
+                let value_span = self.scan_value();
                 let header_span = match value_span {
                     Some(value) => key.span.merge(value),
                     None => key.span,

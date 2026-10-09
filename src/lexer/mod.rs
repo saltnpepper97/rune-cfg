@@ -1,5 +1,5 @@
 // Author: Dustin Pilgrim
-// License: MIT
+// License: GPL-3.0-or-later
 
 use crate::RuneError;
 use crate::source::Span;
@@ -83,6 +83,7 @@ pub struct Lexer<'a> {
     offset: usize,
     line: usize,
     column: usize,
+    pub(crate) escaped_dollars: Vec<usize>,
 }
 
 /// A token together with the byte span of its own lexeme.
@@ -104,6 +105,7 @@ impl<'a> Lexer<'a> {
             offset: 0,
             line: 1,
             column: 0,
+            escaped_dollars: Vec::new(),
         };
         lexer.peek = lexer.input.next();
         lexer

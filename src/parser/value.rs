@@ -1,9 +1,9 @@
 // Author: Dustin Pilgrim
-// License: MIT
+// License: GPL-3.0-or-later
 
 use super::*;
 use crate::ast::{AnnotatedValue, ObjectItem};
-use crate::resolver::{expand_dollar_string, parse_dollar_reference};
+use crate::resolver::{expand_dollar_string_with_escapes, parse_dollar_reference_with_options};
 use regex::Regex;
 
 pub(super) fn parse_assignment(parser: &mut Parser) -> Result<(String, Value), RuneError> {
@@ -192,8 +192,15 @@ pub(super) fn parse_value(parser: &mut Parser) -> Result<Value, RuneError> {
 }
 
 fn parse_string_value(parser: &mut Parser) -> Result<Value, RuneError> {
+    let position = parser.token_position();
+    let escaped = if parser.options.quoted_references {
+        Vec::new()
+    } else {
+        parser.peek_escaped_dollars.clone()
+    };
     if let Token::String(s) = parser.bump()? {
-        expand_dollar_string(&s)
+        expand_dollar_string_with_escapes(&s, parser.options, &escaped)
+            .map_err(|error| at_position(error, position))
     } else {
         unreachable!()
     }
@@ -236,6 +243,7 @@ fn parse_null_value(parser: &mut Parser) -> Result<Value, RuneError> {
 }
 
 fn parse_dollar_reference_value(parser: &mut Parser) -> Result<Value, RuneError> {
+    let position = parser.token_position();
     parser.bump()?; // $
 
     let namespace = if let Token::Ident(name) = parser.bump()? {
@@ -276,7 +284,8 @@ fn parse_dollar_reference_value(parser: &mut Parser) -> Result<Value, RuneError>
         }
     }
 
-    parse_dollar_reference(path)
+    parse_dollar_reference_with_options(path, parser.options)
+        .map_err(|error| at_position(error, position))
 }
 
 fn parse_reference_value(parser: &mut Parser) -> Result<Value, RuneError> {
@@ -326,4 +335,14 @@ fn parse_array_value(parser: &mut Parser) -> Result<Value, RuneError> {
     }
 
     Ok(Value::Array(arr))
+}
+
+fn at_position(mut error: RuneError, position: (usize, usize)) -> RuneError {
+    if let RuneError::SyntaxError { line, column, .. } = &mut error
+        && *line == 0
+    {
+        *line = position.0;
+        *column = position.1;
+    }
+    error
 }
