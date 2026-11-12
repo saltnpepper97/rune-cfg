@@ -3,3 +3,4 @@
 /editors/vscode/node_modules
 /editors/vscode/out
 *.vsix
+/editors/emacs/*.elc

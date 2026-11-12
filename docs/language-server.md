@@ -2,7 +2,15 @@
 
 RUNE includes an experimental language server binary named `rune-lsp`. It speaks LSP over stdio and can be launched by any editor client that supports custom language servers.
 
-Editor integrations are included under [`editors/nvim/`](../editors/nvim/) for Neovim, [`editors/vim/`](../editors/vim/) for classic Vim, and [`editors/vscode/`](../editors/vscode/) for VS Code. The Vim and Neovim runtime files provide highlighting, filetype detection, and 2-space indentation. The VS Code extension provides language registration, basic TextMate highlighting, language configuration, and a client that launches `rune-lsp`.
+Editor integrations are included under [`editors/nvim/`](../editors/nvim/) for Neovim,
+[`editors/vim/`](../editors/vim/) for classic Vim,
+[`editors/vscode/`](../editors/vscode/) for VS Code, and
+[`editors/emacs/`](../editors/emacs/) for Emacs. The Vim and Neovim runtime files
+provide highlighting, filetype detection, and 2-space indentation. The VS Code
+extension provides language registration, basic TextMate highlighting, language
+configuration, and a client that launches `rune-lsp`. The Emacs mode provides
+Tree-sitter highlighting, structural indentation, section navigation, and optional
+Eglot integration.
 
 An experimental Tree-sitter grammar is included under [`editors/tree-sitter-rune/`](../editors/tree-sitter-rune/) for higher quality highlighting, indentation, and folding. The Vim syntax files remain the stable fallback while the grammar matures.
 
@@ -217,6 +225,14 @@ npm run compile
 ```
 
 Run the extension from VS Code's Extension Development Host. By default it launches `rune-lsp` from `PATH`; set `runecfg.server.path` to an absolute binary path when testing a local development build. See [`editors/vscode/README.md`](../editors/vscode/README.md) for details.
+
+## Emacs
+
+Install `rune-cfg-ts-mode` and its grammar as described in
+[`editors/emacs/README.md`](../editors/emacs/README.md), then install `rune-lsp`
+using the instructions above. Run `M-x eglot` in a `.rune` buffer to connect.
+The mode registers the server with Eglot but does not start it automatically.
+Schema support and server capabilities are shared with the other editors.
 
 ## Packaging and Releases
 

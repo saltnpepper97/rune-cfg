@@ -1,0 +1,30 @@
+name: Emacs
+
+on:
+  push:
+    paths:
+      - editors/emacs/**
+      - editors/tree-sitter-rune/**
+      - .github/workflows/emacs.yml
+  pull_request:
+    paths:
+      - editors/emacs/**
+      - editors/tree-sitter-rune/**
+      - .github/workflows/emacs.yml
+
+permissions:
+  contents: read
+
+jobs:
+  emacs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Emacs 31.1
+        uses: purcell/setup-emacs@34c6ded44899fd1bf74d2889558befd1750e61a7
+        with:
+          version: '31.1'
+
+      - name: Compile and test mode with bundled grammar
+        run: editors/emacs/tests/run-tests.sh
