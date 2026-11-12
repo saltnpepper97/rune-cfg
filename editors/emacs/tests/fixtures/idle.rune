@@ -1,0 +1,22 @@
+@description "Example idle-manager configuration"
+
+lock_after 300
+
+default:
+  monitor_media true
+  pre_suspend_command None
+  inhibit_apps [
+    "mpv"
+    r"steam_app_.*"
+  ]
+
+  lock_screen:
+    timeout lock_after
+    command "hyprlock"
+  end
+
+  suspend:
+    timeout 600
+    command "systemctl suspend"
+  end
+end

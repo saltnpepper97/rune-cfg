@@ -471,7 +471,9 @@ println!("{}", json);
 
 ## Editor Support
 
-RUNE includes Vim and Neovim runtime files, an experimental VS Code extension, and `rune-lsp` for diagnostics, completion, hover, navigation, rename, formatting, and schema-aware editor features.
+RUNE includes Vim and Neovim runtime files, an experimental VS Code extension,
+an [Emacs Tree-sitter mode](./editors/emacs/), and `rune-lsp` for diagnostics,
+completion, hover, navigation, rename, formatting, and schema-aware editor features.
 
 See [Language Server](./docs/language-server.md) for setup, capabilities, and editor-specific configuration.
 
