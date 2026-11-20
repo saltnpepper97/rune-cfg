@@ -27,8 +27,10 @@ syn match runeDollarReference "\$\(env\|sys\|runtime\|var\)\(\.[A-Za-z_][A-Za-z0
 
 syn match runeTopLevelObjectKey "^[A-Za-z_][A-Za-z0-9_-]*\ze\s*:"
 syn match runeObjectKey "^\s\+[A-Za-z_][A-Za-z0-9_-]*\ze\s*:"
-syn match runeKey "^\s*[A-Za-z_][A-Za-z0-9_-]*\ze\s*[= ]"
+syn match runeKey "^\s*\%(end\>\)\@![A-Za-z_][A-Za-z0-9_-]*\ze\s*[= ]"
 syn match runeObjectDelimiter "[:\[\]]"
+" The optional block name in `end <name>`.
+syn match runeEndLabel "\v(^\s*end\s+)@<=([A-Za-z_][A-Za-z0-9_-]*|\"([^\"\\]|\\.)*\")"
 
 hi def link runeComment Comment
 hi def link runeString Character
@@ -44,6 +46,7 @@ hi def link runeMetadata PreProc
 hi def link runeDollarReference Special
 hi def link runeTopLevelObjectKey Structure
 hi def link runeObjectKey Function
+hi def link runeEndLabel Function
 hi def link runeKey Identifier
 hi def link runeObjectDelimiter Delimiter
 
