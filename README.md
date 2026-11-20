@@ -196,12 +196,62 @@ app:
   if environment = "production":
     debug false
     workers 8
+  elseif environment in ["staging", "qa"]:
+    debug false
+    workers 4
   else:
     debug true
     workers 2
   end
 end
 ```
+
+A chain can have any number of `elseif` branches (`else-if` works too) and
+one optional `else`, all closed by a single `end`.
+
+#### Writing conditions
+
+Inline and block conditionals take the same conditions:
+
+| Condition | True when |
+|---|---|
+| `if debug` | `debug` is set to anything but `false` or `None` |
+| `if not debug` | the opposite of `if debug` |
+| `if env = "prod"` | `env` equals `"prod"` |
+| `if env != "prod"` | `env` is anything but `"prod"`, including unset |
+| `if env in ["dev", "qa"]` | `env` equals one of the listed values |
+| `if not env in ["dev", "qa"]` | `env` equals none of them |
+
+`not` goes in front of any condition. Comparisons are typed, so `8` and `"8"`
+are different values. The right-hand side can be a reference to another key,
+as in `if mode = default_mode`.
+
+A condition on its own, like `if debug`, is false only for `false`, `None`,
+or a key that does not exist. Every other value is true, including `0`, `""`,
+and `[]`. To test those, compare them: `if retries != 0`.
+
+A condition names a key by its full path, the same way a value reference
+does. A bare name means a top-level key, even inside a block, so use a dotted
+path to read a key from a block:
+
+```rune
+debug true
+
+app:
+  debug false
+  level if debug "trace" else "info"      # top-level debug -> "trace"
+  mode if app.debug "trace" else "info"   # app.debug       -> "info"
+end
+```
+
+Paths see into the branch an if-block actually takes, and read the final
+value of a key, after its own references and conditionals are resolved.
+
+Environment and system values work in conditions with or without `$`:
+`if $env.CI`, `if env.CI`, `if sys.os = "linux"`. An unset environment
+variable counts as a missing key, so `if $env.CI` is false when `CI` is not
+set. A set but empty variable is true, like any other string. `$var.name`
+reads a top-level key, the same as a bare `name`.
 
 ### Variable References
 
@@ -214,6 +264,9 @@ server:
   timeout default_timeout
 end
 ```
+
+A key that leads back to itself, directly or through other keys or
+conditions, is a reference cycle and reports error code 310 when read.
 
 ### Environment Variables
 
