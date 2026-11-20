@@ -8,6 +8,5 @@
 
 [
   "end"
-  "endif"
   "]"
 ] @indent.end

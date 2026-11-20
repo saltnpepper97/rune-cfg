@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Breaking:** block conditionals now close with `end`, like every other
+  block, instead of `endif`. `endif` is no longer a keyword, so existing
+  configs must replace each `endif` with `end`. Updated the parser, LSP
+  (diagnostics, completion, formatting), tree-sitter grammar, and the Vim,
+  Neovim, Emacs, and VS Code integrations to match.
 - Add an Emacs Tree-sitter major mode (`rune-cfg-ts-mode`) with highlighting,
   indentation, Imenu, section navigation, and optional Eglot registration for
   `rune-lsp`, plus an Emacs CI workflow.

@@ -122,7 +122,7 @@ module.exports = grammar({
         $._terminator,
         repeat(choice($._object_item, $._terminator)),
       )),
-      'endif',
+      'end',
     ),
 
     assignment: $ => seq(

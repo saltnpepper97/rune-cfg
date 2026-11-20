@@ -652,10 +652,6 @@
     "named": false
   },
   {
-    "type": "endif",
-    "named": false
-  },
-  {
     "type": "enum",
     "named": false
   },
@@ -717,11 +713,11 @@
   },
   {
     "type": "regex",
-    "named": false
+    "named": true
   },
   {
     "type": "regex",
-    "named": true
+    "named": false
   },
   {
     "type": "required",
@@ -737,11 +733,11 @@
   },
   {
     "type": "string",
-    "named": false
+    "named": true
   },
   {
     "type": "string",
-    "named": true
+    "named": false
   },
   {
     "type": "true",

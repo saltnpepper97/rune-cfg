@@ -40,7 +40,7 @@
       "patterns": [
         {
           "name": "keyword.control.runecfg",
-          "match": "\\b(?:gather|as|if|else|elseif|else-if|end|endif|schema|with)\\b"
+          "match": "\\b(?:gather|as|if|else|elseif|else-if|end|schema|with)\\b"
         },
         {
           "name": "storage.modifier.runecfg",

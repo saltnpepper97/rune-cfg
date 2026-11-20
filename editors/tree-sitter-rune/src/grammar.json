@@ -578,7 +578,7 @@
         },
         {
           "type": "STRING",
-          "value": "endif"
+          "value": "end"
         }
       ]
     },
