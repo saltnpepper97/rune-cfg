@@ -86,8 +86,3 @@ server and opt in with its absolute path:
 cargo build --locked --bin rune-lsp
 RUNE_LSP_TEST_BINARY="$PWD/target/debug/rune-lsp" editors/emacs/tests/run-tests.sh
 ```
-
-With `rune-lsp` 0.8.0, the opt-in test can report an Eglot shutdown warning:
-the server stays alive after the `exit` notification until stdin closes, so
-Eglot forcefully terminates it. This does not affect the connection or symbol
-request checked by the test.

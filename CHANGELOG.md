@@ -5,6 +5,9 @@
 - Add an Emacs Tree-sitter major mode (`rune-cfg-ts-mode`) with highlighting,
   indentation, Imenu, section navigation, and optional Eglot registration for
   `rune-lsp`, plus an Emacs CI workflow.
+- Make `rune-lsp` exit as soon as it handles the `exit` notification instead
+  of waiting for stdin to close, using exit code 1 when `shutdown` was never
+  requested.
 
 ## 0.8.0
 
