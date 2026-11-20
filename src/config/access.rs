@@ -197,7 +197,7 @@ impl RuneConfig {
         }
 
         // Build a unified "root" object that contains both globals and items as Assigns.
-        // This is crucial because block `if ... endif` can hide assignments inside ObjectItem::IfBlock,
+        // This is crucial because block `if ... end` can hide assignments inside ObjectItem::IfBlock,
         // and resolve_reference() cannot see those until we resolve/flatten the object.
         let mut root_items: Vec<ObjectItem> = Vec::new();
 
@@ -208,7 +208,7 @@ impl RuneConfig {
             root_items.push(ObjectItem::Assign(k.clone(), v.clone()));
         }
 
-        // Resolve + flatten everything (references, $env/$sys, inline if, and block if/endif).
+        // Resolve + flatten everything (references, $env/$sys, inline if, and block if/end).
         let resolved =
             helpers::resolve_value_recursively(&Value::Object(root_items), &temp_parser, main_doc)?;
 

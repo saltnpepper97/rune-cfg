@@ -336,7 +336,7 @@ where
 
 /// Convert an object `Value` to a map, **expecting the object to be fully-resolved**.
 ///
-/// With block `if ... endif` support, objects can contain conditional items. By the time you
+/// With block `if ... end` support, objects can contain conditional items. By the time you
 /// convert to a `HashMap`, those conditionals should have been evaluated and flattened into
 /// plain assignments.
 ///

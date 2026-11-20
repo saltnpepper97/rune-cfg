@@ -2345,11 +2345,9 @@ fn recovery_diagnostics(source: &SourceIndex) -> Vec<RuneDiagnostic> {
     }
 
     for closer in source.stray_closers() {
-        let keyword = closer.kind.keyword();
-        let diagnostic =
-            RuneDiagnostic::error(format!("Unexpected '{}' without open block", keyword))
-                .with_hint("Remove this closing keyword or add a matching block above");
-        positional.push((closer.span, diagnostic));
+        let diagnostic = RuneDiagnostic::error("Unexpected 'end' without open block")
+            .with_hint("Remove this closing keyword or add a matching block above");
+        positional.push((*closer, diagnostic));
     }
 
     for entry in source.entries() {
@@ -3192,7 +3190,7 @@ fn config_completion_items(
     }
 
     items.extend(
-        ["end", "if", "else", "endif", "gather"]
+        ["end", "if", "else", "gather"]
             .into_iter()
             .map(|label| keyword_completion(label, CompletionItemKind::KEYWORD)),
     );
@@ -3612,7 +3610,7 @@ enum LineRole<'a> {
 /// Re-indent a document to two spaces per nesting level.
 ///
 /// Object and conditional blocks both open with a trailing `:` and close with
-/// `end`/`endif`; `else`/`elseif` branches dedent for their own line and indent
+/// `end`; `else`/`elseif` branches dedent for their own line and indent
 /// what follows. Only leading indentation changes — trailing content (including
 /// inline comments) and blank lines are preserved, as is the final-newline state.
 ///
@@ -3641,7 +3639,7 @@ fn format_document(source: &SourceIndex) -> Option<String> {
     }
     for closer in source.stray_closers() {
         roles
-            .entry(lines.line_of(closer.span.start))
+            .entry(lines.line_of(closer.start))
             .or_insert(LineRole::Closer);
     }
 
@@ -3810,10 +3808,10 @@ end
         );
     }
 
-    /// A field completion after `endif` still knows it is inside the object the
+    /// A field completion after `end` still knows it is inside the object the
     /// conditional was nested in.
     #[test]
-    fn completion_after_endif_keeps_the_enclosing_object_scope() {
+    fn completion_after_if_block_end_keeps_the_enclosing_object_scope() {
         let schema = SchemaDocument::from_str(
             r#"
 schema app:
@@ -3826,7 +3824,7 @@ end
 "#,
         )
         .unwrap();
-        let source = SourceIndex::new("app:\n  if debug:\n    port 8080\n  endif\n  ");
+        let source = SourceIndex::new("app:\n  if debug:\n    port 8080\n  end\n  ");
 
         let completions =
             config_completion_items(Some(&schema), &source, Position::new(4, 2), &[], None);
@@ -3912,11 +3910,11 @@ end
 
     #[test]
     fn format_document_reindents_nested_blocks_and_conditionals() {
-        let messy = "app:\nname \"RuneApp\"\nserver:\nport 8080\nif debug:\nlevel \"high\"\nelse:\nlevel \"low\"\nendif\nend\nend\n";
+        let messy = "app:\nname \"RuneApp\"\nserver:\nport 8080\nif debug:\nlevel \"high\"\nelse:\nlevel \"low\"\nend\nend\nend\n";
         let formatted =
             format_document(&SourceIndex::new(messy)).expect("formatting should change the text");
 
-        let expected = "app:\n  name \"RuneApp\"\n  server:\n    port 8080\n    if debug:\n      level \"high\"\n    else:\n      level \"low\"\n    endif\n  end\nend\n";
+        let expected = "app:\n  name \"RuneApp\"\n  server:\n    port 8080\n    if debug:\n      level \"high\"\n    else:\n      level \"low\"\n    end\n  end\nend\n";
         assert_eq!(formatted, expected);
     }
 
@@ -3989,9 +3987,8 @@ end
     /// Document symbols follow the object stack through conditionals.
     #[test]
     fn document_symbols_skip_conditionals_and_keep_scope() {
-        let source = SourceIndex::new(
-            "app:\n  if debug:\n    feature true\n  endif\n  name \"Rune\"\nend\n",
-        );
+        let source =
+            SourceIndex::new("app:\n  if debug:\n    feature true\n  end\n  name \"Rune\"\nend\n");
         let names: Vec<String> = document_symbols(&source)
             .into_iter()
             .map(|symbol| symbol.name)

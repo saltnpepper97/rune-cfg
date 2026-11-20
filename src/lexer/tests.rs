@@ -194,10 +194,10 @@ fn comments_preserve_the_newline_statement_boundary() {
 }
 
 #[test]
-fn test_endif_token() {
+fn test_end_closes_if_block_tokens() {
     let input = r#"
 if something:
-endif
+end
 "#;
 
     let mut lexer = Lexer::new(input);
@@ -208,7 +208,7 @@ endif
         Token::Ident("something".into()),
         Token::Colon,
         Token::Newline,
-        Token::EndIf,
+        Token::End,
         Token::Newline,
         Token::Eof,
     ];
@@ -221,11 +221,11 @@ endif
 }
 
 #[test]
-fn test_else_and_endif_tokens() {
+fn test_else_and_end_tokens() {
     let input = r#"
 if something:
 else:
-endif
+end
 "#;
 
     let mut lexer = Lexer::new(input);
@@ -239,7 +239,7 @@ endif
         Token::Else,
         Token::Colon,
         Token::Newline,
-        Token::EndIf,
+        Token::End,
         Token::Newline,
         Token::Eof,
     ];

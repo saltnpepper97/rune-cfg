@@ -25,7 +25,6 @@ pub enum Token {
     RBracket,
 
     End,
-    EndIf,
 
     // --- symbols ---
     Dollar,
@@ -60,7 +59,6 @@ impl Token {
             Token::LBracket => "'['".into(),
             Token::RBracket => "']'".into(),
             Token::End => "'end'".into(),
-            Token::EndIf => "'endif'".into(),
             Token::Dollar => "'$'".into(),
             Token::Dot => "'.'".into(),
             Token::At => "'@'".into(),

@@ -12,7 +12,7 @@
 //!   rules and it never rejects input: a half-written editor buffer simply
 //!   yields the entries recognised so far.
 //!
-//! Conditional blocks (`if` / `else` / `elseif` / `endif`) describe layout and
+//! Conditional blocks (`if` / `else` / `elseif` / `end`) describe layout and
 //! control flow. They are recorded as entries of their own, they never become
 //! fields, and they never change the object path of the statements inside them.
 
@@ -234,7 +234,7 @@ pub(crate) enum SourceEntryKind {
     ConditionalHeader,
     /// `else:` or `elseif <condition>:`
     ConditionalBranch,
-    /// `endif`
+    /// The `end` that closes a conditional block
     ConditionalEnd,
     /// `@name value`
     Metadata,
@@ -259,28 +259,6 @@ impl SourceEntryKind {
     pub(crate) fn dedents(self) -> bool {
         matches!(self, Self::ConditionalEnd | Self::ConditionalBranch)
     }
-}
-
-/// A closing keyword with nothing to close.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StrayCloser {
-    End,
-    EndIf,
-}
-
-impl StrayCloser {
-    pub(crate) fn keyword(self) -> &'static str {
-        match self {
-            Self::End => "end",
-            Self::EndIf => "endif",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StrayCloserSpan {
-    pub(crate) kind: StrayCloser,
-    pub(crate) span: Span,
 }
 
 /// One structural entry of a buffer.
@@ -385,7 +363,8 @@ pub(crate) struct SourceIndex {
     lines: LineIndex,
     tokens: Vec<SpannedToken>,
     entries: Vec<SourceEntry>,
-    stray_closers: Vec<StrayCloserSpan>,
+    /// Spans of `end` keywords with no open block to close.
+    stray_closers: Vec<Span>,
     gathers: Vec<GatherDirective>,
     references: Vec<ReferenceRun>,
 }
@@ -419,7 +398,7 @@ impl SourceIndex {
         &self.entries
     }
 
-    pub(crate) fn stray_closers(&self) -> &[StrayCloserSpan] {
+    pub(crate) fn stray_closers(&self) -> &[Span] {
         &self.stray_closers
     }
 
@@ -956,7 +935,7 @@ struct IndexBuilder<'a> {
     cursor: usize,
     entries: Vec<SourceEntry>,
     frames: Vec<Frame>,
-    stray_closers: Vec<StrayCloserSpan>,
+    stray_closers: Vec<Span>,
     gathers: Vec<GatherDirective>,
 }
 
@@ -972,7 +951,7 @@ impl<'a> IndexBuilder<'a> {
         }
     }
 
-    fn build(mut self) -> (Vec<SourceEntry>, Vec<StrayCloserSpan>, Vec<GatherDirective>) {
+    fn build(mut self) -> (Vec<SourceEntry>, Vec<Span>, Vec<GatherDirective>) {
         self.run();
         (self.entries, self.stray_closers, self.gathers)
     }
@@ -984,8 +963,7 @@ impl<'a> IndexBuilder<'a> {
                 Token::Newline => self.cursor += 1,
                 Token::At => self.metadata(),
                 Token::Gather => self.gather_statement(),
-                Token::End => self.close_object(),
-                Token::EndIf => self.close_conditional(),
+                Token::End => self.close_block(),
                 Token::Else | Token::ElseIf => self.conditional_branch(),
                 Token::If if self.if_starts_block() => self.conditional_header(),
                 Token::Ident(_) | Token::String(_) => self.assignment_or_object(),
@@ -1095,12 +1073,7 @@ impl<'a> IndexBuilder<'a> {
                     self.scan_value();
                 }
             }
-            Token::Newline
-            | Token::End
-            | Token::EndIf
-            | Token::Else
-            | Token::ElseIf
-            | Token::Eof => return None,
+            Token::Newline | Token::End | Token::Else | Token::ElseIf | Token::Eof => return None,
             _ => {
                 self.scan_statement();
             }
@@ -1393,59 +1366,29 @@ impl<'a> IndexBuilder<'a> {
         });
     }
 
-    fn close_object(&mut self) {
+    /// `end` closes the innermost open block, whether an object or a
+    /// conditional.
+    fn close_block(&mut self) {
         let Some(keyword) = self.bump() else {
             return;
         };
 
         match self.frames.pop() {
             Some(Frame::Object { entry }) => self.entries[entry].close_span = Some(keyword.span),
-            // An `end` where a conditional is still open is a half-written
-            // buffer rather than an object close; closing the conditional keeps
-            // the enclosing object path intact for everything that follows.
-            Some(Frame::Conditional) => {}
-            None => self.stray_closers.push(StrayCloserSpan {
-                kind: StrayCloser::End,
-                span: keyword.span,
-            }),
-        }
-    }
-
-    fn close_conditional(&mut self) {
-        let Some(keyword) = self.bump() else {
-            return;
-        };
-
-        let scope = self.current_scope();
-        self.push_entry(SourceEntry {
-            kind: SourceEntryKind::ConditionalEnd,
-            scope: scope.clone(),
-            path: scope,
-            name: None,
-            key_span: keyword.span,
-            header_span: keyword.span,
-            value_span: None,
-            close_span: None,
-        });
-
-        if !self
-            .frames
-            .iter()
-            .any(|frame| matches!(frame, Frame::Conditional))
-        {
-            self.stray_closers.push(StrayCloserSpan {
-                kind: StrayCloser::EndIf,
-                span: keyword.span,
-            });
-            return;
-        }
-
-        // Close the innermost conditional, tolerating a buffer where an object
-        // opened inside it was never closed.
-        while let Some(frame) = self.frames.pop() {
-            if matches!(frame, Frame::Conditional) {
-                break;
+            Some(Frame::Conditional) => {
+                let scope = self.current_scope();
+                self.push_entry(SourceEntry {
+                    kind: SourceEntryKind::ConditionalEnd,
+                    scope: scope.clone(),
+                    path: scope,
+                    name: None,
+                    key_span: keyword.span,
+                    header_span: keyword.span,
+                    value_span: None,
+                    close_span: None,
+                });
             }
+            None => self.stray_closers.push(keyword.span),
         }
     }
 }
@@ -1460,7 +1403,7 @@ mod tests {
 
     /// `app:` with a conditional block, then an assignment that belongs to
     /// `app` rather than to the conditional.
-    const CONDITIONAL_CONFIG: &str = "app:\n  if debug:\n    feature true\n  else:\n    feature false\n  endif\n  name \"Rune\"\nend\n";
+    const CONDITIONAL_CONFIG: &str = "app:\n  if debug:\n    feature true\n  else:\n    feature false\n  end\n  name \"Rune\"\nend\n";
 
     #[test]
     fn line_index_counts_utf16_units() {
@@ -1516,7 +1459,7 @@ mod tests {
     }
 
     #[test]
-    fn conditional_headers_and_endif_are_not_fields() {
+    fn conditional_headers_and_if_block_end_are_not_fields() {
         let index = SourceIndex::new(CONDITIONAL_CONFIG);
         let names: Vec<String> = index
             .entries()
@@ -1533,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_survives_endif_and_branches() {
+    fn scope_survives_if_block_end_and_branches() {
         let index = SourceIndex::new(CONDITIONAL_CONFIG);
 
         // `name "Rune"` is line 6 and still belongs to `app`.
@@ -1682,13 +1625,8 @@ mod tests {
         assert_eq!(unclosed, vec!["app", "server"]);
         assert!(index.stray_closers().is_empty());
 
-        let stray = SourceIndex::new("name \"x\"\nend\nendif\n");
-        let keywords: Vec<&str> = stray
-            .stray_closers()
-            .iter()
-            .map(|closer| closer.kind.keyword())
-            .collect();
-        assert_eq!(keywords, vec!["end", "endif"]);
+        let stray = SourceIndex::new("name \"x\"\nend\n");
+        assert_eq!(stray.stray_closers(), &[Span::new(9, 12)]);
     }
 
     #[test]
@@ -1949,7 +1887,7 @@ mod tests {
     #[test]
     fn reference_runs_skip_keys_dollars_and_metadata() {
         let index = SourceIndex::new(
-            "@author rune\napp:\n  user $env.USER\n  hostname local\n  if debug:\n    level 1\n  endif\nend\n",
+            "@author rune\napp:\n  user $env.USER\n  hostname local\n  if debug:\n    level 1\n  end\nend\n",
         );
         let runs: Vec<Vec<String>> = index.references().iter().map(|run| run.names()).collect();
 

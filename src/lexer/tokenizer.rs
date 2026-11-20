@@ -242,7 +242,6 @@ fn tokenize_identifier_or_keyword(lexer: &mut Lexer) -> Result<Token, RuneError>
         "false" => Token::Bool(false),
 
         "end" => Token::End,
-        "endif" => Token::EndIf, // <-- NEW: closes if-blocks
 
         "gather" => Token::Gather,
         "as" => Token::As,
