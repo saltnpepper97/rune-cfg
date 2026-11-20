@@ -84,7 +84,7 @@
   (setq-local treesit-simple-indent-rules
               '((runecfg
                  ((parent-is "source_file") column-0 0)
-                 ((node-is "end\\|endif\\|else\\|elseif\\|else-if\\|]") parent-bol 0)
+                 ((node-is "end\\|else\\|elseif\\|else-if\\|]") parent-bol 0)
                  ((parent-is "object_block\\|schema_block\\|schema_object\\|if_block\\|array")
                   parent-bol rune-cfg-ts-mode-indent-offset))))
   (setq-local treesit-font-lock-settings
@@ -94,7 +94,7 @@
                :language 'runecfg :feature 'string
                '([(string) (regex)] @font-lock-string-face)
                :language 'runecfg :feature 'keyword
-               '(["end" "if" "else" "elseif" "else-if" "endif"
+               '(["end" "if" "else" "elseif" "else-if"
                   "gather" "as" "with" "schema" "required" "default" "range" "enum"]
                  @font-lock-keyword-face)
                :language 'runecfg :feature 'constant

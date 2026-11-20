@@ -20,7 +20,7 @@ RUNE is a configuration language designed to combine **readability, simplicity, 
 **Key Features:**
 - **Clean syntax** - Minimal and readable, no complex indentation rules
 - **Native regex** - First-class regex support with `r"pattern"` syntax
-- **Conditionals** - Inline `if/else` expressions *and* block-style `if / else / endif`
+- **Conditionals** - Inline `if/else` expressions *and* block-style `if / else / end`
 - **Memory-safe** - Written in Rust with strong type safety
 - **System integration** - Access environment variables with `$env` and system info with `$sys`
 - **Flexible keys** - Automatic `snake_case` and `kebab-case` handling
@@ -185,10 +185,11 @@ end
 
 #### 2. Block conditionals (inside objects)
 
-```rune
 For more complex configuration, RUNE supports **block-style conditionals**
-inside object blocks using `if / else / endif`
+inside object blocks using `if / else / end`. Like every other block, an
+if-block closes with `end`.
 
+```rune
 app:
   name "MyApp"
 
@@ -198,7 +199,7 @@ app:
   else:
     debug true
     workers 2
-  endif
+  end
 end
 ```
 

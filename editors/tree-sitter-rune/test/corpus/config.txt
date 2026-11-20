@@ -63,3 +63,31 @@ font "Inter" with size 14 weight 600
     value: (string)
     attributes: (inline_attributes
       (inline_attribute name: (identifier) value: (boolean)))))
+
+==================
+if block closed by end
+==================
+
+app:
+  if debug:
+    server:
+      port 8080
+    end
+  else:
+    level "info"
+  end
+  name "A"
+end
+
+---
+
+(source_file
+  (object_block
+    name: (identifier)
+    (if_block
+      condition: (condition)
+      (object_block
+        name: (identifier)
+        (assignment key: (identifier) value: (number)))
+      (assignment key: (identifier) value: (string)))
+    (assignment key: (identifier) value: (string))))
