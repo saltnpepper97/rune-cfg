@@ -1599,6 +1599,27 @@ fn key_location_ignores_conditional_headers_in_the_path() {
 }
 
 #[test]
+fn key_location_closes_scopes_at_labeled_ends() {
+    let config = "app:\n  server:\n    port 8080\n  end server\n  port 9090\nend app\nport 1\n";
+    let line = |key| helpers::find_config_location(key, config).0;
+
+    assert_eq!(line("app.server.port"), 3);
+    assert_eq!(line("app.port"), 5, "`end server` closes `server`");
+    assert_eq!(line("port"), 7, "`end app` closes `app`");
+}
+
+#[test]
+fn labeled_ends_load_like_bare_ones() {
+    let config = RuneConfig::from_str(
+        "app:\n  server:\n    port 8080\n  end server\n  name \"rune\"\nend app\n",
+    )
+    .expect("labeled ends parse");
+
+    assert_eq!(config.get::<u16>("app.server.port").unwrap(), 8080);
+    assert_eq!(config.get::<String>("app.name").unwrap(), "rune");
+}
+
+#[test]
 fn key_location_falls_back_to_the_last_path_segment() {
     let (line, column, snippet) =
         helpers::find_config_location("defaults.level", KEY_LOCATION_CONFIG);

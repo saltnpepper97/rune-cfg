@@ -973,11 +973,15 @@ impl RuneLanguageServer {
             && let Ok(schema) = SchemaDocument::from_str(&schema_text)
             && let Some(range) = schema_definition_range(&schema_text, &schema, path)
         {
-            occurrences.push(Occurrence {
-                uri: schema_uri.clone(),
-                range,
-                is_declaration: true,
-            });
+            // An `end <name>` label belongs to the declaration it closes.
+            let label = schema_end_label_range(&schema_text, &schema, path);
+            for range in std::iter::once(range).chain(label) {
+                occurrences.push(Occurrence {
+                    uri: schema_uri.clone(),
+                    range,
+                    is_declaration: true,
+                });
+            }
         }
 
         for config_uri in self.related_config_uris(schema_uri).await {
@@ -1871,8 +1875,8 @@ impl LanguageServer for RuneLanguageServer {
         }
 
         Ok(source
-            .field_key_at(position)
-            .map(|entry| PrepareRenameResponse::Range(source.key_range(entry))))
+            .field_name_at(position)
+            .map(|(_, span)| PrepareRenameResponse::Range(source.lines().range(span))))
     }
 
     async fn rename(&self, params: RenameParams) -> LspResult<Option<WorkspaceEdit>> {
@@ -3501,8 +3505,8 @@ fn schema_field_at_position(
     let offset = lines.position_to_byte(position)?;
 
     for block in &schema.blocks {
-        if block.name_span.touches(offset) {
-            return Some((vec![block.root.clone()], block.name_span));
+        if let Some(span) = touched_name(block.name_span, block.end_label_span, offset) {
+            return Some((vec![block.root.clone()], span));
         }
 
         let mut path = vec![block.root.clone()];
@@ -3521,8 +3525,8 @@ fn schema_field_at_offset(
 ) -> Option<(Vec<String>, Span)> {
     for field in fields {
         path.push(field.name.clone());
-        if field.name_span.touches(offset) {
-            return Some((path.clone(), field.name_span));
+        if let Some(span) = touched_name(field.name_span, field.end_label_span, offset) {
+            return Some((path.clone(), span));
         }
         if let Some(found) = schema_field_at_offset(&field.fields, path, offset) {
             return Some(found);
@@ -3531,6 +3535,35 @@ fn schema_field_at_offset(
     }
 
     None
+}
+
+/// The name span under `offset`: a schema block's or field's own name, or the
+/// label of the `end <name>` closing it.
+fn touched_name(name_span: Span, end_label_span: Option<Span>, offset: usize) -> Option<Span> {
+    [Some(name_span), end_label_span]
+        .into_iter()
+        .flatten()
+        .find(|span| span.touches(offset))
+}
+
+/// Range of the `end <name>` label closing the schema block or object field at
+/// `path`, when it has one.
+fn schema_end_label_range(
+    schema_text: &str,
+    schema: &SchemaDocument,
+    path: &[String],
+) -> Option<Range> {
+    let span = if path.len() == 1 {
+        schema
+            .blocks
+            .iter()
+            .find(|block| block.root == path[0])?
+            .end_label_span?
+    } else {
+        find_field_by_path(schema, path)?.end_label_span?
+    };
+
+    Some(LineIndex::new(schema_text).range(span))
 }
 
 fn schema_definition_range(
@@ -3582,11 +3615,14 @@ fn rename_collision(path: &[String], candidate: &[String]) -> tower_lsp::jsonrpc
 /// Paths come from the structural index, so a key nested in a conditional is
 /// matched at its enclosing object path and a same-named key in another object
 /// is not matched at all.
+/// Every range naming `target_path`: each key, plus each `end <name>` label
+/// repeating an object's name.
 fn references_in_document(source: &SourceIndex, target_path: &[String]) -> Vec<Range> {
     source
         .entries_with_path(target_path)
         .into_iter()
-        .map(|entry| source.key_range(entry))
+        .flat_map(|entry| source.name_spans(entry))
+        .map(|span| source.lines().range(span))
         .collect()
 }
 
@@ -3909,6 +3945,63 @@ end
     }
 
     #[test]
+    fn references_include_matching_end_labels_only() {
+        let text = "app:\n  server:\n    port 8080\n  end server\nend app\nother:\nend\n";
+        let source = SourceIndex::new(text);
+
+        let ranges = references_in_document(&source, &["app".into(), "server".into()]);
+        assert_eq!(
+            ranges,
+            vec![
+                Range::new(Position::new(1, 2), Position::new(1, 8)),
+                Range::new(Position::new(3, 6), Position::new(3, 12)),
+            ]
+        );
+
+        // The label is a handle on the block it closes, for rename too.
+        assert_eq!(
+            source
+                .field_key_at(Position::new(3, 8))
+                .map(|entry| entry.path.clone()),
+            Some(vec!["app".to_string(), "server".to_string()])
+        );
+        assert_eq!(
+            source
+                .field_name_at(Position::new(4, 5))
+                .map(|(_, span)| source.lines().range(span)),
+            Some(Range::new(Position::new(4, 4), Position::new(4, 7)))
+        );
+
+        // A label naming some other block is not an occurrence of it.
+        let mismatched = SourceIndex::new("app:\nend other\nother:\nend\n");
+        assert_eq!(
+            references_in_document(&mismatched, &["other".into()]),
+            vec![Range::new(Position::new(2, 0), Position::new(2, 5))]
+        );
+    }
+
+    #[test]
+    fn end_labels_are_not_indexed_as_keys() {
+        let source = SourceIndex::new("app:\n  server:\n  end server\nend wrong\n");
+
+        assert!(recovery_diagnostics(&source).is_empty());
+        assert_eq!(source.entries().len(), 2);
+        assert!(source.unclosed_objects().is_empty());
+    }
+
+    #[test]
+    fn format_document_keeps_end_labels() {
+        let messy = "app:\nserver:\nport 8080\nend server # inner\nend app\n";
+        let formatted = format_document(&SourceIndex::new(messy)).expect("reindents");
+
+        assert_eq!(
+            formatted,
+            "app:\n  server:\n    port 8080\n  end server # inner\nend app\n"
+        );
+        assert_eq!(format_document(&SourceIndex::new(&formatted)), None);
+    }
+
+    #[test]
     fn format_document_reindents_nested_blocks_and_conditionals() {
         let messy = "app:\nname \"RuneApp\"\nserver:\nport 8080\nif debug:\nlevel \"high\"\nelse:\nlevel \"low\"\nend\nend\nend\n";
         let formatted =
@@ -3945,6 +4038,25 @@ end
         );
         // Cursor on the value: nothing renameable.
         assert!(source.field_key_at(Position::new(1, 9)).is_none());
+    }
+
+    #[test]
+    fn schema_end_labels_resolve_to_their_declaration() {
+        let text = "schema app:\n  server:\n    port int\n  end server\nend app\n";
+        let schema = SchemaDocument::from_str(text).unwrap();
+
+        assert_eq!(
+            schema_field_name_range(text, Position::new(3, 7)),
+            Some(Range::new(Position::new(3, 6), Position::new(3, 12)))
+        );
+        assert_eq!(
+            schema_field_at_position(text, &schema, Position::new(4, 5)).map(|(path, _)| path),
+            Some(vec!["app".to_string()])
+        );
+        assert_eq!(
+            schema_end_label_range(text, &schema, &["app".into(), "server".into()]),
+            Some(Range::new(Position::new(3, 6), Position::new(3, 12)))
+        );
     }
 
     /// The schema rename range comes from the field-name token, never from the

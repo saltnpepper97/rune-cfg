@@ -281,6 +281,9 @@ pub(crate) struct SourceEntry {
     pub(crate) value_span: Option<Span>,
     /// Bytes of the `end` closing an object; `None` while it is unclosed.
     pub(crate) close_span: Option<Span>,
+    /// Bytes of the name in `end <name>` when it repeats this object's name,
+    /// narrowed like `key_span` so a rename can rewrite both together.
+    pub(crate) close_label_span: Option<Span>,
 }
 
 /// One `gather` statement: the file it names, the alias it binds, and the two
@@ -483,10 +486,28 @@ impl SourceIndex {
 
     /// The field whose key token the cursor intersects.
     pub(crate) fn field_key_at(&self, position: Position) -> Option<&SourceEntry> {
+        self.field_name_at(position).map(|(entry, _)| entry)
+    }
+
+    /// The field whose name is under the cursor, with the span of that name:
+    /// its key, or the label of an `end <name>` closing it.
+    pub(crate) fn field_name_at(&self, position: Position) -> Option<(&SourceEntry, Span)> {
         let offset = self.offset_at(position)?;
         self.entries
             .iter()
-            .find(|entry| entry.kind.is_field() && entry.key_span.touches(offset))
+            .filter(|entry| entry.kind.is_field())
+            .find_map(|entry| {
+                [Some(entry.key_span), entry.close_label_span]
+                    .into_iter()
+                    .flatten()
+                    .find(|span| span.touches(offset))
+                    .map(|span| (entry, span))
+            })
+    }
+
+    /// Every span naming `entry`: its key, then the label of its `end`.
+    pub(crate) fn name_spans<'e>(&self, entry: &'e SourceEntry) -> impl Iterator<Item = Span> + 'e {
+        std::iter::once(entry.key_span).chain(entry.close_label_span)
     }
 
     /// The full token span of an entry's quoted value: the string token that
@@ -1147,6 +1168,7 @@ impl<'a> IndexBuilder<'a> {
                     header_span,
                     value_span: None,
                     close_span: None,
+                    close_label_span: None,
                 });
                 self.frames.push(Frame::Object {
                     entry: self.entries.len() - 1,
@@ -1192,6 +1214,7 @@ impl<'a> IndexBuilder<'a> {
             header_span,
             value_span,
             close_span: None,
+            close_label_span: None,
         });
     }
 
@@ -1230,6 +1253,7 @@ impl<'a> IndexBuilder<'a> {
             header_span,
             value_span,
             close_span: None,
+            close_label_span: None,
         });
     }
 
@@ -1314,6 +1338,7 @@ impl<'a> IndexBuilder<'a> {
             header_span: statement_span,
             value_span,
             close_span: None,
+            close_label_span: None,
         });
     }
 
@@ -1338,6 +1363,7 @@ impl<'a> IndexBuilder<'a> {
             header_span,
             value_span: None,
             close_span: None,
+            close_label_span: None,
         });
         self.frames.push(Frame::Conditional);
     }
@@ -1363,18 +1389,34 @@ impl<'a> IndexBuilder<'a> {
             header_span,
             value_span: None,
             close_span: None,
+            close_label_span: None,
         });
     }
 
     /// `end` closes the innermost open block, whether an object or a
     /// conditional.
+    ///
+    /// A name after `end` on the same line is its label, as in `end server`.
+    /// It is consumed whatever it says, so it is never indexed as a key; only
+    /// a label repeating the object's own name is recorded. The strict parser
+    /// reports any other label.
     fn close_block(&mut self) {
         let Some(keyword) = self.bump() else {
             return;
         };
+        let label = match self.peek_token() {
+            Some(Token::Ident(_) | Token::String(_)) => self.bump(),
+            _ => None,
+        };
 
         match self.frames.pop() {
-            Some(Frame::Object { entry }) => self.entries[entry].close_span = Some(keyword.span),
+            Some(Frame::Object { entry }) => {
+                let object = &mut self.entries[entry];
+                object.close_span = Some(keyword.span);
+                object.close_label_span = label
+                    .filter(|label| token_name(&label.token) == object.name)
+                    .map(key_span_of);
+            }
             Some(Frame::Conditional) => {
                 let scope = self.current_scope();
                 self.push_entry(SourceEntry {
@@ -1386,6 +1428,7 @@ impl<'a> IndexBuilder<'a> {
                     header_span: keyword.span,
                     value_span: None,
                     close_span: None,
+                    close_label_span: None,
                 });
             }
             None => self.stray_closers.push(keyword.span),

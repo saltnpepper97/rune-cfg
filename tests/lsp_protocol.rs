@@ -4978,3 +4978,109 @@ async fn duplicate_keys_warn_without_schema_and_error_with_schema() {
     assert_eq!(config.diagnostics[0]["code"], 660);
     assert_eq!(config.diagnostics[0]["severity"], 1);
 }
+
+/// A schema and config that close their blocks with `end <name>` labels.
+const LABELED_SCHEMA: &str = "schema app:\n  server:\n    port int\n  end server\nend app\n";
+const LABELED_CONFIG: &str = "app:\n  server:\n    port 8080\n  end server\nend app\n";
+
+/// An `end <name>` label is part of the block it closes: the labeled files
+/// publish no diagnostics, and renaming the block from its label rewrites the
+/// schema and config names and labels together.
+#[tokio::test]
+async fn end_labels_follow_their_block_through_rename() {
+    let mut harness = LspHarness::start().await;
+    let schema_uri = harness.document_uri("schema.rune");
+    let config_uri = harness.document_uri("config.rune");
+
+    harness.did_open(&schema_uri, LABELED_SCHEMA).await;
+    harness.did_open(&config_uri, LABELED_CONFIG).await;
+    let published = harness.collect_diagnostics().await;
+    for uri in [&schema_uri, &config_uri] {
+        assert!(
+            diagnostics_for(&published, uri, Some(1))
+                .diagnostics
+                .is_empty(),
+            "labeled ends parse cleanly: {published:#?}"
+        );
+    }
+    harness.discard_server_messages().await;
+
+    // Line 3 is `  end server`; character 8 sits inside the label.
+    let prepare = harness
+        .request(
+            "textDocument/prepareRename",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 3, "character": 8 },
+            }),
+        )
+        .await;
+    assert_eq!(
+        prepare,
+        json!({
+            "start": { "line": 3, "character": 6 },
+            "end": { "line": 3, "character": 12 },
+        }),
+        "the label itself is the rename range"
+    );
+
+    let rename = harness
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": config_uri },
+                "position": { "line": 3, "character": 8 },
+                "newName": "backend",
+            }),
+        )
+        .await;
+    let changes = rename["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("rename must return a workspace edit, got {rename}"));
+    let lines_edited = |uri: &Url| -> Vec<u64> {
+        let mut lines: Vec<u64> = changes[uri.as_str()]
+            .as_array()
+            .unwrap()
+            .iter()
+            .inspect(|edit| assert_eq!(edit["newText"], json!("backend")))
+            .map(|edit| edit["range"]["start"]["line"].as_u64().unwrap())
+            .collect();
+        lines.sort();
+        lines
+    };
+    assert_eq!(
+        lines_edited(&schema_uri),
+        vec![1, 3],
+        "schema name and label: {rename}"
+    );
+    assert_eq!(
+        lines_edited(&config_uri),
+        vec![1, 3],
+        "config key and label: {rename}"
+    );
+}
+
+/// A label that names another block is reported where it is written.
+#[tokio::test]
+async fn mismatched_end_label_is_reported_on_its_line() {
+    let mut harness = LspHarness::start().await;
+    let uri = harness.document_uri("config.rune");
+
+    harness
+        .did_open(&uri, "app:\n  server:\n    port 8080\n  end client\nend\n")
+        .await;
+    let published = harness.collect_diagnostics().await;
+    let diagnostics = &diagnostics_for(&published, &uri, Some(1)).diagnostics;
+
+    let diagnostic = diagnostic_with_message(diagnostics, "'end client'");
+    assert_eq!(
+        diagnostic["range"]["start"]["line"],
+        json!(3),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "the label is not also reported as a key without a value: {diagnostics:#?}"
+    );
+}

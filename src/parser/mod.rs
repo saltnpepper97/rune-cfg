@@ -87,6 +87,34 @@ impl<'a> Parser<'a> {
         Ok(token)
     }
 
+    /// Consume the optional label after the `end` closing block `name`, as in
+    /// `end server`, and reject a label naming any other block.
+    ///
+    /// Newlines are tokens, so a label is only ever read from the `end` line.
+    pub(crate) fn finish_block_end(&mut self, name: &str) -> Result<(), RuneError> {
+        let label = match self.peek() {
+            Some(Token::Ident(label) | Token::String(label)) => label.clone(),
+            _ => return Ok(()),
+        };
+
+        if label != name {
+            let (line, column) = self.token_position();
+            return Err(RuneError::SyntaxError {
+                message: format!("'end {}' does not match the open block '{}'", label, name),
+                line,
+                column,
+                hint: Some(format!(
+                    "Close '{}' with 'end {}' or a bare 'end'",
+                    name, name
+                )),
+                code: Some(219),
+            });
+        }
+
+        self.bump()?;
+        Ok(())
+    }
+
     pub(crate) fn line(&self) -> usize {
         self.lexer.line()
     }

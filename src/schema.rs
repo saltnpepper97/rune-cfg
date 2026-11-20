@@ -17,6 +17,8 @@ pub struct SchemaBlock {
     pub fields: Vec<SchemaField>,
     pub line: usize,
     pub(crate) name_span: Span,
+    /// Name span of the optional label in `end <name>`.
+    pub(crate) end_label_span: Option<Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +32,9 @@ pub struct SchemaField {
     pub fields: Vec<SchemaField>,
     pub line: usize,
     pub(crate) name_span: Span,
+    /// Name span of the optional label in `end <name>`; only object fields
+    /// have one.
+    pub(crate) end_label_span: Option<Span>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -138,12 +143,13 @@ impl<'a> SchemaParser<'a> {
                     )?;
                     self.expect_boundary("Expected end of schema declaration", "Use: schema app:")?;
                     let line = self.line_of(name_span);
-                    let fields = self.parse_fields()?;
+                    let (fields, end_label_span) = self.parse_fields(&root)?;
                     blocks.push(SchemaBlock {
                         root,
                         fields,
                         line,
                         name_span,
+                        end_label_span,
                     });
                 }
                 _ => {
@@ -162,7 +168,9 @@ impl<'a> SchemaParser<'a> {
         Ok(SchemaDocument { blocks })
     }
 
-    fn parse_fields(&mut self) -> Result<Vec<SchemaField>, RuneError> {
+    /// Parse the fields of block `name` through its closing `end`, returning
+    /// them with the span of the optional `end name` label.
+    fn parse_fields(&mut self, name: &str) -> Result<(Vec<SchemaField>, Option<Span>), RuneError> {
         let mut fields = Vec::new();
 
         loop {
@@ -172,11 +180,12 @@ impl<'a> SchemaParser<'a> {
             match token.token {
                 Token::End => {
                     self.take();
+                    let end_label_span = self.end_label(name)?;
                     self.expect_boundary(
                         "Expected end of schema block",
                         "Close schema blocks with 'end'",
                     )?;
-                    return Ok(fields);
+                    return Ok((fields, end_label_span));
                 }
                 Token::Eof => {
                     return Err(self.error_at(
@@ -202,7 +211,7 @@ impl<'a> SchemaParser<'a> {
         if self.peek()?.token == Token::Colon {
             self.take();
             self.expect_boundary("Expected newline after object field ':'", "Use: server:")?;
-            let fields = self.parse_fields()?;
+            let (fields, end_label_span) = self.parse_fields(&name)?;
             return Ok(SchemaField {
                 name,
                 kind: SchemaType::Object,
@@ -213,6 +222,7 @@ impl<'a> SchemaParser<'a> {
                 fields,
                 line,
                 name_span,
+                end_label_span,
             });
         }
 
@@ -269,6 +279,7 @@ impl<'a> SchemaParser<'a> {
             fields: Vec::new(),
             line,
             name_span,
+            end_label_span: None,
         })
     }
 
@@ -432,6 +443,33 @@ impl<'a> SchemaParser<'a> {
         };
         let name_span = if quoted { span.inner() } else { span };
         Ok((name, name_span))
+    }
+
+    /// Consume the optional label after the `end` closing block `name`, as in
+    /// `end server`, returning its name span. A label naming any other block
+    /// is an error.
+    fn end_label(&mut self, name: &str) -> Result<Option<Span>, RuneError> {
+        let token = self.peek()?.clone();
+        let label = match &token.token {
+            Token::Ident(label) | Token::String(label) => label.clone(),
+            _ => return Ok(None),
+        };
+
+        if label != name {
+            return Err(self.error_at(
+                &token,
+                format!("'end {}' does not match the open block '{}'", label, name),
+                format!("Close '{}' with 'end {}' or a bare 'end'", name, name),
+            ));
+        }
+
+        self.take();
+        let quoted = matches!(token.token, Token::String(_));
+        Ok(Some(if quoted {
+            token.span.inner()
+        } else {
+            token.span
+        }))
     }
 
     fn expect_token(
@@ -648,6 +686,41 @@ end
         assert_eq!(schema.blocks[0].root, "app");
         assert_eq!(schema.blocks[0].fields.len(), 5);
         assert_eq!(schema.blocks[0].fields[3].kind, SchemaType::Object);
+    }
+
+    #[test]
+    fn schema_blocks_and_objects_accept_end_labels() {
+        let source = "schema app:\n  server:\n    port int\n  end server\n  name string\nend app\n";
+        let schema = SchemaDocument::from_str(source).expect("labeled schema should parse");
+        let bare = SchemaDocument::from_str(
+            &source
+                .replace("end server", "end")
+                .replace("end app", "end"),
+        )
+        .expect("bare schema should parse");
+
+        assert_eq!(schema, bare);
+        let label = |span: Option<Span>| span.map(|span| &source[span.start..span.end]);
+        assert_eq!(label(schema.blocks[0].end_label_span), Some("app"));
+        assert_eq!(
+            label(schema.blocks[0].fields[0].end_label_span),
+            Some("server")
+        );
+        assert_eq!(label(bare.blocks[0].end_label_span), None);
+    }
+
+    #[test]
+    fn schema_end_label_must_match_its_block() {
+        let error =
+            SchemaDocument::from_str("schema app:\n  server:\n    port int\n  end app\nend\n")
+                .expect_err("a mismatched label must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("'end app' does not match the open block 'server'"),
+            "{error}"
+        );
     }
 
     #[test]
