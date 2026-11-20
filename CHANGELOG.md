@@ -7,6 +7,9 @@
   configs must replace each `endif` with `end`. Updated the parser, LSP
   (diagnostics, completion, formatting), tree-sitter grammar, and the Vim,
   Neovim, Emacs, and VS Code integrations to match.
+- Pin the Emacs mode's grammar install recipe to the `end`-closing grammar
+  revision, so `rune-cfg-ts-mode-install-grammar` no longer builds a grammar
+  that still expects `endif`.
 - Report the correct line for keys inside or after block conditionals in
   type, validation, and lookup errors. `if`/`else`/`elseif` headers no longer
   count as part of a key's path, and an exact path match takes priority over
