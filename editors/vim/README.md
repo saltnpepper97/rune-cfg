@@ -23,7 +23,8 @@ The syntax file distinguishes:
 - top-level object blocks, such as `app:`
 - nested object blocks, such as `server:`
 - assignment keys, such as `port`
-- the `end` keyword that closes object and conditional blocks
+- the `end` keyword that closes object and conditional blocks, and the optional
+  block name after it (`end server`)
 - strings, regex literals, numbers, booleans, nulls, metadata, schema keywords, and `$env`/`$sys` references
 
 For LSP diagnostics, completion, hover, navigation, rename, and formatting, install `rune-lsp` and configure your editor to launch it:
