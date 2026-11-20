@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add an Emacs Tree-sitter major mode (`rune-cfg-ts-mode`) with highlighting,
+  indentation, Imenu, section navigation, and optional Eglot registration for
+  `rune-lsp`, plus an Emacs CI workflow.
+
 ## 0.8.0
 
 - Add `ParseOptions`, opt-in literal quoted references, and strict environment
