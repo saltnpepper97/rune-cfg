@@ -721,6 +721,7 @@ impl RuneLanguageServer {
             SchemaBinding::Found(schema_source) => schema_source,
             binding => {
                 let mut diagnostics = self.schema_binding_diagnostics(uri, source, &binding).await;
+                diagnostics.extend(config.resolution_diagnostics());
                 diagnostics.extend(config.duplicate_key_diagnostics_with_source(source));
                 return diagnostics
                     .into_iter()

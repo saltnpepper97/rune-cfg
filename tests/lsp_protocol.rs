@@ -5084,3 +5084,42 @@ async fn mismatched_end_label_is_reported_on_its_line() {
         "the label is not also reported as a key without a value: {diagnostics:#?}"
     );
 }
+
+/// A reference cycle in an open config is reported as itself, with or without
+/// a schema, and the server keeps answering requests: resolving the cycle used
+/// to overflow the stack.
+#[tokio::test]
+async fn reference_cycle_is_a_diagnostic_not_a_crash() {
+    const CYCLE: &str = "app:\n  name if app.name \"a\" else \"b\"\nend\n";
+    let mut harness = LspHarness::start().await;
+    let config_uri = harness.document_uri("config.rune");
+    let schema_uri = harness.document_uri("schema.rune");
+
+    // No schema yet.
+    harness.did_open(&config_uri, CYCLE).await;
+    let published = harness.collect_diagnostics().await;
+    let diagnostics = &diagnostics_for(&published, &config_uri, Some(1)).diagnostics;
+    let cycle = diagnostic_with_message(diagnostics, "Reference cycle");
+    assert_eq!(cycle["code"], json!(310), "{diagnostics:#?}");
+
+    // With a schema: the cycle, not a missing root.
+    harness.did_open(&schema_uri, SCHEMA_STRING_FIELD).await;
+    harness.replace_document(&config_uri, 2, CYCLE).await;
+    let published = harness.collect_diagnostics().await;
+    let diagnostics = &diagnostics_for(&published, &config_uri, Some(2)).diagnostics;
+    diagnostic_with_message(diagnostics, "Reference cycle");
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == json!(650)),
+        "an unresolvable config is not reported as missing its root: {diagnostics:#?}"
+    );
+
+    let symbols = harness
+        .request(
+            "textDocument/documentSymbol",
+            json!({ "textDocument": { "uri": config_uri } }),
+        )
+        .await;
+    assert_eq!(symbol_names(&symbols), vec!["app", "app.name"]);
+}

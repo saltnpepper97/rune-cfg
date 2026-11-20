@@ -92,6 +92,33 @@ impl RuneConfig {
     /// Diagnostics carry the exact key spans of `raw_content`; the language
     /// server uses [`RuneConfig::validate_schema_with_source`] so the index it
     /// already built for the buffer is the one the ranges come from.
+    /// Why this config's values cannot be resolved, such as a reference
+    /// cycle; empty when they can.
+    pub(crate) fn resolution_diagnostics(&self) -> Vec<RuneDiagnostic> {
+        let Err(error) = self.resolved_root() else {
+            return Vec::new();
+        };
+
+        let diagnostic = match error {
+            RuneError::RuntimeError {
+                message,
+                hint,
+                code,
+            } => {
+                let mut diagnostic = RuneDiagnostic::error(message);
+                if let Some(hint) = hint {
+                    diagnostic = diagnostic.with_hint(hint);
+                }
+                if let Some(code) = code {
+                    diagnostic = diagnostic.with_code(code);
+                }
+                diagnostic
+            }
+            other => RuneDiagnostic::error(other.to_string()),
+        };
+        vec![diagnostic]
+    }
+
     pub fn validate_schema(&self, schema: &SchemaDocument) -> Vec<RuneDiagnostic> {
         let source = SourceIndex::new(&self.raw_content);
         self.validate_schema_with_source(schema, &source)
@@ -115,6 +142,13 @@ impl RuneConfig {
             self.raw_content.as_str(),
             "schema validation must use the source index of the config's own text"
         );
+
+        // A config whose values cannot be resolved has nothing to validate:
+        // every field would read as missing. Report why instead.
+        let unresolved = self.resolution_diagnostics();
+        if !unresolved.is_empty() {
+            return unresolved;
+        }
 
         let snapshot = ValidationSnapshot::build(self, source);
         let mut diagnostics = self.duplicate_key_diagnostics_with_source(source);

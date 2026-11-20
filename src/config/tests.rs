@@ -1307,10 +1307,10 @@ end
 }
 
 #[test]
-fn unresolved_root_reports_the_schema_root_as_missing() {
-    // A config whose root does not resolve makes `get_value` report every path
-    // as missing. Validation keeps that behavior: it reports the schema root
-    // instead of the fields that happen to resolve on their own.
+fn unresolved_root_reports_why_it_does_not_resolve() {
+    // A config whose root does not resolve makes `get_value` fail for every
+    // path with the resolution error. Validation reports that same error once,
+    // instead of the schema root or the fields that resolve on their own.
     let config_text = r#"value $var.nope
 app:
   name "RuneApp"
@@ -1323,13 +1323,19 @@ end
 
     let (config, diagnostics) = indexed_schema_diagnostics(config_text, schema_text);
 
-    assert!(config.get_value("app").is_err());
+    assert!(matches!(
+        config.get::<String>("app.name"),
+        Err(RuneError::RuntimeError {
+            code: Some(309),
+            ..
+        })
+    ));
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
     assert_eq!(
         diagnostics[0].message,
-        "Required schema root 'app' is missing"
+        "Variable 'nope' not found for $var reference"
     );
-    assert_eq!(diagnostics[0].code, Some(650));
+    assert_eq!(diagnostics[0].code, Some(309));
     assert_eq!(diagnostics[0].range, None);
 }
 
