@@ -75,9 +75,14 @@ impl RuneConfig {
     ///
     /// Allows flexible key access: `monitor_media` and `monitor-media` both work.
     fn get_value_flexible(&self, path: &str) -> Result<Value, RuneError> {
-        // Fast path: exact
-        if let Ok(v) = self.get_value(path) {
-            return Ok(v);
+        // Fast path: exact. Only a missing key is worth retrying under another
+        // spelling; any other failure, such as a reference cycle, is the answer.
+        match self.get_value(path) {
+            Ok(v) => return Ok(v),
+            Err(RuneError::SyntaxError {
+                code: Some(304), ..
+            }) => {}
+            Err(error) => return Err(error),
         }
 
         // Root path special case handled by get_value("") already
@@ -162,7 +167,7 @@ impl RuneConfig {
     /// and flattened a single time, then cached in `self.resolved_root`. Every value lookup
     /// reuses this, turning what used to be a full-document deep-clone + recursive resolve
     /// *per key access* into a single resolve for the lifetime of the instance.
-    fn resolved_root(&self) -> Result<&Value, RuneError> {
+    pub(super) fn resolved_root(&self) -> Result<&Value, RuneError> {
         use crate::ast::ObjectItem;
 
         if let Some(resolved) = self.resolved_root.get() {

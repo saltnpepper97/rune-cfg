@@ -241,50 +241,201 @@ fn column_for_token(line: &str, token: &str) -> usize {
 /// Schema validation uses this same evaluator for its location snapshot, so an
 /// `if`/`elseif`/`else` chain selects one branch for values and diagnostics
 /// alike.
+///
+/// A path's value is resolved fully first, through references, inline
+/// conditionals and active if-block branches, so a condition sees what reading
+/// that key would return. A missing key reads as `null`: only `false` and
+/// `null` are false, and `0`, `""` and `[]` are true.
 pub(super) fn condition_is_met(
     condition: &crate::ast::Condition,
     parser: &parser::Parser,
     doc: &Document,
-) -> bool {
-    use crate::resolver;
+) -> Result<bool, RuneError> {
+    use crate::ast::Condition;
 
-    fn resolve_path_value(parser: &parser::Parser, doc: &Document, path: &str) -> Option<Value> {
-        let segs: Vec<String> = path.split('.').map(String::from).collect();
+    // A path lookup can re-enter this evaluator through an if-block on the
+    // path, so conditions count toward the cycle limit too.
+    let _depth = ResolutionDepth::enter()?;
 
-        if segs.len() >= 2 {
-            match segs[0].as_str() {
-                "env" | "sys" | "runtime" => resolver::parse_dollar_reference(segs).ok(),
-                "var" => parser.resolve_reference(&segs[1..], doc).cloned(),
-                _ => parser.resolve_reference(&segs, doc).cloned(),
+    let value = |path: &str| -> Result<Value, RuneError> {
+        Ok(condition_value(parser, doc, path)?.unwrap_or(Value::Null))
+    };
+    let operand = |expected: &Value| resolve_value_recursively(expected, parser, doc);
+
+    Ok(match condition {
+        Condition::Truthy(path) => is_truthy(&value(path)?),
+        Condition::Not(inner) => !condition_is_met(inner, parser, doc)?,
+        Condition::Equals(path, expected) => values_equal(&value(path)?, &operand(expected)?),
+        Condition::NotEquals(path, expected) => !values_equal(&value(path)?, &operand(expected)?),
+        Condition::In(path, options) => {
+            let actual = value(path)?;
+            let mut found = false;
+            for option in options {
+                if values_equal(&actual, &operand(option)?) {
+                    found = true;
+                    break;
+                }
             }
-        } else {
-            parser.resolve_reference(&segs, doc).cloned()
+            found
+        }
+        Condition::Exists(path) => condition_value(parser, doc, path)?.is_some(),
+        Condition::NotExists(path) => condition_value(parser, doc, path)?.is_none(),
+    })
+}
+
+/// Ruby/Lua truthiness: only `false` and `null` are false.
+fn is_truthy(value: &Value) -> bool {
+    !matches!(value.primary(), Value::Bool(false) | Value::Null)
+}
+
+/// Equality on primary values, ignoring any `with` attributes.
+fn values_equal(actual: &Value, expected: &Value) -> bool {
+    actual.primary() == expected.primary()
+}
+
+/// The fully resolved value of a condition path, or `None` when the path is
+/// not defined. An unset environment variable or unknown system key is not
+/// defined either.
+fn condition_value(
+    parser: &parser::Parser,
+    doc: &Document,
+    path: &str,
+) -> Result<Option<Value>, RuneError> {
+    let segs: Vec<String> = path.split('.').map(String::from).collect();
+
+    let raw = match segs[0].as_str() {
+        // An unset variable is missing, not the empty string a value
+        // reference would read in non-strict mode.
+        "env" if segs.len() == 2 => return Ok(std::env::var(&segs[1]).ok().map(Value::String)),
+        "env" | "sys" | "runtime" if segs.len() >= 2 => {
+            return Ok(crate::resolver::parse_dollar_reference(segs).ok());
+        }
+        "var" if segs.len() >= 2 => lookup_path(parser, doc, &segs[1..])?,
+        _ => lookup_path(parser, doc, &segs)?,
+    };
+
+    raw.map(|value| resolve_value_recursively(value, parser, doc))
+        .transpose()
+}
+
+/// The unresolved value at `path`, looking through imports and into the
+/// active branch of any if-block along the way.
+///
+/// The first segment names a top-level key or global, or an import alias when
+/// more segments follow. Inside an object the first matching assignment in
+/// source order wins, the same one reading the key returns.
+pub(super) fn lookup_path<'a>(
+    parser: &'a parser::Parser,
+    doc: &'a Document,
+    path: &[String],
+) -> Result<Option<&'a Value>, RuneError> {
+    let (doc, path) = match parser.imports.get(&path[0]) {
+        Some(import) if path.len() > 1 => (import, &path[1..]),
+        _ => (doc, path),
+    };
+
+    let Some(mut current) = doc
+        .items
+        .iter()
+        .chain(&doc.globals)
+        .find_map(|(key, value)| (key == &path[0]).then_some(value))
+    else {
+        return Ok(None);
+    };
+
+    for seg in &path[1..] {
+        let next = match current {
+            Value::Object(items) => find_in_items(items, seg, parser, doc)?,
+            Value::Annotated(value) => value
+                .attributes
+                .iter()
+                .find_map(|(key, value)| (key == seg).then_some(value)),
+            _ => None,
+        };
+        let Some(next) = next else {
+            return Ok(None);
+        };
+        current = next;
+    }
+
+    Ok(Some(current))
+}
+
+/// The first assignment to `key` among `items`, entering only the branch each
+/// if-block takes.
+fn find_in_items<'a>(
+    items: &'a [crate::ast::ObjectItem],
+    key: &str,
+    parser: &parser::Parser,
+    doc: &Document,
+) -> Result<Option<&'a Value>, RuneError> {
+    use crate::ast::ObjectItem;
+
+    for item in items {
+        match item {
+            ObjectItem::Assign(name, value) if name == key => return Ok(Some(value)),
+            ObjectItem::Assign(..) => {}
+            ObjectItem::IfBlock(block) => {
+                let branch: &[ObjectItem] = if condition_is_met(&block.condition, parser, doc)? {
+                    &block.then_items
+                } else {
+                    block.else_items.as_deref().unwrap_or(&[])
+                };
+                if let Some(value) = find_in_items(branch, key, parser, doc)? {
+                    return Ok(Some(value));
+                }
+            }
         }
     }
 
-    match condition {
-        crate::ast::Condition::Equals(path, expected) => resolve_path_value(parser, doc, path)
-            .as_ref()
-            .map(|actual| actual == expected)
-            .unwrap_or(false),
-        crate::ast::Condition::NotEquals(path, expected) => resolve_path_value(parser, doc, path)
-            .as_ref()
-            .map(|actual| actual != expected)
-            .unwrap_or(true),
-        crate::ast::Condition::Exists(path) => resolve_path_value(parser, doc, path).is_some(),
-        crate::ast::Condition::NotExists(path) => resolve_path_value(parser, doc, path).is_none(),
-    }
+    Ok(None)
 }
 
 pub(super) fn evaluate_conditional(
     cond: &crate::ast::ConditionalValue,
     parser: &parser::Parser,
     doc: &Document,
-) -> Value {
-    if condition_is_met(&cond.condition, parser, doc) {
+) -> Result<Value, RuneError> {
+    Ok(if condition_is_met(&cond.condition, parser, doc)? {
         cond.then_value.clone()
     } else {
         cond.else_value.clone().unwrap_or(Value::Null)
+    })
+}
+
+/// How deeply value resolution may nest, through references, conditionals and
+/// objects, before it is treated as a reference cycle.
+const MAX_RESOLUTION_DEPTH: usize = 128;
+
+thread_local! {
+    static RESOLUTION_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One level of value resolution, released when dropped.
+struct ResolutionDepth;
+
+impl ResolutionDepth {
+    fn enter() -> Result<Self, RuneError> {
+        RESOLUTION_DEPTH.with(|depth| {
+            if depth.get() >= MAX_RESOLUTION_DEPTH {
+                return Err(RuneError::RuntimeError {
+                    message: "Reference cycle: resolving a value led back to itself".into(),
+                    hint: Some(
+                        "Check for keys that refer to each other, or a condition that reads the key it sets"
+                            .into(),
+                    ),
+                    code: Some(310),
+                });
+            }
+            depth.set(depth.get() + 1);
+            Ok(Self)
+        })
+    }
+}
+
+impl Drop for ResolutionDepth {
+    fn drop(&mut self) {
+        RESOLUTION_DEPTH.with(|depth| depth.set(depth.get() - 1));
     }
 }
 
@@ -323,7 +474,7 @@ fn resolve_var_reference(
     }
 
     let target = &path[1..];
-    let Some(resolved) = parser.resolve_reference(target, main_doc) else {
+    let Some(resolved) = lookup_path(parser, main_doc, target)? else {
         return Err(RuneError::RuntimeError {
             message: format!(
                 "Variable '{}' not found for $var reference",
@@ -417,9 +568,11 @@ pub(super) fn resolve_value_recursively(
     parser: &parser::Parser,
     main_doc: &Document,
 ) -> Result<Value, RuneError> {
+    let _depth = ResolutionDepth::enter()?;
+
     match value {
         Value::Conditional(cond) => {
-            let resolved = evaluate_conditional(cond, parser, main_doc);
+            let resolved = evaluate_conditional(cond, parser, main_doc)?;
             resolve_value_recursively(&resolved, parser, main_doc)
         }
 
@@ -445,7 +598,7 @@ pub(super) fn resolve_value_recursively(
                 )))
             } else if path.first().map(|s| s.as_str()) == Some("var") {
                 resolve_var_reference(path, parser, main_doc)
-            } else if let Some(resolved) = parser.resolve_reference(path, main_doc) {
+            } else if let Some(resolved) = lookup_path(parser, main_doc, path)? {
                 resolve_value_recursively(resolved, parser, main_doc)
             } else {
                 Ok(value.clone())
@@ -482,7 +635,7 @@ pub(super) fn resolve_value_recursively(
                         }
                         ObjectItem::IfBlock(block) => {
                             let take_then =
-                                super::helpers::condition_is_met(&block.condition, parser, doc);
+                                super::helpers::condition_is_met(&block.condition, parser, doc)?;
                             let branch: &[ObjectItem] = if take_then {
                                 &block.then_items
                             } else {

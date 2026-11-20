@@ -712,7 +712,10 @@ impl<'a> SnapshotBuilder<'a> {
             return false;
         };
 
+        // A condition that cannot be evaluated (a reference cycle) fails the
+        // resolution itself, which reports it; the snapshot takes `else`.
         helpers::condition_is_met(condition, &resolution.parser, &resolution.document)
+            .unwrap_or(false)
     }
 
     fn resolved_value(&self, value: &Value) -> Option<Value> {
