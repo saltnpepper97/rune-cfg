@@ -26,8 +26,12 @@ syn match runeMetadata "@[A-Za-z_][A-Za-z0-9_-]*"
 syn match runeDollarReference "\$\(env\|sys\|runtime\|var\)\(\.[A-Za-z_][A-Za-z0-9_-]*\)*"
 
 syn match runeTopLevelObjectKey "^[A-Za-z_][A-Za-z0-9_-]*\ze\s*:"
-syn match runeObjectKey "^\s\+[A-Za-z_][A-Za-z0-9_-]*\ze\s*:"
-syn match runeKey "^\s*\%(end\>\)\@![A-Za-z_][A-Za-z0-9_-]*\ze\s*[= ]"
+" Indented keywords are not keys, though keys may start with their letters.
+syn match runeObjectKey "^\s\+\%(\%(if\|elseif\|else-if\|else\|end\)[A-Za-z0-9_-]\@!\)\@![A-Za-z_][A-Za-z0-9_-]*\ze\s*:"
+syn match runeKey "^\s*\%(\%(if\|elseif\|else-if\|else\|end\)[A-Za-z0-9_-]\@!\)\@![A-Za-z_][A-Za-z0-9_-]*\ze\s*[= ]"
+" `not` and `in` are keywords only as condition operators.
+syn match runeConditionKeyword "\v(<(if|elseif|else-if|not)\s+)@<=not(\s+[A-Za-z_$])@="
+syn match runeConditionKeyword "\v([A-Za-z0-9_-]\s+)@<=in(\s*\[)@="
 syn match runeObjectDelimiter "[:\[\]]"
 " The optional block name in `end <name>`.
 syn match runeEndLabel "\v(^\s*end\s+)@<=([A-Za-z_][A-Za-z0-9_-]*|\"([^\"\\]|\\.)*\")"
@@ -39,6 +43,7 @@ hi def link runeNumber Number
 hi def link runeBoolean Boolean
 hi def link runeNull Constant
 hi def link runeKeyword Statement
+hi def link runeConditionKeyword Statement
 hi def link runeEndKeyword Delimiter
 hi def link runeSchemaKeyword Keyword
 hi def link runeSchemaType Type
