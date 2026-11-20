@@ -91,3 +91,30 @@ end
         (assignment key: (identifier) value: (number)))
       (assignment key: (identifier) value: (string)))
     (assignment key: (identifier) value: (string))))
+
+==================
+blocks closed by a labeled end
+==================
+
+app:
+  if debug:
+    server:
+      port 8080
+    end server
+  end
+  name "A"
+end app
+
+---
+
+(source_file
+  (object_block
+    name: (identifier)
+    (if_block
+      condition: (condition)
+      (object_block
+        name: (identifier)
+        (assignment key: (identifier) value: (number))
+        end_name: (identifier)))
+    (assignment key: (identifier) value: (string))
+    end_name: (identifier)))

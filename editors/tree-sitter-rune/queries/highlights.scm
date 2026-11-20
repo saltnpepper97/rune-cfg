@@ -40,6 +40,9 @@
 (object_block name: (identifier) @type)
 (schema_block name: (identifier) @type.definition)
 (schema_object name: (identifier) @type)
+(object_block end_name: (identifier) @type)
+(schema_block end_name: (identifier) @type.definition)
+(schema_object end_name: (identifier) @type)
 (schema_field name: (identifier) @property)
 (schema_primitive) @type.builtin
 
