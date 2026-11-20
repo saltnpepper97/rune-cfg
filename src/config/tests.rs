@@ -1556,3 +1556,56 @@ fn nested_imports_and_cycles_load_the_same_through_both_paths() {
     assert_eq!(memory.get::<String>("looped").expect("include"), "3");
     assert_eq!(memory.get::<String>("root_marker").expect("root"), "root");
 }
+
+const KEY_LOCATION_CONFIG: &str = r#"name "top"
+app:
+  if debug:
+    level "trace"
+    server:
+      port 8080
+    end
+  elseif verbose:
+    level "info"
+  else:
+    level "warn"
+  end
+  name "inner"
+  port 9090
+end
+"#;
+
+#[test]
+fn key_location_ignores_conditional_headers_in_the_path() {
+    let line = |key| helpers::find_config_location(key, KEY_LOCATION_CONFIG).0;
+
+    assert_eq!(line("app.level"), 4, "first branch assignment");
+    assert_eq!(line("app.server"), 5, "object opened inside an if-block");
+    assert_eq!(
+        line("app.server.port"),
+        6,
+        "field nested inside an if-block"
+    );
+    assert_eq!(
+        line("app.name"),
+        13,
+        "field after the if-block keeps `app` scope"
+    );
+    assert_eq!(
+        line("app.port"),
+        14,
+        "exact path beats an earlier same-named field"
+    );
+    assert_eq!(line("name"), 1);
+}
+
+#[test]
+fn key_location_falls_back_to_the_last_path_segment() {
+    let (line, column, snippet) =
+        helpers::find_config_location("defaults.level", KEY_LOCATION_CONFIG);
+    assert_eq!((line, column, snippet.as_str()), (4, 5, "level \"trace\""));
+
+    assert_eq!(
+        helpers::find_config_location("missing", KEY_LOCATION_CONFIG),
+        (0, 0, "<key not found>".into())
+    );
+}

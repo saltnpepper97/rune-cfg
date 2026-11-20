@@ -7,6 +7,10 @@
   configs must replace each `endif` with `end`. Updated the parser, LSP
   (diagnostics, completion, formatting), tree-sitter grammar, and the Vim,
   Neovim, Emacs, and VS Code integrations to match.
+- Report the correct line for keys inside or after block conditionals in
+  type, validation, and lookup errors. `if`/`else`/`elseif` headers no longer
+  count as part of a key's path, and an exact path match takes priority over
+  an earlier field that merely shares the last segment.
 - Add an Emacs Tree-sitter major mode (`rune-cfg-ts-mode`) with highlighting,
   indentation, Imenu, section navigation, and optional Eglot registration for
   `rune-lsp`, plus an Emacs CI workflow.

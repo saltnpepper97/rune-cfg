@@ -133,9 +133,32 @@ pub(super) fn find_config_line(key: &str, raw_content: &str) -> (usize, String) 
     (line, snippet)
 }
 
+/// A block that is open while `find_config_location` walks the source.
+enum ScopeFrame {
+    /// `name:` ... `end`; contributes `name` to the key path.
+    Object(String),
+    /// `if condition:` ... `end`; contributes nothing to the key path.
+    Conditional,
+}
+
 pub(super) fn find_config_location(key: &str, raw_content: &str) -> (usize, usize, String) {
-    let key_parts: Vec<&str> = key.split('.').collect();
-    let mut scope_stack: Vec<String> = Vec::new();
+    let simple_key = key.rsplit('.').next().unwrap_or(key);
+    let mut frames: Vec<ScopeFrame> = Vec::new();
+    // First line whose key matches only the last path segment; used when no
+    // line matches the full path.
+    let mut fallback: Option<(usize, usize, String)> = None;
+
+    let path_with = |frames: &[ScopeFrame], name: &str| -> String {
+        frames
+            .iter()
+            .filter_map(|frame| match frame {
+                ScopeFrame::Object(name) => Some(name.as_str()),
+                ScopeFrame::Conditional => None,
+            })
+            .chain(std::iter::once(name))
+            .collect::<Vec<_>>()
+            .join(".")
+    };
 
     for (idx, line) in raw_content.lines().enumerate() {
         let trimmed = line.trim();
@@ -144,30 +167,20 @@ pub(super) fn find_config_location(key: &str, raw_content: &str) -> (usize, usiz
             continue;
         }
 
-        // scope open: foo:
-        if trimmed.ends_with(':') && !trimmed.starts_with('@') {
-            let scope_name = trimmed.trim_end_matches(':').trim().to_string();
-            let full_path = {
-                let mut path = scope_stack.clone();
-                path.push(scope_name.clone());
-                path.join(".")
-            };
-
-            if full_path == key {
-                return (
-                    idx + 1,
-                    column_for_token(line, &scope_name),
-                    trimmed.to_string(),
-                );
-            }
-
-            scope_stack.push(scope_name);
+        // block conditionals: `if` opens a block closed by `end`; `else` and
+        // `elseif` continue it. None of them is part of a key path.
+        let first_word = trimmed.split_whitespace().next().unwrap_or("");
+        if first_word == "if" {
+            frames.push(ScopeFrame::Conditional);
+            continue;
+        }
+        if matches!(first_word, "else:" | "else" | "elseif" | "else-if") {
             continue;
         }
 
         // scope close: end
         if trimmed == "end" {
-            scope_stack.pop();
+            frames.pop();
             continue;
         }
 
@@ -176,8 +189,18 @@ pub(super) fn find_config_location(key: &str, raw_content: &str) -> (usize, usiz
             continue;
         }
 
-        // ignore control keywords lines (if / else / elseif)
-        if trimmed.starts_with("if ") || trimmed == "else:" || trimmed.starts_with("elseif ") {
+        // scope open: foo:
+        if trimmed.ends_with(':') {
+            let scope_name = trimmed.trim_end_matches(':').trim().to_string();
+            if path_with(&frames, &scope_name) == key {
+                return (
+                    idx + 1,
+                    column_for_token(line, &scope_name),
+                    trimmed.to_string(),
+                );
+            }
+
+            frames.push(ScopeFrame::Object(scope_name));
             continue;
         }
 
@@ -189,31 +212,24 @@ pub(super) fn find_config_location(key: &str, raw_content: &str) -> (usize, usiz
             continue;
         };
 
-        let full_path = {
-            let mut path = scope_stack.clone();
-            path.push(line_key.to_string());
-            path.join(".")
+        let location = || {
+            (
+                idx + 1,
+                column_for_token(line, line_key),
+                trimmed.to_string(),
+            )
         };
 
-        if full_path == key {
-            return (
-                idx + 1,
-                column_for_token(line, line_key),
-                trimmed.to_string(),
-            );
+        if path_with(&frames, line_key) == key {
+            return location();
         }
 
-        let simple_key = key_parts.last().unwrap_or(&key);
-        if line_key == *simple_key {
-            return (
-                idx + 1,
-                column_for_token(line, line_key),
-                trimmed.to_string(),
-            );
+        if fallback.is_none() && line_key == simple_key {
+            fallback = Some(location());
         }
     }
 
-    (0, 0, "<key not found>".into())
+    fallback.unwrap_or((0, 0, "<key not found>".into()))
 }
 
 fn column_for_token(line: &str, token: &str) -> usize {
