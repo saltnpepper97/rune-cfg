@@ -34,7 +34,7 @@ fn duplicate_scalars_fields_and_objects_warn_without_changing_lookup() {
 #[test]
 fn different_objects_and_exclusive_branches_are_not_duplicates() {
     let text =
-        "r:\n if debug:\n  name \"a\"\n else:\n  name \"b\"\n endif\nend\ns:\n name \"c\"\nend\n";
+        "r:\n if debug:\n  name \"a\"\n else:\n  name \"b\"\n end\nend\ns:\n name \"c\"\nend\n";
     assert!(
         RuneConfig::from_str(text)
             .unwrap()
@@ -44,7 +44,7 @@ fn different_objects_and_exclusive_branches_are_not_duplicates() {
 }
 #[test]
 fn duplicates_inside_a_branch_point_at_the_repeated_key() {
-    let text = "r:\n if debug:\n  name \"a\"\n  name \"b\"\n else:\n  name \"c\"\n endif\nend\n";
+    let text = "r:\n if debug:\n  name \"a\"\n  name \"b\"\n else:\n  name \"c\"\n end\nend\n";
     let ds = RuneConfig::from_str(text)
         .unwrap()
         .duplicate_key_diagnostics();

@@ -110,7 +110,7 @@ fn parse_top_level_item(
                         object_items.push(crate::ast::ObjectItem::Assign(k, v));
                     }
                     Token::If => {
-                        // block if: if condition: ... endif
+                        // block if: if condition: ... end
                         object_items.push(conditional::parse_if_block(parser)?);
                     }
                     Token::End => {

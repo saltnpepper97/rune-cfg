@@ -36,7 +36,7 @@ pub(super) fn parse_assignment(parser: &mut Parser) -> Result<(String, Value), R
                         items.push(ObjectItem::Assign(k, v));
                     }
                     Token::If => {
-                        // block if: if condition: ... endif
+                        // block if: if condition: ... end
                         items.push(conditional::parse_if_block(parser)?);
                     }
                     Token::End => {
@@ -95,14 +95,7 @@ pub(super) fn parse_value_with_attributes(parser: &mut Parser) -> Result<Value, 
     let mut attributes = Vec::new();
     loop {
         match parser.peek() {
-            Some(
-                Token::Newline
-                | Token::Eof
-                | Token::End
-                | Token::EndIf
-                | Token::Else
-                | Token::ElseIf,
-            ) => break,
+            Some(Token::Newline | Token::Eof | Token::End | Token::Else | Token::ElseIf) => break,
             Some(Token::Ident(_) | Token::String(_)) => {
                 let name = match parser.bump()? {
                     Token::Ident(name) | Token::String(name) => name,
@@ -110,14 +103,7 @@ pub(super) fn parse_value_with_attributes(parser: &mut Parser) -> Result<Value, 
                 };
                 if matches!(
                     parser.peek(),
-                    Some(
-                        Token::Newline
-                            | Token::Eof
-                            | Token::End
-                            | Token::EndIf
-                            | Token::Else
-                            | Token::ElseIf
-                    )
+                    Some(Token::Newline | Token::Eof | Token::End | Token::Else | Token::ElseIf)
                 ) {
                     return Err(RuneError::SyntaxError {
                         message: format!("Missing value for inline attribute '{name}'"),
@@ -175,7 +161,7 @@ pub(super) fn parse_value(parser: &mut Parser) -> Result<Value, RuneError> {
             // - In value position, `if` means inline conditional:
             //     x = if cond a else b
             // - Block ifs are only parsed inside objects:
-            //     if cond: ... endif
+            //     if cond: ... end
             conditional::parse_conditional(parser)
         }
         _ => {

@@ -165,8 +165,8 @@ pub(super) fn find_config_location(key: &str, raw_content: &str) -> (usize, usiz
             continue;
         }
 
-        // scope close: end / endif
-        if trimmed == "end" || trimmed == "endif" {
+        // scope close: end
+        if trimmed == "end" {
             scope_stack.pop();
             continue;
         }
@@ -220,7 +220,7 @@ fn column_for_token(line: &str, token: &str) -> usize {
     line.find(token).map(|column| column + 1).unwrap_or(1)
 }
 
-/// Shared condition evaluation for both inline conditionals and block if/endif.
+/// Shared condition evaluation for both inline conditionals and block if/end.
 ///
 /// Schema validation uses this same evaluator for its location snapshot, so an
 /// `if`/`elseif`/`else` chain selects one branch for values and diagnostics

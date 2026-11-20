@@ -317,7 +317,7 @@ app:
     flag true
   else:
     flag false
-  endif
+  end
 end
 "#;
 
@@ -337,8 +337,70 @@ end
 }
 
 #[test]
+fn test_end_closes_nested_objects_and_ifs_inside_if_block() {
+    let input = r#"
+app:
+  if debug:
+    server:
+      port 8080
+    end
+    if verbose:
+      level "trace"
+    end
+  else:
+    level "info"
+  end
+  name "A"
+end
+"#;
+
+    let mut parser = Parser::new(input).expect("Failed to create parser");
+    let doc = parser.parse_document().expect("Failed to parse doc");
+
+    let Value::Object(items) = &doc.items[0].1 else {
+        panic!("Expected 'app' to be an Object");
+    };
+    assert_eq!(items.len(), 2, "the if-block and `name` belong to `app`");
+    let ObjectItem::IfBlock(block) = &items[0] else {
+        panic!("Expected the conditional block first");
+    };
+    assert!(
+        matches!(&block.then_items[0], ObjectItem::Assign(k, Value::Object(_)) if k == "server")
+    );
+    assert!(matches!(&block.then_items[1], ObjectItem::IfBlock(_)));
+    assert!(block.else_items.is_some());
+    assert!(matches!(&items[1], ObjectItem::Assign(k, _) if k == "name"));
+}
+
+#[test]
+fn test_unclosed_if_block_reports_eof() {
+    let input = "app:\n  if debug:\n    flag true\n";
+
+    let mut parser = Parser::new(input).expect("Failed to create parser");
+    let err = parser
+        .parse_document()
+        .expect_err("an if-block without `end` must fail");
+
+    assert!(
+        matches!(err, crate::RuneError::UnexpectedEof { ref message, .. } if message.contains("if-block")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn test_endif_is_no_longer_a_keyword() {
+    let input = "app:\n  if debug:\n    flag true\n  endif\nend\n";
+
+    let mut parser = Parser::new(input).expect("Failed to create parser");
+    assert!(
+        parser.parse_document().is_err(),
+        "`endif` must not close an if-block"
+    );
+}
+
+#[test]
 fn test_parse_elseif_chain_and_crlf() {
-    let input = "app:\r\n  if first:\r\n    value \"first\"\r\n  elseif second:\r\n    value \"second\"\r\n  else:\r\n    value \"fallback\"\r\n  endif\r\nend\r\n";
+    let input = "app:\r\n  if first:\r\n    value \"first\"\r\n  elseif second:\r\n    value \"second\"\r\n  else:\r\n    value \"fallback\"\r\n  end\r\nend\r\n";
     let mut parser = Parser::new(input).expect("CRLF input should lex");
     let doc = parser
         .parse_document()

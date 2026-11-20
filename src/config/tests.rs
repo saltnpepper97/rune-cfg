@@ -658,7 +658,7 @@ app:
     flag true
   else:
     flag false
-  endif
+  end
 end
 "#;
 
@@ -897,7 +897,7 @@ app:
     value "second"
   else:
     value "fallback"
-  endif
+  end
 end
 "#,
     )
@@ -1020,7 +1020,7 @@ app:
     mode "beta"
   else:
     mode 200
-  endif
+  end
 end
 "#;
     let schema_text = r#"schema app:
@@ -1050,7 +1050,7 @@ app:
     mode 100
   else:
     mode "beta"
-  endif
+  end
 end
 "#;
     let schema_text = r#"schema app:
@@ -1150,7 +1150,7 @@ fn missing_field_diagnostic_underlines_the_active_parent_occurrence() {
     server:
       host 42
     end
-  endif
+  end
 end
 "#;
     let schema_text = r#"schema app:
@@ -1260,7 +1260,7 @@ app:
     mode "beta"
   else:
     mode 200
-  endif
+  end
   server:
     port 1
   end

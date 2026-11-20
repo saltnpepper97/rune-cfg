@@ -10,7 +10,7 @@
 //!
 //! The tests below were originally written against a line-based server
 //! implementation that reported `app.if`, dropped fields out of their object
-//! after `endif`, answered `prepareRename` from the cursor's line alone, and
+//! after `end`, answered `prepareRename` from the cursor's line alone, and
 //! measured positions in UTF-8 bytes. They are regression tests now: each one
 //! names the defect it pins down in its doc comment, and none of them shape
 //! their assertions around any particular implementation.
@@ -39,7 +39,7 @@ use tower_lsp::{ClientSocket, LspService};
 const CONDITIONAL_CONFIG: &str = r#"app:
   if debug:
     feature true
-  endif
+  end
   name "Rune"
 end
 "#;
@@ -579,15 +579,15 @@ async fn forward_client_messages(socket: ClientSocket, sender: UnboundedSender<S
     }
 }
 
-/// `endif` closes the conditional block, not the enclosing object, and the
+/// `end` closes the conditional block, not the enclosing object, and the
 /// `if <condition>:` header is not a document symbol.
 ///
 /// Regression guard: the earlier line-based symbol walker read the `if debug:`
 /// line as an assignment to a key named `if` and popped the object stack when
-/// it reached `endif`, so the trailing assignment was reported as a top-level
+/// it reached `end`, so the trailing assignment was reported as a top-level
 /// `name` symbol instead of `app.name`.
 #[tokio::test]
-async fn document_symbols_preserve_object_scope_across_endif() {
+async fn document_symbols_preserve_object_scope_across_if_block_end() {
     let mut harness = LspHarness::start().await;
     let uri = harness.document_uri("config.rune");
 
@@ -605,7 +605,7 @@ async fn document_symbols_preserve_object_scope_across_endif() {
     assert_eq!(
         names,
         vec!["app", "app.feature", "app.name"],
-        "`endif` must close the conditional and leave `app` as the scope of what follows"
+        "`end` must close the conditional and leave `app` as the scope of what follows"
     );
     assert!(
         !names.iter().any(|name| name == "app.if"),
@@ -810,14 +810,14 @@ async fn schema_change_republishes_diagnostics_for_open_dependents() {
     );
 }
 
-/// Completion after `endif` offers the fields of the object the conditional was
+/// Completion after `end` offers the fields of the object the conditional was
 /// nested in, not the document's top level.
 ///
 /// Regression guard: the earlier line-based completion walker popped the object
-/// stack at `endif` and then treated the `if debug:` header as a key, so the
-/// scope after `endif` was wrong.
+/// stack at `end` and then treated the `if debug:` header as a key, so the
+/// scope after `end` was wrong.
 #[tokio::test]
-async fn completion_after_endif_uses_the_enclosing_object_scope() {
+async fn completion_after_if_block_end_uses_the_enclosing_object_scope() {
     let mut harness = LspHarness::start().await;
     let schema_uri = harness.document_uri("schema.rune");
     let config_uri = harness.document_uri("config.rune");
@@ -1006,7 +1006,7 @@ const SCHEMA_CONDITIONAL_FIELDS: &str =
 /// `if`/`elseif`/`else` chain. The active branch is the `elseif`, so that is the
 /// occurrence a diagnostic has to point at; the value carries a `#`, and the
 /// second field is a quoted non-BMP key.
-const CONDITIONAL_CRLF_CONFIG: &str = "first false\r\nsecond true\r\napp:\r\n  if first = true:\r\n    mode 100\r\n  elseif second = true:\r\n    mode \"beta#1\"\r\n  else:\r\n    mode 200\r\n  endif\r\n  \"\u{10400}name\" 42\r\nend\r\n";
+const CONDITIONAL_CRLF_CONFIG: &str = "first false\r\nsecond true\r\napp:\r\n  if first = true:\r\n    mode 100\r\n  elseif second = true:\r\n    mode \"beta#1\"\r\n  else:\r\n    mode 200\r\n  end\r\n  \"\u{10400}name\" 42\r\nend\r\n";
 
 /// The one published diagnostic whose message contains `needle`.
 fn diagnostic_with_message<'a>(diagnostics: &'a [Value], needle: &str) -> &'a Value {

@@ -18,7 +18,7 @@ use crate::parser::Parser;
 /// - Conditionals → structured object with condition/then/else
 /// - Null → JSON null
 ///
-/// Notes on block `if ... endif`:
+/// Notes on block `if ... end`:
 /// - Objects can contain conditional blocks as `ObjectItem::IfBlock`.
 /// - This exporter preserves that structure instead of trying to evaluate it.
 ///   (Evaluation depends on runtime/environment and happens elsewhere.)
