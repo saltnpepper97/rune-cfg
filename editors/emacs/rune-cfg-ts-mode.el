@@ -46,7 +46,7 @@
 ;; Update this tested grammar revision together with the mode tests.
 (add-to-list 'treesit-language-source-alist
              '(runecfg "https://github.com/saltnpepper97/rune-cfg"
-                       :commit "4b61300721933e463160ad4b843d97ed57aceb6a"
+                       :commit "59f8ed3828b0a7cdf5e9b0368e795c2f4f66aa3f"
                        :source-dir "editors/tree-sitter-rune/src")
              t)
 
@@ -104,6 +104,9 @@
                  (object_block name: (identifier) @font-lock-type-face)
                  (schema_block name: (identifier) @font-lock-type-face)
                  (schema_object name: (identifier) @font-lock-type-face)
+                 (object_block end_name: (identifier) @font-lock-type-face)
+                 (schema_block end_name: (identifier) @font-lock-type-face)
+                 (schema_object end_name: (identifier) @font-lock-type-face)
                  (assignment key: (identifier) @font-lock-property-name-face)
                  (schema_field name: (identifier) @font-lock-property-name-face)
                  (schema_primitive) @font-lock-type-face
