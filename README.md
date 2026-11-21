@@ -299,6 +299,19 @@ server:
 end
 ```
 
+In large configs, an `end` can repeat the name of the block it closes. The
+label is optional and checked: `end client` closing `server:` is a syntax
+error. It works for object blocks and schema blocks, not if-blocks, which
+always close with a bare `end`.
+
+```rune
+server:
+  ssl:
+    enabled true
+  end ssl
+end server
+```
+
 ### Schemas
 
 Schemas describe the expected shape of a RUNE config. They are parsed separately from runtime config files and return structured diagnostics that can be shown in CLIs, tests, and `rune-lsp`.

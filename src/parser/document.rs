@@ -115,6 +115,7 @@ fn parse_top_level_item(
                     }
                     Token::End => {
                         parser.bump()?;
+                        parser.finish_block_end(&key)?;
                         closed = true;
                         break;
                     }

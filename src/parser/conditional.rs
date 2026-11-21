@@ -131,7 +131,21 @@ fn parse_conditional_tail(parser: &mut Parser) -> Result<Option<Vec<ObjectItem>>
 
 fn expect_end(parser: &mut Parser) -> Result<(), RuneError> {
     match parser.bump()? {
-        Token::End => Ok(()),
+        Token::End => match parser.peek() {
+            // Only named blocks take a label; an if-block has no name to repeat.
+            Some(Token::Ident(label) | Token::String(label)) => {
+                let label = label.clone();
+                let (line, column) = parser.token_position();
+                Err(RuneError::SyntaxError {
+                    message: format!("'end {}' closes an if-block, which takes no label", label),
+                    line,
+                    column,
+                    hint: Some("Close if-blocks with a bare 'end'".into()),
+                    code: Some(219),
+                })
+            }
+            _ => Ok(()),
+        },
         Token::Eof => Err(RuneError::UnexpectedEof {
             message: "Unclosed if-block; expected 'end'".into(),
             line: parser.line(),

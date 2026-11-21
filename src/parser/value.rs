@@ -41,6 +41,7 @@ pub(super) fn parse_assignment(parser: &mut Parser) -> Result<(String, Value), R
                     }
                     Token::End => {
                         parser.bump()?;
+                        parser.finish_block_end(&key)?;
                         closed = true;
                         break;
                     }

@@ -617,3 +617,86 @@ fn test_invalid_key_reports_readable_token() {
         other => panic!("Expected InvalidToken, got {:?}", other),
     }
 }
+
+fn parse_err(input: &str) -> crate::RuneError {
+    Parser::new(input)
+        .expect("input should lex")
+        .parse_document()
+        .expect_err("input should not parse")
+}
+
+#[test]
+fn test_end_label_repeating_the_block_name_is_optional() {
+    let labeled = "app:\n  server:\n    port 8080\n  end server\n  name \"rune\"\nend app\n";
+    let bare = "app:\n  server:\n    port 8080\n  end\n  name \"rune\"\nend\n";
+
+    let labeled = Parser::new(labeled)
+        .unwrap()
+        .parse_document()
+        .expect("labels parse");
+    let bare = Parser::new(bare)
+        .unwrap()
+        .parse_document()
+        .expect("bare ends parse");
+
+    assert_eq!(labeled.items, bare.items);
+}
+
+#[test]
+fn test_end_label_inside_if_blocks_and_on_quoted_keys() {
+    let input = "app:\n  if debug:\n    \"log level\":\n      value \"trace\"\n    end \"log level\"\n  end\nend app\n";
+    let doc = Parser::new(input)
+        .unwrap()
+        .parse_document()
+        .expect("labels on nested and quoted blocks parse");
+
+    assert_eq!(doc.items[0].0, "app");
+}
+
+#[test]
+fn test_mismatched_end_label_is_a_syntax_error() {
+    let err = parse_err("app:\n  server:\n    port 8080\n  end client\nend\n");
+
+    match err {
+        crate::RuneError::SyntaxError {
+            ref message,
+            line,
+            column,
+            code,
+            ..
+        } => {
+            assert!(message.contains("'end client'"), "{message}");
+            assert!(message.contains("'server'"), "{message}");
+            assert_eq!((line, column, code), (4, 7, Some(219)));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    // The outer block is checked against its own name, not the inner one.
+    let err = parse_err("app:\n  server:\n  end server\nend server\n");
+    assert!(
+        matches!(
+            err,
+            crate::RuneError::SyntaxError {
+                line: 4,
+                code: Some(219),
+                ..
+            }
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn test_if_block_end_takes_no_label() {
+    let err = parse_err("app:\n  if debug:\n    flag true\n  end debug\nend\n");
+
+    assert!(
+        matches!(
+            err,
+            crate::RuneError::SyntaxError { ref message, line: 4, code: Some(219), .. }
+                if message.contains("if-block")
+        ),
+        "unexpected error: {err:?}"
+    );
+}

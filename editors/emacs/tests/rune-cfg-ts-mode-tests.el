@@ -83,6 +83,32 @@
       (search-forward (car entry))
       (should (eq (get-text-property (match-beginning 0) 'face) (cdr entry))))))
 
+(ert-deftest rune-cfg-test-labeled-ends ()
+  (with-temp-buffer
+    (insert "app:\n"
+            "server:\n"
+            "port 8080\n"
+            "end server\n"
+            "end app\n")
+    (rune-cfg-ts-mode)
+    (should-not (treesit-node-check (treesit-buffer-root-node) 'has-error))
+    (indent-region (point-min) (point-max))
+    (should (equal (buffer-string)
+                   (concat "app:\n"
+                           "  server:\n"
+                           "    port 8080\n"
+                           "  end server\n"
+                           "end app\n")))
+    (font-lock-ensure)
+    ;; `end` keeps its keyword face; the label is styled like the block name.
+    (dolist (closer '("end server" "end app"))
+      (goto-char (point-min))
+      (search-forward closer)
+      (should (eq (get-text-property (match-beginning 0) 'face)
+                  'font-lock-keyword-face))
+      (should (eq (get-text-property (+ (match-beginning 0) 4) 'face)
+                  'font-lock-type-face)))))
+
 (ert-deftest rune-cfg-test-imenu-sections ()
   (with-temp-buffer
     (insert-file-contents rune-cfg-test--fixture-file)

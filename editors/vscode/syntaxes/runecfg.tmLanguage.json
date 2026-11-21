@@ -5,6 +5,7 @@
   "patterns": [
     { "include": "#comments" },
     { "include": "#metadata" },
+    { "include": "#block-ends" },
     { "include": "#keywords" },
     { "include": "#schema-types" },
     { "include": "#block-keys" },
@@ -53,6 +54,17 @@
         {
           "name": "support.type.runecfg",
           "match": "\\b(?:string|int|float|number|bool|regex|null|any|array|object)\\b"
+        }
+      ]
+    },
+    "block-ends": {
+      "patterns": [
+        {
+          "match": "^\\s*(end)\\s+([A-Za-z_][A-Za-z0-9_-]*|\"(?:\\\\.|[^\"\\\\])*\")",
+          "captures": {
+            "1": { "name": "keyword.control.runecfg" },
+            "2": { "name": "entity.name.section.runecfg" }
+          }
         }
       ]
     },

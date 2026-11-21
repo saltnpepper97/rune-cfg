@@ -35,27 +35,31 @@ module.exports = grammar({
       $._terminator,
     ),
 
-    schema_block: $ => seq(
+    // An identifier right after `end` is the block's optional label.
+    schema_block: $ => prec.right(seq(
       'schema',
       field('name', $.identifier),
       ':',
       $._terminator,
       repeat(choice($._schema_item, $._terminator)),
       'end',
-    ),
+      optional(field('end_name', $.identifier)),
+    )),
 
     _schema_item: $ => choice(
       $.schema_object,
       $.schema_field,
     ),
 
-    schema_object: $ => seq(
+    // An identifier right after `end` is the block's optional label.
+    schema_object: $ => prec.right(seq(
       field('name', $.identifier),
       ':',
       $._terminator,
       repeat(choice($._schema_item, $._terminator)),
       'end',
-    ),
+      optional(field('end_name', $.identifier)),
+    )),
 
     schema_field: $ => seq(
       field('name', $.identifier),
@@ -95,13 +99,15 @@ module.exports = grammar({
       seq('range', $.range),
     ),
 
-    object_block: $ => seq(
+    // An identifier right after `end` is the block's optional label.
+    object_block: $ => prec.right(seq(
       field('name', $.identifier),
       ':',
       $._terminator,
       repeat(choice($._object_item, $._terminator)),
       'end',
-    ),
+      optional(field('end_name', $.identifier)),
+    )),
 
     _object_item: $ => choice(
       $.assignment,

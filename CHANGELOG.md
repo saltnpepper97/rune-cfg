@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Allow an optional block name after `end`, as in `server:` ... `end server`,
+  for object blocks, schema blocks, and nested schema objects. The name must
+  match the block being closed; a mismatch is a syntax error (code 219), and
+  if-blocks keep a bare `end`. `rune-lsp` treats the label as part of its
+  block (hover, definition, references, and rename all work from it, and
+  rename updates it), and the formatter keeps labels as written. The
+  tree-sitter grammar adds an `end_name` field, Vim, Neovim, Emacs, and VS
+  Code highlight the label, and the Emacs grammar pin moves to the grammar
+  revision that parses it. An identifier written after `end` on the same line
+  is now always read as its label.
 - **Breaking:** block conditionals now close with `end`, like every other
   block, instead of `endif`. `endif` is no longer a keyword, so existing
   configs must replace each `endif` with `end`. Updated the parser, LSP

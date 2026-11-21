@@ -9,7 +9,7 @@ Current scope:
 - metadata declarations like `@schema "app"`
 - `gather "file.rune" as alias`
 - assignments with optional `=`
-- object blocks closed by `end`
+- object and schema blocks closed by `end`, optionally labeled `end <name>`
 - block conditionals closed by `end`
 - schema blocks, schema objects, schema fields, enum types, ranges, defaults, and required fields
 - strings, regex literals, numbers, booleans, nulls, arrays, references, and comments

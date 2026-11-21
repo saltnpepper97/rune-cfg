@@ -178,8 +178,8 @@ pub(super) fn find_config_location(key: &str, raw_content: &str) -> (usize, usiz
             continue;
         }
 
-        // scope close: end
-        if trimmed == "end" {
+        // scope close: `end`, or `end name` repeating the block it closes
+        if first_word == "end" {
             frames.pop();
             continue;
         }

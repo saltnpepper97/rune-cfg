@@ -39,3 +39,24 @@ end
         (schema_modifier (range))
         (schema_modifier (number))))
     (schema_field name: (identifier) type: (schema_array_type (schema_primitive)))))
+
+==================
+schema closed by labeled ends
+==================
+
+schema app:
+  server:
+    port int
+  end server
+end app
+
+---
+
+(source_file
+  (schema_block
+    name: (identifier)
+    (schema_object
+      name: (identifier)
+      (schema_field name: (identifier) type: (schema_primitive))
+      end_name: (identifier))
+    end_name: (identifier)))
