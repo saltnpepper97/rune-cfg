@@ -226,25 +226,114 @@ fn parse_object_items_until(
     Ok(items)
 }
 
+/// Parse the test after `if` or `elseif`:
+///
+/// ```text
+/// condition := "not" condition
+///            | path [ ("=" | "!=") value | "in" "[" value, ... "]" ]
+/// path      := ["$"] name ("." name)*
+/// ```
+///
+/// `not` and `in` are contextual: `not` negates only when a path follows it,
+/// and `in` is a membership test only when a list follows it, so keys named
+/// `not` or `in` still work.
 fn parse_condition(parser: &mut Parser) -> Result<Condition, RuneError> {
-    let path = if let Token::Ident(name) = parser.bump()? {
-        name
-    } else {
-        return Err(RuneError::SyntaxError {
-            message: "Expected identifier in condition".into(),
-            line: parser.line(),
-            column: parser.column(),
-            hint: None,
-            code: Some(214),
-        });
-    };
+    if matches!(parser.peek(), Some(Token::Ident(word)) if word == "not") {
+        parser.bump()?;
+        if matches!(parser.peek(), Some(Token::Ident(_) | Token::Dollar)) {
+            return Ok(Condition::Not(Box::new(parse_condition(parser)?)));
+        }
+        // A key named `not`.
+        return parse_comparison(parser, "not".into());
+    }
 
+    let path = parse_condition_path(parser)?;
+    parse_comparison(parser, path)
+}
+
+/// The comparison after a condition's path, if any.
+fn parse_comparison(parser: &mut Parser, path: String) -> Result<Condition, RuneError> {
     match parser.peek() {
         Some(Token::Equals) => {
             parser.bump()?;
-            let value = value::parse_value(parser)?;
-            Ok(Condition::Equals(path, value))
+            Ok(Condition::Equals(path, value::parse_value(parser)?))
         }
-        _ => Ok(Condition::Exists(path)),
+        Some(Token::NotEquals) => {
+            parser.bump()?;
+            Ok(Condition::NotEquals(path, value::parse_value(parser)?))
+        }
+        Some(Token::Ident(word)) if word == "in" => {
+            parser.bump()?;
+            let (line, column) = parser.token_position();
+            if parser.peek() != Some(&Token::LBracket) {
+                return Err(RuneError::SyntaxError {
+                    message: format!("Expected a list after '{} in'", path),
+                    line,
+                    column,
+                    hint: Some(format!("Use: if {} in [\"a\", \"b\"]", path)),
+                    code: Some(214),
+                });
+            }
+            match value::parse_value(parser)? {
+                Value::Array(options) => Ok(Condition::In(path, options)),
+                _ => unreachable!("a value starting with '[' is an array"),
+            }
+        }
+        _ => Ok(Condition::Truthy(path)),
+    }
+}
+
+/// A condition's path: `name`, `a.b.c`, or `$env.NAME`, joined with dots.
+/// `$env`, `$sys`, `$runtime` and `$var` read the same as their bare forms.
+fn parse_condition_path(parser: &mut Parser) -> Result<String, RuneError> {
+    let (line, column) = parser.token_position();
+    let dollar = parser.peek() == Some(&Token::Dollar);
+    if dollar {
+        parser.bump()?;
+    }
+
+    let mut segments = vec![expect_path_segment(parser, line, column)?];
+    while parser.peek() == Some(&Token::Dot) {
+        parser.bump()?;
+        let (line, column) = parser.token_position();
+        segments.push(expect_path_segment(parser, line, column)?);
+    }
+
+    if dollar && !matches!(segments[0].as_str(), "env" | "sys" | "runtime" | "var") {
+        return Err(RuneError::SyntaxError {
+            message: format!("Unknown namespace ${}", segments[0]),
+            line,
+            column,
+            hint: Some("Use $env, $sys, $runtime, or $var".into()),
+            code: Some(214),
+        });
+    }
+
+    Ok(segments.join("."))
+}
+
+fn expect_path_segment(
+    parser: &mut Parser,
+    line: usize,
+    column: usize,
+) -> Result<String, RuneError> {
+    match parser.peek() {
+        Some(Token::Ident(name)) => {
+            let name = name.clone();
+            parser.bump()?;
+            Ok(name)
+        }
+        other => Err(RuneError::SyntaxError {
+            message: format!(
+                "Expected a key name in condition, got {}",
+                other
+                    .map(Token::describe)
+                    .unwrap_or_else(|| "end of input".into())
+            ),
+            line,
+            column,
+            hint: Some("Use: if key, if app.key, or if key = value".into()),
+            code: Some(214),
+        }),
     }
 }

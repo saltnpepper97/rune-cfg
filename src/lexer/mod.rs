@@ -21,6 +21,8 @@ pub enum Token {
     // --- structure ---
     Colon,
     Equals,
+    /// `!=`, only meaningful in an `if` condition.
+    NotEquals,
     LBracket,
     RBracket,
 
@@ -56,6 +58,7 @@ impl Token {
             Token::Null => "null".into(),
             Token::Colon => "':'".into(),
             Token::Equals => "'='".into(),
+            Token::NotEquals => "'!='".into(),
             Token::LBracket => "'['".into(),
             Token::RBracket => "']'".into(),
             Token::End => "'end'".into(),

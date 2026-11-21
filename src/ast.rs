@@ -3,24 +3,28 @@
 
 use regex::Regex;
 
-#[derive(Debug, Clone)]
+/// The test in an `if`, inline or block.
+///
+/// Each path is dotted (`app.debug`), and may start with `env.`, `sys.`,
+/// `runtime.` or `var.`. A bare name means a top-level key, exactly as in a
+/// value reference.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Condition {
+    /// `if path`: true unless the value is `false`, `null`, or missing.
+    Truthy(String),
+    /// `if not condition`.
+    Not(Box<Condition>),
+    /// `if path = value`.
     Equals(String, Value),
+    /// `if path != value`.
     NotEquals(String, Value),
+    /// `if path in [a, b, ...]`.
+    In(String, Vec<Value>),
+    /// True when the path is defined, whatever its value. No syntax produces
+    /// it; it is kept for code that builds conditions directly.
     Exists(String),
+    /// True when the path is not defined.
     NotExists(String),
-}
-
-impl PartialEq for Condition {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Condition::Equals(p1, v1), Condition::Equals(p2, v2)) => p1 == p2 && v1 == v2,
-            (Condition::NotEquals(p1, v1), Condition::NotEquals(p2, v2)) => p1 == p2 && v1 == v2,
-            (Condition::Exists(p1), Condition::Exists(p2)) => p1 == p2,
-            (Condition::NotExists(p1), Condition::NotExists(p2)) => p1 == p2,
-            _ => false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

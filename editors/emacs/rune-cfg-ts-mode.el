@@ -46,7 +46,7 @@
 ;; Update this tested grammar revision together with the mode tests.
 (add-to-list 'treesit-language-source-alist
              '(runecfg "https://github.com/saltnpepper97/rune-cfg"
-                       :commit "59f8ed3828b0a7cdf5e9b0368e795c2f4f66aa3f"
+                       :commit "aa95ea053e872c90bf47d3a8fe56b92d377f3633"
                        :source-dir "editors/tree-sitter-rune/src")
              t)
 

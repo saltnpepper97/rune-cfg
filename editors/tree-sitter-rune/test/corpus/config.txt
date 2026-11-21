@@ -118,3 +118,50 @@ end app
         end_name: (identifier)))
     (assignment key: (identifier) value: (string))
     end_name: (identifier)))
+
+==================
+if block with an elseif chain and else
+==================
+
+app:
+  if not $env.CI:
+    x 1
+  elseif mode in ["a", "b"]:
+    x 2
+  elseif app.y != 3:
+    x 3
+  else:
+    x 4
+  end
+end
+
+---
+
+(source_file
+  (object_block
+    name: (identifier)
+    (if_block
+      condition: (condition)
+      (assignment key: (identifier) value: (number))
+      condition: (condition)
+      (assignment key: (identifier) value: (number))
+      condition: (condition)
+      (assignment key: (identifier) value: (number))
+      (assignment key: (identifier) value: (number)))))
+
+==================
+inline conditions with paths, not, != and in
+==================
+
+ping if debug 8080 else 443
+a if not app.debug 1 else 2
+b if $env.MODE != "x" 1 else 2
+c if mode in ["a", "b"] 1 else 2
+
+---
+
+(source_file
+  (assignment key: (identifier) value: (conditional_value))
+  (assignment key: (identifier) value: (conditional_value))
+  (assignment key: (identifier) value: (conditional_value))
+  (assignment key: (identifier) value: (conditional_value)))

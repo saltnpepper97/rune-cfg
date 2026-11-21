@@ -19,6 +19,10 @@ pub(super) fn next_token_with_flag(
         Some('\n') => tokenize_newline(lexer),
         Some(':') => tokenize_symbol(lexer, Token::Colon),
         Some('=') => tokenize_symbol(lexer, Token::Equals),
+        Some('!') if next_is(lexer, '=') => {
+            bump(lexer);
+            tokenize_symbol(lexer, Token::NotEquals)
+        }
         Some('[') => tokenize_symbol(lexer, Token::LBracket),
         Some(']') => tokenize_symbol(lexer, Token::RBracket),
         Some(',') => {
@@ -173,6 +177,10 @@ fn tokenize_string(lexer: &mut Lexer) -> Result<Token, RuneError> {
     }
 
     Ok(Token::String(content))
+}
+
+fn next_is(lexer: &Lexer, expected: char) -> bool {
+    lexer.input.clone().next() == Some(expected)
 }
 
 fn next_is_ascii_digit(lexer: &Lexer) -> bool {

@@ -115,15 +115,22 @@ module.exports = grammar({
       $.if_block,
     ),
 
+    // `if` / any number of `elseif` / an optional `else`, closed by one `end`.
     if_block: $ => seq(
       'if',
       field('condition', $.condition),
       ':',
       $._terminator,
       repeat(choice($._object_item, $._terminator)),
+      repeat(seq(
+        choice('elseif', 'else-if'),
+        field('condition', $.condition),
+        ':',
+        $._terminator,
+        repeat(choice($._object_item, $._terminator)),
+      )),
       optional(seq(
-        choice('else', 'elseif', 'else-if'),
-        optional($.condition),
+        'else',
         ':',
         $._terminator,
         repeat(choice($._object_item, $._terminator)),

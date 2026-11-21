@@ -40,6 +40,21 @@
     "keywords": {
       "patterns": [
         {
+          "comment": "`not` is a keyword only when it negates a condition.",
+          "match": "\\b(if|elseif|else-if|not)\\s+(not)(?=\\s+[A-Za-z_$])",
+          "captures": {
+            "1": { "name": "keyword.control.runecfg" },
+            "2": { "name": "keyword.control.runecfg" }
+          }
+        },
+        {
+          "comment": "`in` is a keyword only when a list follows it.",
+          "match": "(?<=[A-Za-z0-9_-])\\s+(in)(?=\\s*\\[)",
+          "captures": {
+            "1": { "name": "keyword.control.runecfg" }
+          }
+        },
+        {
           "name": "keyword.control.runecfg",
           "match": "\\b(?:gather|as|if|else|elseif|else-if|end|schema|with)\\b"
         },
@@ -72,7 +87,7 @@
       "patterns": [
         {
           "name": "meta.block.runecfg",
-          "match": "^\\s*(?:schema\\s+)?([A-Za-z_][A-Za-z0-9_-]*|\"(?:\\\\.|[^\"\\\\])*\")\\s*:",
+          "match": "^\\s*(?:schema\\s+)?(?!(?:if|elseif|else-if|else|end)(?![A-Za-z0-9_-]))([A-Za-z_][A-Za-z0-9_-]*|\"(?:\\\\.|[^\"\\\\])*\")\\s*:",
           "captures": {
             "1": { "name": "entity.name.section.runecfg" }
           }
@@ -83,7 +98,7 @@
       "patterns": [
         {
           "name": "meta.assignment.runecfg",
-          "match": "^\\s*([A-Za-z_][A-Za-z0-9_-]*|\"(?:\\\\.|[^\"\\\\])*\")(?=\\s+(?:=\\s*)?[^#\\s])",
+          "match": "^\\s*(?!(?:if|elseif|else-if|else|end)(?![A-Za-z0-9_-]))([A-Za-z_][A-Za-z0-9_-]*|\"(?:\\\\.|[^\"\\\\])*\")(?=\\s+(?:=\\s*)?[^#\\s])",
           "captures": {
             "1": { "name": "variable.other.member.runecfg" }
           }

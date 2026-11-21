@@ -700,3 +700,72 @@ fn test_if_block_end_takes_no_label() {
         "unexpected error: {err:?}"
     );
 }
+
+fn parse_condition_of(source: &str) -> crate::ast::Condition {
+    let doc = Parser::new(source)
+        .expect("input should lex")
+        .parse_document()
+        .expect("input should parse");
+    let (_, value) = doc
+        .items
+        .iter()
+        .chain(&doc.globals)
+        .find(|(key, _)| key == "r")
+        .expect("the source sets r");
+    match value {
+        Value::Conditional(conditional) => conditional.condition.clone(),
+        other => panic!("expected a conditional, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_condition_syntax_builds_the_matching_ast() {
+    use crate::ast::Condition;
+
+    let cases = [
+        ("r if debug 1 else 2", Condition::Truthy("debug".into())),
+        (
+            "r if app.server.debug 1 else 2",
+            Condition::Truthy("app.server.debug".into()),
+        ),
+        (
+            "r if $env.HOME 1 else 2",
+            Condition::Truthy("env.HOME".into()),
+        ),
+        (
+            "r if not debug 1 else 2",
+            Condition::Not(Box::new(Condition::Truthy("debug".into()))),
+        ),
+        (
+            "r if app.mode != \"prod\" 1 else 2",
+            Condition::NotEquals("app.mode".into(), Value::String("prod".into())),
+        ),
+        (
+            "r if mode in [\"a\", 2] 1 else 2",
+            Condition::In(
+                "mode".into(),
+                vec![Value::String("a".into()), Value::Number(2.0)],
+            ),
+        ),
+        (
+            "r if not mode = \"a\" 1 else 2",
+            Condition::Not(Box::new(Condition::Equals(
+                "mode".into(),
+                Value::String("a".into()),
+            ))),
+        ),
+    ];
+
+    for (source, expected) in cases {
+        assert_eq!(parse_condition_of(source), expected, "{source}");
+    }
+}
+
+#[test]
+fn test_block_if_accepts_the_full_condition_syntax() {
+    let input = "app:\n  if not $env.CI:\n    a 1\n  elseif mode in [\"a\", \"b\"]:\n    a 2\n  elseif app.x != 3:\n    a 3\n  end\nend\n";
+    Parser::new(input)
+        .unwrap()
+        .parse_document()
+        .expect("block conditions take the same syntax as inline ones");
+}

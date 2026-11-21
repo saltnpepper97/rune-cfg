@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- **Breaking:** fix `if` conditions that only checked whether a key was set.
+  A bare `if debug` took the then-branch even for `debug false` or
+  `debug None`, inline and in blocks. Conditions now treat only `false`,
+  `None`, and a missing key as false, so `0`, `""`, and `[]` are true.
+  Configs that relied on the old behavior should compare explicitly.
+- Fix conditions with dotted paths, such as `if app.debug` or the README's
+  `if sys.cpu_count = "8"`, which failed to parse. `$env.X`, `$sys.X`, and
+  `$var.X` work in conditions too, and an unset environment variable counts
+  as missing.
+- Add `!=`, `not`, and `in [ ... ]` to conditions. `not` and `in` are only
+  keywords in that position, so keys named `not` or `in` still work.
+- Conditions and value references read the final value of a key, through
+  other references, inline conditionals, and the active branch of any
+  if-block on the path.
+- Report a reference cycle, such as `a b` / `b a` or a condition that reads
+  the key it sets, as error code 310 instead of overflowing the stack.
+  `get` now returns resolution errors like this one instead of reporting the
+  key as not found, and `rune-lsp` shows them as diagnostics, with or without
+  a schema, instead of reporting the schema root as missing.
+- `Condition` gains `Truthy`, `Not`, and `In` variants, and `Token` gains
+  `NotEquals`.
+- Fix the tree-sitter grammar, and the Emacs grammar pin, for if-blocks with
+  more than one branch after `if`: a second `elseif` was an error, and an
+  `else` after `elseif` was read as an object block.
+- Fix Vim, Neovim, and VS Code highlighting of indented `if`, `elseif`, and
+  `else`, which read as keys, and highlight `not` and `in` in conditions.
 - Allow an optional block name after `end`, as in `server:` ... `end server`,
   for object blocks, schema blocks, and nested schema objects. The name must
   match the block being closed; a mismatch is a syntax error (code 219), and

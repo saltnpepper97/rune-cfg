@@ -109,6 +109,37 @@
       (should (eq (get-text-property (+ (match-beginning 0) 4) 'face)
                   'font-lock-type-face)))))
 
+(ert-deftest rune-cfg-test-elseif-chains-and-conditions ()
+  (with-temp-buffer
+    (insert "app:\n"
+            "if not $env.CI:\n"
+            "x 1\n"
+            "elseif mode in [\"a\", \"b\"]:\n"
+            "x 2\n"
+            "elseif app.y != 3:\n"
+            "x 3\n"
+            "else:\n"
+            "x 4\n"
+            "end\n"
+            "ping if not debug 8080 else 443\n"
+            "end\n")
+    (rune-cfg-ts-mode)
+    (should-not (treesit-node-check (treesit-buffer-root-node) 'has-error))
+    (indent-region (point-min) (point-max))
+    (should (equal (buffer-string)
+                   (concat "app:\n"
+                           "  if not $env.CI:\n"
+                           "    x 1\n"
+                           "  elseif mode in [\"a\", \"b\"]:\n"
+                           "    x 2\n"
+                           "  elseif app.y != 3:\n"
+                           "    x 3\n"
+                           "  else:\n"
+                           "    x 4\n"
+                           "  end\n"
+                           "  ping if not debug 8080 else 443\n"
+                           "end\n")))))
+
 (ert-deftest rune-cfg-test-imenu-sections ()
   (with-temp-buffer
     (insert-file-contents rune-cfg-test--fixture-file)
